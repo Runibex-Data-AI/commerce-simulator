@@ -17,7 +17,10 @@ sources.
 * **Retailer promotions**: per enabled retailer and quarter,
   ``promo_weeks_per_quarter`` promotion weeks split into promotions of one or
   two weeks (Monday to Sunday), on hero SKUs plus in-season SKUs of the
-  retailer's assortment, ``retail_discount_choices`` off.
+  retailer's assortment, ``retail_discount_choices`` off. Promotion weeks lie
+  in weeks ``retail_forward_buy_weeks + 1`` to ``n - 1`` of the retail quarter
+  (ISO weeks, ``models.retail_calendar``), so a forward buy, the promotion
+  and its replenishment order fall in the same retail quarter.
   Ids: ``60_000_000 + year * 10000 + channel index * 1000 + quarter * 100 + i``.
 * **Scenario promotions** (e.g. ``promo_margin_trap``) from the scenario
   manager, web channel, automatic. Ids: ``900_000 + index``.
@@ -45,6 +48,7 @@ from typing import Iterable
 from ..engine.queue import Event
 from ..engine.registry import arrival_source, bootstrap, handler
 from ..models import pricing
+from ..models.retail_calendar import quarter_weeks, retail_quarter
 from ..models.seasonality import category_factor
 from .events import PromotionChanged, PromotionDefined
 from .model import Promotion, Sku
@@ -63,6 +67,7 @@ FREE_SHIPPING_LIFT = 1.05  # demand bump from free shipping on top of the price 
 BLACK_WEEK_INDEX = 90
 BLACK_WEEK_DISCOUNT = 0.20
 RETAIL_MAX_WEEKS = 2
+RETAIL_QUARTER_TAIL_WEEKS = 1  # last weeks of a retail quarter without promotion weeks
 SEASONAL_FACTOR_MIN = 1.25  # category factor above which a SKU counts as in season
 _CACHE_LIMIT = 6000
 
@@ -301,10 +306,21 @@ def _gen_retail_quarter(st: _State, world, channel: str, year: int, q: int) -> l
     q_start = date(year, 3 * q - 2, 1)
     q_end = date(year + (q == 4), 1 if q == 4 else 3 * q + 1, 1)  # exclusive
     first_mon = q_start + timedelta(days=(7 - q_start.weekday()) % 7)
+    # Promotion weeks lie inside the retailer's own retail quarter (ISO weeks),
+    # clear of its edges: not in the first ``retail_forward_buy_weeks`` weeks
+    # (the forward buy is ordered in the same quarter) and not in the last
+    # RETAIL_QUARTER_TAIL_WEEKS weeks (the promotion and its replenishment
+    # order fall in the same quarter). Retailers plan promotion slots per
+    # retail quarter; it also keeps sell-in and sell-out of a quarter aligned.
+    n_weeks = len(quarter_weeks(year, q))
+    lo_idx = int(pc.retail_forward_buy_weeks) + 1
+    hi_idx = n_weeks - RETAIL_QUARTER_TAIL_WEEKS
     mondays = []
     m = first_mon
     while m + timedelta(days=6) < q_end:
-        mondays.append(m)
+        iso_week = m.isocalendar()[1]
+        if retail_quarter(m) == (year, q) and lo_idx <= iso_week - 13 * (q - 1) <= hi_idx:
+            mondays.append(m)
         m += timedelta(days=7)
     taken: set[int] = set()  # week indexes used (incl. one week buffer)
     weeks_left = int(rc.promo_weeks_per_quarter)

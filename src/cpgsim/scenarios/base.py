@@ -15,8 +15,16 @@ modules ask about at the decision points that matter:
   multiplies its model parameter by the result. Every active window whose
   implementation provides that factor name contributes; with no active window
   the factor is exactly ``1.0``, so normal business is unaffected.
+* **lifetime factors**: a factor listed in ``lifetime_factors`` keeps
+  applying after the window ends (the window contributes for every ``t`` from
+  its start), so an implementation can scale entities *created* inside the
+  window for their whole life (``influencer_cohort_churn``).
+* **transfers**: a scenario can move expected demand from one SKU to another
+  (``world.scenarios.transfers("sku_demand", t, world=world, ...)``).
 * **promotions**: a scenario can contribute promotion specs, which the
   promotions calendar turns into ordinary promotions (``scenario_promotions``).
+* **duration**: a scenario can bound its windows (``duration(params)``), so a
+  window self-closes even when switched on live without an end.
 
 Writing a new scenario
 ----------------------
@@ -35,7 +43,7 @@ Implementations are stateless: everything they know comes from the window
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -64,12 +72,17 @@ class Scenario:
         Names of the factors this implementation may contribute to. The
         manager only asks implementations that declare the name, which keeps
         ``factor()`` cheap on hot paths.
+    ``lifetime_factors``
+        Subset of ``factors`` asked also after the window has ended (for every
+        ``t >= window.start``); the implementation decides from the context
+        (e.g. ``acquired_at`` inside the window) whether it applies.
     """
 
     id: ClassVar[str] = ""
     description: ClassVar[str] = ""
     defaults: ClassVar[dict[str, Any]] = {}
     factors: ClassVar[tuple[str, ...]] = ()
+    lifetime_factors: ClassVar[tuple[str, ...]] = ()
 
     def normalize(self, params: dict[str, Any] | None, cfg: "Config | None" = None) -> dict[str, Any]:
         """Complete and validate parameters: defaults, then ``params`` on top.
@@ -91,6 +104,23 @@ class Scenario:
         """
         return None
 
+    def duration(self, params: dict[str, Any]) -> timedelta | None:
+        """Maximum window length for these (normalised) parameters, or ``None`` (unbounded).
+
+        The manager sets a window's end to ``start + duration`` when it has no
+        end, else to ``min(end, start + duration)``.
+        """
+        return None
+
+    def transfers(
+        self, name: str, window: "ScenarioWindow", t: datetime, ctx: dict[str, Any]
+    ) -> list[tuple[int, int, float]]:
+        """Demand transfers ``(from_sku, to_sku, share)`` of this window for ``name`` at ``t``.
+
+        ``ctx`` always contains ``world`` (callers pass ``world=world``).
+        """
+        return []
+
     def promotions(self, window: "ScenarioWindow") -> list[dict[str, Any]]:
         """Promotion specs this window contributes (at most one per window).
 
@@ -105,11 +135,10 @@ class Scenario:
 
 REGISTRY: dict[str, Scenario] = {}
 
-# Scenario ids from the spec that phase 1 does not implement yet. They are
-# accepted in config (with a warning) and ignored.
-PLANNED: frozenset[str] = frozenset(
-    {"hero_oos_substitution", "influencer_cohort_churn", "retailer_overstock"}
-)
+# Scenario ids that are specified but not implemented yet. They are accepted
+# in config (with a warning) and ignored. Every spec scenario is implemented
+# since phase 2; kept for future use.
+PLANNED: frozenset[str] = frozenset()
 
 
 def register(cls: type[Scenario]) -> type[Scenario]:
@@ -154,6 +183,27 @@ def as_bool(sid: str, key: str, value: Any) -> bool:
         if s in ("false", "no", "off", "0"):
             return False
     raise ScenarioParamError(f"scenario {sid}: {key} must be true or false, got {value!r}")
+
+
+def as_int(sid: str, key: str, value: Any, *, minimum: int = 1) -> int:
+    if isinstance(value, bool):
+        raise ScenarioParamError(f"scenario {sid}: {key} must be a whole number, got {value!r}")
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        raise ScenarioParamError(f"scenario {sid}: {key} must be a whole number, got {value!r}") from None
+    if f != f or f in (float("inf"), float("-inf")) or f != int(f):
+        raise ScenarioParamError(f"scenario {sid}: {key} must be a whole number, got {value!r}")
+    if int(f) < minimum:
+        raise ScenarioParamError(f"scenario {sid}: {key} must be >= {minimum}, got {value!r}")
+    return int(f)
+
+
+def as_share(sid: str, key: str, value: Any) -> float:
+    f = as_float(sid, key, value, positive=False)
+    if not 0.0 <= f <= 1.0:
+        raise ScenarioParamError(f"scenario {sid}: {key} must lie in [0, 1], got {value!r}")
+    return f
 
 
 def as_str(sid: str, key: str, value: Any) -> str:

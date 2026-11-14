@@ -9,7 +9,7 @@ Every event carries ``at``: the simulation time at which the business fact
 happened. Writers use it for ``created_at``/``updated_at`` and for any
 business timestamp columns (converted to the system's own time convention).
 
-Which writer consumes what (phase 1):
+Which writer consumes what:
 
 =============================  ===============================================
 Event                          Rows
@@ -48,6 +48,20 @@ ReturnChanged                  wms.returns / wms.return_lines (update)
 ScenarioWindowRecorded         truth.scenario_windows
 ScenarioWindowClosed           truth.scenario_windows (update end_at)
 PlantedEffect                  truth.planted_effects
+FeedDelivered                  feeds.feed_loads + feeds.retailer_sellout | feeds.marketplace_sales_daily
+                               / feeds.marketplace_inventory_daily
+TradeAgreementDefined          erp.kona, erp.zkona_item
+DeductionClaimed               erp.zdeduct, erp.zdeduct_item
+DeductionChanged               erp.zdeduct (update)
+DeductionCleared               erp.zdeduct_clr + erp.zdeduct (update of zztaken / zzrepaid)
+InfluencerCodeRegistered       mkt.influencer_codes
+CampaignDefined                mkt.campaigns
+CampaignStatusChanged          mkt.campaigns (update)
+CampaignSpendReported          mkt.campaign_spend_daily
+SessionsReported               mkt.sessions_daily
+OrdersAttributed               mkt.attributions
+StatusErrorSet                 shop.orders | wms.shipments (update: status set in error)
+StatusErrorCorrected           shop.orders | wms.shipments (update: status corrected)
 =============================  ===============================================
 """
 
@@ -61,7 +75,9 @@ from .model import (
     Address,
     B2BAccount,
     BillingDoc,
+    Campaign,
     Customer,
+    Deduction,
     Delivery,
     Payment,
     Promotion,
@@ -370,3 +386,192 @@ class PlantedEffect(DomainEvent):
     effect: str  # e.g. "delay_multiplier", "promo_discount"
     magnitude: float | None
     detail: dict[str, Any] = field(default_factory=dict)
+
+
+# -- feeds (phase 2) ---------------------------------------------------------
+
+
+@dataclass(slots=True)
+class SelloutRow:
+    dc_account: str
+    sales_channel: str  # store | online
+    sku_id: int
+    units: int
+    value_net_eur: float
+    value_gross_eur: float
+    stock_units: int | None = None  # store rows: region DC on hand at period end
+
+
+@dataclass(slots=True)
+class MarketplaceSalesRow:
+    sku_id: int
+    units: int
+    revenue_gross_eur: float
+    glance_views: int
+
+
+@dataclass(slots=True)
+class MarketplaceInventoryRow:
+    sku_id: int
+    sellable_units: int
+    inbound_units: int
+
+
+@dataclass(slots=True)
+class FeedDelivered(DomainEvent):
+    """One delivered feed file (feeds.feed_loads + its child rows)."""
+
+    channel: str
+    feed_type: str  # sellout_weekly | sellout_monthly | mp_sales_daily | mp_inventory_daily
+    period_start: date
+    period_end: date
+    run: int  # 1 original, 2.. restatement
+    restates_run: int | None = None
+    sellout: list[SelloutRow] = field(default_factory=list)
+    mp_sales: list[MarketplaceSalesRow] = field(default_factory=list)
+    mp_inventory: list[MarketplaceInventoryRow] = field(default_factory=list)
+
+
+# -- deductions (phase 2) ----------------------------------------------------
+
+
+@dataclass(slots=True)
+class DeductionClaimed(DomainEvent):  # erp.zdeduct insert (+ zdeduct_item)
+    deduction: Deduction
+
+
+@dataclass(slots=True)
+class DeductionChanged(DomainEvent):  # erp.zdeduct update
+    deduction_id: int
+    status: str | None = None  # DEDUCTION_STATUSES; None = only fields
+    # optional neutral fields: matched_on, disputed_on, dispute_reason, resolved_on, accepted_amount, closed_on
+    fields: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class DeductionCleared(DomainEvent):  # erp.zdeduct_clr insert + zdeduct zztaken/zzrepaid update
+    deduction_id: int
+    seq: int  # 1-based clearing sequence of the deduction (buzei)
+    kind: str  # taken | repaid
+    billing_id: int | None  # invoice short-paid (taken); None for repaid
+    amount: float  # EUR, positive
+    on: date  # local clearing date
+    taken_total: float  # after this item
+    repaid_total: float
+
+
+@dataclass(slots=True)
+class TradeAgreementItem:
+    sku_id: int
+    customer_article: str
+    scan_rate_net: float  # EUR per unit sold
+
+
+@dataclass(slots=True)
+class TradeAgreementDefined(DomainEvent):  # erp.kona + erp.zkona_item
+    promo_id: int
+    channel: str
+    account_id: str  # retailer sold-to
+    text: str  # the retailer's wording
+    start: date
+    end: date  # inclusive
+    discount_pct: float
+    off_invoice_share: float  # retail_funding_share
+    scanback_share: float
+    advertising_fee_eur: float | None
+    items: list[TradeAgreementItem] = field(default_factory=list)
+
+
+# -- marketing (phase 2) -----------------------------------------------------
+
+
+@dataclass(slots=True)
+class InfluencerCodeRegistered(DomainEvent):  # mkt.influencer_codes
+    code: str
+    handle: str
+    audience_platform: str
+    commission_pct: float
+    fixed_fee_eur: float
+    valid_from: date
+
+
+@dataclass(slots=True)
+class CampaignDefined(DomainEvent):  # mkt.campaigns insert
+    campaign: Campaign
+    status: str  # planned | active
+
+
+@dataclass(slots=True)
+class CampaignStatusChanged(DomainEvent):  # mkt.campaigns update
+    campaign_id: str
+    status: str
+    end_date: date | None = None  # set on 'ended' (differs from the defined end after an early CLI disable)
+    daily_budget_eur: float | None = None  # set when a scenario changes the budget (influencer_cohort_churn)
+
+
+@dataclass(slots=True)
+class CampaignSpendRow:
+    campaign_id: str
+    spend_date: date
+    impressions: int
+    clicks: int
+    spend_eur: float
+    platform_conversions: int
+
+
+@dataclass(slots=True)
+class CampaignSpendReported(DomainEvent):  # mkt.campaign_spend_daily
+    rows: list[CampaignSpendRow]
+
+
+@dataclass(slots=True)
+class SessionsRow:
+    channel: str
+    country: str
+    device: str
+    sessions: int
+    users: int
+    new_users: int
+    orders: int
+    revenue_eur: float
+
+
+@dataclass(slots=True)
+class SessionsReported(DomainEvent):  # mkt.sessions_daily
+    session_date: date
+    rows: list[SessionsRow]
+
+
+@dataclass(slots=True)
+class AttributionRow:
+    order_id: int
+    customer_id: int
+    attribution_date: date
+    channel: str
+    campaign_id: str | None
+    influencer_code: str | None
+    is_new_customer: bool
+    revenue_eur: float
+
+
+@dataclass(slots=True)
+class OrdersAttributed(DomainEvent):  # mkt.attributions
+    rows: list[AttributionRow]
+
+
+# -- chaos (phase 2) ---------------------------------------------------------
+
+
+@dataclass(slots=True)
+class StatusErrorSet(DomainEvent):  # shop.orders.status | wms.shipments.status_code (update)
+    system: str  # shop | wms
+    entity_id: int  # web order id (shop) | delivery id (wms)
+    wrong_status: str  # neutral: WEB_ORDER_STATUSES | DELIVERY_STATUSES ('cancelled' in both systems)
+    error_at: datetime  # written to shop.orders.cancelled_at | wms.shipments.cancelled_local (kept after correction)
+
+
+@dataclass(slots=True)
+class StatusErrorCorrected(DomainEvent):
+    system: str
+    entity_id: int
+    status: str  # neutral current status

@@ -8,13 +8,14 @@ business stories with ground truth.
 
 The simulated company is **Northvale Consumer Care GmbH**, a German skincare manufacturer with
 three brands (Velmora, Cutara, Sorell) selling in Germany, Austria and Switzerland through its
-own web shop and drugstore chains. Everything is fictional. All parameters are synthetic
+own web shop, two drugstore chains, a perfumery chain and a marketplace. Everything is fictional. All parameters are synthetic
 defaults, not market data.
 
-> Status: **phase 1** (core loop). The web shop, warehouse and SAP-style ERP systems are
-> generated, along with the web channel, the two drugstore chains' sell-in and two planted
-> scenarios. Retail feeds, marketing, the digital shelf and data quality noise follow in
-> phases 2 and 3. See [docs/SPEC.md](docs/SPEC.md).
+> Status: **phase 2** (retail reality). The web shop, warehouse, SAP-style ERP (with trade
+> deductions), marketing stack and retailer and marketplace feeds are generated for all five
+> channels, with five planted scenarios and data quality noise recorded in `truth`. The digital
+> shelf, a readable English ERP naming profile and platform guides follow in phase 3. See
+> [docs/SPEC.md](docs/SPEC.md).
 
 ## Quick start (Docker)
 
@@ -25,8 +26,9 @@ docker compose logs -f generator
 ```
 
 On first start the generator creates the schemas and backfills 24 months of history. With the
-default volume this took 13 minutes with the stack limited to 2 vCPU and 2 GB RAM; slower disks
-take longer. It then keeps running live, with the simulation clock equal to wall time. Only
+default volume this takes about 15 minutes with the stack limited to 2 vCPU and 2 GB RAM (phase 1
+measured 13 minutes there; phase 2 takes 1.1 to 1.15 times as long on the same machine); slower
+disks take longer. It then keeps running live, with the simulation clock equal to wall time. Only
 Postgres is published (port 5432, SSL required for remote connections).
 
 Connect your BI tool as `bi_reader` (password `CPGSIM_READER_PASSWORD`) to database `cpgsim`.
@@ -38,18 +40,24 @@ That role can read the business schemas and nothing else.
 | --- | --- | --- |
 | `shop` | Web shop platform: customers, addresses, orders, order lines, payments, refunds, promotions, subscriptions | UUID keys, `timestamptz` in UTC, statuses as words |
 | `wms` | Warehouse and shipping: shipments, carrier events, returns, daily stock levels, stock movements | Integer keys, two-letter status codes, local Berlin time without time zone |
-| `erp` | SAP-style ERP: `mara`, `makt`, `mbew`, `kna1`, `knmt`, `tcurr`, `vbak`/`vbap`, `konv`, `likp`/`lips`, `vbrk`/`vbrp` | Ten-digit document numbers, SAP field names, amounts in document currency plus EUR |
-| `mkt`, `feeds`, `shelf` | Marketing, retailer feeds, digital shelf | Arrive in phases 2 and 3 |
+| `erp` | SAP-style ERP: `mara`, `makt`, `mbew`, `kna1`, `knmt`, `tcurr`, `vbak`/`vbap`, `konv`, `likp`/`lips`, `vbrk`/`vbrp`, trade promotion agreements `kona`/`zkona_item`, deductions `zdeduct`/`zdeduct_item`/`zdeduct_clr` | Ten-digit document numbers, SAP field names, amounts in document currency plus EUR |
+| `mkt` | Marketing stack: campaigns, daily spend, web sessions, last-click attributions, influencer codes | Text keys, dates; daily facts exported once a day after the day closes |
+| `feeds` | Retailer sell-out (weekly; the perfumery per retail month), marketplace daily sales, traffic and inventory, feed loads | Flat file-like rows in each sender's own codes and layout, a load id per delivery, insert-only (restatements are new loads) |
+| `shelf` | Digital shelf | Arrives in phase 3 |
 | `sim`, `truth` | Simulator state and ground truth for planted scenarios | Never granted to `bi_reader` |
 
 The systems do not share keys. The shop order UUID reaches the ERP only as a reference on the
-sales document (`vbak.bstnk`). The warehouse references the ERP delivery number, never the shop
-order. Web customers appear in the ERP as one collective account per country. Joining the
-systems is part of what a platform is tested on.
+sales document (`vbak.bstnk`, about 1 % missing or truncated). The warehouse references the ERP
+delivery number, never the shop order. Web customers appear in the ERP as one collective account
+per country. Retailers and the marketplace report their own article numbers, mapped through
+`erp.knmt` (about 95 % complete). For the missing 5 % the EDI order lines (`vbap.kdmat` next to
+`matnr`) and the brand's promotion agreements still show the article, so the mapping can be
+recovered from the order history; feeds and deduction claim items carry the article only. Joining
+the systems is part of what a platform is tested on.
 
-At the default 300 web orders a day, a 24-month backfill writes about 9.3 million rows (3.0 GB
-including indexes, plus up to 2 GB of Postgres WAL). Live mode adds about 11,000 to 13,000 rows
-a day, about 1.5 GB a year.
+At the default 300 web orders a day, a 24-month backfill writes about 10.4 million rows (3.3 GB
+including indexes, plus up to 2 GB of Postgres WAL). Live mode adds about 13,000 to 14,600 rows
+a day, about 1.6 GB a year.
 
 ## Loading it into a BI tool
 
@@ -61,7 +69,8 @@ without custom logic:
   `updated_at` moves on every change and is indexed;
 - nothing is ever deleted: cancellations are states, withdrawn rows carry `is_deleted` and
   `deleted_at`;
-- daily snapshot tables (`wms.stock_levels_daily`) are insert-only.
+- daily snapshot tables (`wms.stock_levels_daily`) and the four `feeds` tables are insert-only:
+  load them in full or append by `load_id` (a restated sell-out period is a new load).
 
 Load incrementally with `WHERE updated_at > :last_watermark` on a 5 to 15 minute schedule.
 A change committed by the generator is visible at the end of its 30-second tick.
@@ -82,6 +91,14 @@ joining sources. Each one records exactly what it did in the `truth` schema.
 | --- | --- |
 | `carrier_decay` | Swiftbox deliveries in Bavaria get 2.5 times slower and fail three times as often from a set week |
 | `promo_margin_trap` | 25 % off plus free shipping on Velmora grows orders but loses money once shipping and returns are costed |
+| `hero_oos_substitution` | A quality block takes a hero SKU out of stock for three weeks; a sibling absorbs 40 % of its demand, retailers' sell-out dips |
+| `influencer_cohort_churn` | A boosted influencer campaign buys customers who rarely order again (CAC versus lifetime value) |
+| `retailer_overstock` | Mylo orders 30 % above its sell-out for a quarter, then cuts orders and claims clearance deductions |
+
+Data quality noise (duplicate customers, malformed postcodes, statuses set in error, duplicate
+carrier scans, DST local times, missing order references, unmapped articles, sell-out
+restatements, free-text return reasons, GDPR erasures) is planted at low configurable rates and
+recorded in `truth` the same way (`sim truth <defect>`).
 
 Switch a scenario on live, for example during a demo, and it shows up in the BI tool after the
 next incremental load:
@@ -102,7 +119,7 @@ docker compose exec generator sim truth promo_margin_trap
 | `sim start` | Container entrypoint: init, backfill if new, then run |
 | `sim status` | Clock, queue depth, rows written in the last hour, active scenarios, config changes |
 | `sim scenario list / enable <id> / disable <id>` | Lists scenarios or switches one on or off from now |
-| `sim truth <scenario id>` | Prints what a scenario planted |
+| `sim truth <scenario or defect id>` | Prints what a scenario or data quality defect planted |
 
 ## Configuration
 

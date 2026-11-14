@@ -26,6 +26,8 @@ from ..domain.events import (
     PromotionDefined,
     RefundChanged,
     RefundIssued,
+    StatusErrorCorrected,
+    StatusErrorSet,
     SubscriptionChanged,
     SubscriptionCreated,
     WebOrderLinesChanged,
@@ -165,6 +167,8 @@ class ShopWriter(Writer):
             RefundChanged: self.on_refund_changed,
             SubscriptionCreated: self.on_subscription_created,
             SubscriptionChanged: self.on_subscription_changed,
+            StatusErrorSet: self.on_status_error_set,
+            StatusErrorCorrected: self.on_status_error_corrected,
         }
 
     # -- helpers -----------------------------------------------------------
@@ -399,6 +403,24 @@ class ShopWriter(Writer):
         col = ORDER_STATUS_TIMESTAMPS[e.milestone]
         eff = e.effective_at if e.effective_at is not None else e.at
         self.t(ORDERS).update(keys.shop_order_id(self.seed, e.order_id), {col: eff}, e.at)
+
+    def on_status_error_set(self, e: StatusErrorSet) -> None:
+        """Chaos: an order status set in error, with its timestamp column (``cancelled_at``)."""
+        if e.system != "shop":
+            return
+        status = _check(e.wrong_status, WEB_ORDER_STATUSES, "order status")
+        changes: dict[str, Any] = {"status": status}
+        col = ORDER_STATUS_TIMESTAMPS.get(status)
+        if col is not None:
+            changes[col] = e.error_at
+        self.t(ORDERS).update(keys.shop_order_id(self.seed, e.entity_id), changes, e.at)
+
+    def on_status_error_corrected(self, e: StatusErrorCorrected) -> None:
+        """Chaos: the status is reverted by hand; the error timestamp stays (residue)."""
+        if e.system != "shop":
+            return
+        status = _check(e.status, WEB_ORDER_STATUSES, "order status")
+        self.t(ORDERS).update(keys.shop_order_id(self.seed, e.entity_id), {"status": status}, e.at)
 
     def on_order_lines_changed(self, e: WebOrderLinesChanged) -> None:
         buf = self.t(ORDER_LINES)

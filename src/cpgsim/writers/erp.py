@@ -27,6 +27,9 @@ from ..domain.events import (
     BillingDocChanged,
     BillingDocCreated,
     CustomerMaterialListed,
+    DeductionChanged,
+    DeductionClaimed,
+    DeductionCleared,
     DeliveryChanged,
     DeliveryCreated,
     FxRatePublished,
@@ -35,6 +38,7 @@ from ..domain.events import (
     ServiceMaterialListed,
     SkuListed,
     StandardCostRevised,
+    TradeAgreementDefined,
 )
 from ..domain.model import B2BAccount, Condition, SalesItem, Sku
 from ..engine.rng import Rng
@@ -58,6 +62,12 @@ LIKP = "erp.likp"
 LIPS = "erp.lips"
 VBRK = "erp.vbrk"
 VBRP = "erp.vbrp"
+# phase 2: trade promotion agreements and deductions (customer Z-tables)
+KONA = "erp.kona"
+ZKONA_ITEM = "erp.zkona_item"
+ZDEDUCT = "erp.zdeduct"
+ZDEDUCT_ITEM = "erp.zdeduct_item"
+ZDEDUCT_CLR = "erp.zdeduct_clr"
 
 # -- organisational constants --------------------------------------------------
 
@@ -296,6 +306,17 @@ def fictional_vat_id(seed: int, account_id: str, country: str) -> str:
 # -- writer ----------------------------------------------------------------------
 
 
+def _sortl(account_id: str) -> str:
+    """Search term (10 characters): the account id, or for a longer id its head shortened before the
+    last ``-`` part (``SHOPNOVA-DC1`` -> ``SHOPNO-DC1``), so ship-to points stay unique."""
+    if len(account_id) <= 10:
+        return account_id
+    head, sep, tail = account_id.rpartition("-")
+    if not sep or len(tail) >= 9:
+        return account_id[:10]
+    return f"{head[:10 - len(tail) - 1]}-{tail}"
+
+
 class ErpWriter(Writer):
     tables = (
         TableSpec(MARA, ("matnr",)),
@@ -311,6 +332,12 @@ class ErpWriter(Writer):
         TableSpec(LIPS, ("vbeln", "posnr")),
         TableSpec(VBRK, ("vbeln",)),
         TableSpec(VBRP, ("vbeln", "posnr")),
+        # phase 2 (handlers: deductions work package)
+        TableSpec(KONA, ("knuma",)),
+        TableSpec(ZKONA_ITEM, ("knuma", "posnr")),
+        TableSpec(ZDEDUCT, ("belnr",)),
+        TableSpec(ZDEDUCT_ITEM, ("belnr", "posnr")),
+        TableSpec(ZDEDUCT_CLR, ("belnr", "buzei")),
     )
 
     def handlers(self) -> dict[type, Callable[[Any], None]]:
@@ -327,6 +354,10 @@ class ErpWriter(Writer):
             DeliveryChanged: self.on_delivery_changed,
             BillingDocCreated: self.on_billing_doc_created,
             BillingDocChanged: self.on_billing_doc_changed,
+            TradeAgreementDefined: self.on_trade_agreement_defined,
+            DeductionClaimed: self.on_deduction_claimed,
+            DeductionChanged: self.on_deduction_changed,
+            DeductionCleared: self.on_deduction_cleared,
         }
 
     # -- helpers -------------------------------------------------------------
@@ -447,7 +478,7 @@ class ErpWriter(Writer):
                 "kunnr": self._kunnr(a.account_id),
                 "ktokd": _lookup(KTOKD, a.kind, "account kind"),
                 "name1": a.name[:35],
-                "sortl": a.account_id[:10],
+                "sortl": _sortl(a.account_id),
                 "konzs": a.retailer.upper()[:10] if a.retailer else None,
                 "land1": addr.country,
                 "regio": _regio(addr.region),
@@ -502,8 +533,14 @@ class ErpWriter(Writer):
         netwr = doc.net_value
         bstnk: str | None = None
         if doc.external_ref and doc.doc_type == "web":
-            # The shop order UUID reaches the ERP only as free text.
+            # The shop order UUID reaches the ERP only as free text; chaos may
+            # have flagged it missing or truncated (doc.meta["order_ref"]).
             bstnk = keys.shop_order_id(self.seed, int(doc.external_ref))
+            ref_flag = doc.meta.get("order_ref")
+            if ref_flag == "missing":
+                bstnk = None
+            elif ref_flag == "truncated":
+                bstnk = bstnk[: keys.TRUNCATED_REF_LEN]
         elif doc.external_ref:
             bstnk = doc.external_ref[:40]
         self.t(VBAK).insert(
@@ -916,6 +953,171 @@ class ErpWriter(Writer):
             ch["zzpay_status"] = _lookup(PAY_STATUS, f["status"], "payment status")
         if ch:
             self.t(VBRK).update(keys.vbeln_billing(e.billing_id), ch, e.at)
+
+    # -- trade promotion agreements and deductions (phase 2) -------------------
+    # Customer Z-tables: SAP SD has no standard deduction table (real systems
+    # keep them in FSCM dispute management or a customer table). No credit memo
+    # is written for an accepted deduction: accepted trade funding is
+    # zdeduct.zzaccepted, cash is vbrk.zzpaid_amount plus the clearing items.
+
+    #: Neutral deduction kind -> zdeduct.zztype
+    ZZTYPE = {
+        "promotion": "ZP01",
+        "advertising": "ZW01",
+        "coop": "ZK01",
+        "clearance": "ZP05",
+        "shortage": "ZS01",
+        "service_penalty": "ZL01",
+        "unexplained": "ZX99",
+    }
+    #: Neutral deduction status -> zdeduct.zzstatus
+    ZZSTATUS = {"claimed": "O", "matched": "M", "disputed": "D", "accepted": "A", "reversed": "R"}
+    #: Neutral clearing kind -> zdeduct_clr.zzkind
+    ZZKIND = {"taken": "T", "repaid": "P"}
+    #: Kinds whose claim references the promotion agreement (zdeduct.knuma)
+    KNUMA_KINDS = frozenset({"promotion", "advertising", "unexplained"})
+    #: DeductionChanged neutral field -> zdeduct column (dates)
+    DEDUCTION_DATE_FIELDS = {
+        "matched_on": "zzmatch_date",
+        "disputed_on": "zzdisp_date",
+        "resolved_on": "zzres_date",
+        "closed_on": "zzclose_date",
+    }
+    ERNAM_TPM = "TPM_IF"
+    ERNAM_DEDUCT = "DEDUCT_IN"
+
+    @staticmethod
+    def _as_date(v: date | str | None) -> date | None:
+        """Event field date: a date, or its ISO string after a JSON round trip."""
+        if v is None or (isinstance(v, date) and not isinstance(v, datetime)):
+            return v
+        if isinstance(v, datetime):
+            return v.date()
+        return date.fromisoformat(v)
+
+    def on_trade_agreement_defined(self, e: TradeAgreementDefined) -> None:
+        knuma = keys.knuma_promotion(e.promo_id)
+        fee = e.advertising_fee_eur
+        self.t(KONA).insert(
+            {
+                "knuma": knuma,
+                "boart": "ZPRO",
+                "kunnr": self._kunnr(e.account_id),
+                "botext": e.text[:60],
+                "datab": self._as_date(e.start),
+                "datbi": self._as_date(e.end),
+                "zzdisc_pct": _r2(e.discount_pct * 100.0),
+                "zzofi_pct": _r2(e.off_invoice_share * 100.0),
+                "zzscan_pct": _r2(e.scanback_share * 100.0),
+                "zzwkz_eur": _r2(fee) if fee else None,
+                "erdat": self._date(e.at),
+                "ernam": self.ERNAM_TPM,
+            },
+            e.at,
+        )
+        items = self.t(ZKONA_ITEM)
+        for n, it in enumerate(e.items, start=1):
+            items.insert(
+                {
+                    "knuma": knuma,
+                    "posnr": keys.item_posnr(n * 10),
+                    "matnr": keys.matnr(it.sku_id),
+                    "kdmat": it.customer_article,
+                    "zzscan_eur": round(float(it.scan_rate_net), 4),
+                },
+                e.at,
+            )
+
+    def on_deduction_claimed(self, e: DeductionClaimed) -> None:
+        d = e.deduction
+        belnr = keys.belnr_deduction(d.deduction_id)
+        claimed_on = self._as_date(d.claimed_on)
+        claimed_at = _dt(d.claimed_at)
+        resolved = d.status in ("accepted", "reversed")
+        amount = _r2(d.amount)
+        self.t(ZDEDUCT).insert(
+            {
+                "belnr": belnr,
+                "bukrs": BUKRS,
+                "gjahr": f"{claimed_on.year:04d}",
+                "kunnr": self._kunnr(d.payer),
+                "zztype": _lookup(self.ZZTYPE, d.kind, "deduction kind"),
+                "xblnr": keys.retailer_claim_ref(d.channel, d.deduction_id, claimed_on),
+                "bldat": claimed_on,
+                "budat": claimed_on,
+                "wrbtr": amount,
+                "waers": "EUR",
+                "dmbtr": amount,
+                "knuma": (keys.knuma_promotion(d.promo_id)
+                          if d.promo_id is not None and d.kind in self.KNUMA_KINDS else None),
+                "zzpromo_text": d.promo_text[:60] if d.promo_text else None,
+                "zzperiod_from": self._as_date(d.period_from),
+                "zzperiod_to": self._as_date(d.period_to),
+                "vbeln_vl": keys.vbeln_delivery(d.delivery_id) if d.delivery_id is not None else None,
+                "vbeln_va": keys.vbeln_sales(d.sales_doc_id) if d.sales_doc_id is not None else None,
+                "vbeln_vf": keys.vbeln_billing(d.billing_id) if d.billing_id is not None else None,
+                "zzstatus": _lookup(self.ZZSTATUS, d.status, "deduction status"),
+                "zzmatch_date": None,
+                "zzdisp_date": None,
+                "zzdisp_reason": d.dispute_reason if d.status == "disputed" else None,
+                "zzres_date": claimed_on if resolved else None,
+                "zzaccepted": _r2(d.accepted_amount) if d.accepted_amount is not None else None,
+                "zztaken": _r2(d.taken),
+                "zzrepaid": _r2(d.repaid),
+                "zzclose_date": None,
+                "erdat": self._date(claimed_at),
+                "erzet": self._time(claimed_at),
+                "ernam": self.ERNAM_DEDUCT,
+            },
+            e.at,
+        )
+        items = self.t(ZDEDUCT_ITEM)
+        for n, it in enumerate(d.items, start=1):
+            items.insert(
+                {
+                    "belnr": belnr,
+                    "posnr": keys.item_posnr(n * 10),
+                    "kdmat": it.customer_article,
+                    "matnr": keys.matnr(it.sku_id) if it.mapped and it.sku_id else None,
+                    "zzunits": int(it.units),
+                    "zzrate": round(float(it.rate_net), 4),
+                    "wrbtr": _r2(it.amount),
+                },
+                e.at,
+            )
+
+    def on_deduction_changed(self, e: DeductionChanged) -> None:
+        f = e.fields
+        ch: dict[str, Any] = {}
+        if e.status is not None:
+            ch["zzstatus"] = _lookup(self.ZZSTATUS, e.status, "deduction status")
+        for name, col in self.DEDUCTION_DATE_FIELDS.items():
+            if f.get(name) is not None:
+                ch[col] = self._as_date(f[name])
+        if f.get("dispute_reason") is not None:
+            ch["zzdisp_reason"] = f["dispute_reason"]
+        if f.get("accepted_amount") is not None:
+            ch["zzaccepted"] = _r2(f["accepted_amount"])
+        if ch:
+            self.t(ZDEDUCT).update(keys.belnr_deduction(e.deduction_id), ch, e.at)
+
+    def on_deduction_cleared(self, e: DeductionCleared) -> None:
+        belnr = keys.belnr_deduction(e.deduction_id)
+        kind = _lookup(self.ZZKIND, e.kind, "clearing kind")
+        self.t(ZDEDUCT_CLR).insert(
+            {
+                "belnr": belnr,
+                "buzei": f"{int(e.seq):03d}",
+                "zzkind": kind,
+                "vbeln_vf": keys.vbeln_billing(e.billing_id) if e.billing_id is not None else None,
+                "augdt": self._as_date(e.on),
+                "dmbtr": _r2(e.amount),
+            },
+            e.at,
+        )
+        self.t(ZDEDUCT).update(
+            belnr, {"zztaken": _r2(e.taken_total), "zzrepaid": _r2(e.repaid_total)}, e.at
+        )
 
 
 def _ref_pos(item, is_cm: bool) -> str | None:

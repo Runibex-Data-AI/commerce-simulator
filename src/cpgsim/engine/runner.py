@@ -55,6 +55,7 @@ import psycopg
 
 from .. import db, domain, writers
 from ..config import Config
+from ..models import arrivals
 from ..writers.base import Dispatcher, WriterContext
 from .entities import EntityStore
 from .queue import EventQueue
@@ -566,13 +567,15 @@ class Simulation:
         """Advance at backfill speed to ``until`` (default: now, taken under the scenario lock)."""
         bf = self.cfg.backfill
         now = self.refresh_scenarios()
-        return self.advance(
+        n = self.advance(
             until or now,
             timedelta(minutes=bf.tick_minutes),
             timedelta(hours=bf.commit_every_hours),
             "backfill",
             progress,
         )
+        log.info("backfill done: clipped arrival candidates %s", arrivals.clip_stats())
+        return n
 
     def stop(self, *_args) -> None:
         self._stop.set()

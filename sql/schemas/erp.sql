@@ -448,3 +448,129 @@ COMMENT ON COLUMN erp.vbrp.vgbel IS 'Reference document: the delivery (vgtyp J) 
 COMMENT ON COLUMN erp.vbrp.vgpos IS 'Reference item. Not populated in phase 1: to find the delivery item of an invoice item join erp.lips on lips.vbeln = vbrp.vgbel AND lips.vgpos = vbrp.aupos.';
 COMMENT ON COLUMN erp.vbrp.wavwr IS 'Cost (standard cost x quantity) in document currency.';
 COMMENT ON COLUMN erp.vbrp.aupos IS 'Sales document item billed; 000900 (matnr SHIPPING) is the web shipping charge, billed on the first invoice of the order.';
+
+-- ---------------------------------------------------------------------------
+-- Phase 2: trade promotion agreements and deductions (customer Z-tables; SAP SD
+-- has no standard deduction table: real systems keep them in FSCM dispute
+-- management or a customer table).
+-- ---------------------------------------------------------------------------
+
+-- Trade promotion agreements: the brand's record of each retailer promotion it co-funds
+-- (written when the promotion is agreed, about 6 weeks before it starts).
+CREATE TABLE IF NOT EXISTS erp.kona (
+    knuma         varchar(10)   NOT NULL PRIMARY KEY,  -- agreement number (= promotion)
+    boart         varchar(4)    NOT NULL,              -- 'ZPRO' trade promotion
+    kunnr         varchar(10)   NOT NULL,              -- retailer sold-to account
+    botext        varchar(60)   NOT NULL,              -- the retailer's wording, e.g. AKTION KW10/2026
+    datab         date          NOT NULL,              -- valid from (first promotion day)
+    datbi         date          NOT NULL,              -- valid to (last promotion day, inclusive)
+    zzdisc_pct    numeric(5,2)  NOT NULL,              -- consumer discount, percent
+    zzofi_pct     numeric(5,2)  NOT NULL,              -- off-invoice share of the discount on forward-buy lines, percent
+    zzscan_pct    numeric(5,2)  NOT NULL,              -- scan-back share of the discount, percent
+    zzwkz_eur     numeric(12,2),                       -- fixed advertising fee (WKZ), if agreed
+    erdat date NOT NULL, ernam varchar(12) NOT NULL,   -- 'TPM_IF'
+    created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL,
+    is_deleted boolean NOT NULL DEFAULT false, deleted_at timestamptz
+);
+CREATE TABLE IF NOT EXISTS erp.zkona_item (
+    knuma         varchar(10)   NOT NULL,
+    posnr         varchar(6)    NOT NULL,              -- 000010, 000020 ...
+    matnr         varchar(18)   NOT NULL,              -- promoted material
+    kdmat         varchar(35),                         -- the retailer's article number (as in knmt)
+    zzscan_eur    numeric(10,4) NOT NULL,              -- agreed scan-back amount per unit sold, net
+    created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL,
+    is_deleted boolean NOT NULL DEFAULT false, deleted_at timestamptz,
+    PRIMARY KEY (knuma, posnr)
+);
+
+-- Deductions: claims raised by trade customers and short-paid from invoices. No credit
+-- memo is issued for an accepted deduction (phase 2): accepted trade funding is
+-- zdeduct.zzaccepted, and vbrk revenue of trade customers is gross of it.
+CREATE TABLE IF NOT EXISTS erp.zdeduct (
+    belnr         varchar(10)   NOT NULL PRIMARY KEY,  -- deduction case number 0070000001...
+    bukrs         varchar(4)    NOT NULL,              -- '1000'
+    gjahr         varchar(4)    NOT NULL,              -- fiscal year of the claim (calendar year)
+    kunnr         varchar(10)   NOT NULL,              -- payer: the retailer's sold-to account
+    zztype        varchar(4)    NOT NULL,              -- ZP01 promotion, ZW01 advertising, ZK01 co-op, ZP05 clearance support,
+                                                       -- ZS01 shortage, ZL01 service penalty, ZX99 unexplained
+    xblnr         varchar(16)   NOT NULL,              -- the retailer's claim reference
+    bldat         date          NOT NULL,              -- claim date (retailer document date)
+    budat         date          NOT NULL,              -- received/posted date
+    wrbtr         numeric(15,2) NOT NULL,              -- claimed amount, document currency (gross)
+    waers         varchar(5)    NOT NULL,              -- EUR
+    dmbtr         numeric(15,2) NOT NULL,              -- claimed amount in EUR
+    knuma         varchar(10),                         -- promotion agreement (ZP01, ZW01 per promotion, ZX99)
+    zzpromo_text  varchar(60),                         -- the retailer's free-text promotion reference
+    zzperiod_from date,                                -- claimed sales period (ZP01, ZX99)
+    zzperiod_to   date,
+    vbeln_vl      varchar(10),                         -- delivery (ZS01)
+    vbeln_va      varchar(10),                         -- sales order (ZL01)
+    vbeln_vf      varchar(10),                         -- invoice (ZK01 and invoice-based ZW01)
+    zzstatus      char(1)       NOT NULL,              -- O claimed, M matched, D disputed, A accepted, R reversed
+    zzmatch_date  date,
+    zzdisp_date   date,
+    zzdisp_reason varchar(3),                          -- D01 over agreement, D02 no promotion, D03 POD complete, D04 duplicate
+    zzres_date    date,                                -- accepted or reversed on
+    zzaccepted    numeric(15,2),                       -- accepted amount (A; partial allowed), 0 when R
+    zztaken       numeric(15,2) NOT NULL DEFAULT 0,    -- taken by short payment so far (sum of zdeduct_clr T)
+    zzrepaid      numeric(15,2) NOT NULL DEFAULT 0,    -- repaid by the customer so far (sum of zdeduct_clr P)
+    zzclose_date  date,                                -- case closed (taken - repaid = accepted)
+    erdat         date          NOT NULL,
+    erzet         time          NOT NULL,
+    ernam         varchar(12)   NOT NULL,              -- 'DEDUCT_IN'
+    created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL,
+    is_deleted boolean NOT NULL DEFAULT false, deleted_at timestamptz
+);
+CREATE TABLE IF NOT EXISTS erp.zdeduct_item (
+    belnr         varchar(10)   NOT NULL,
+    posnr         varchar(6)    NOT NULL,
+    kdmat         varchar(35),                         -- article number as claimed by the retailer
+    matnr         varchar(18),                         -- NULL when the article is not mapped in knmt
+    zzunits       integer       NOT NULL,              -- claimed units
+    zzrate        numeric(10,4) NOT NULL,              -- per unit, net
+    wrbtr         numeric(15,2) NOT NULL,              -- item amount, gross
+    created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL,
+    is_deleted boolean NOT NULL DEFAULT false, deleted_at timestamptz,
+    PRIMARY KEY (belnr, posnr)
+);
+CREATE TABLE IF NOT EXISTS erp.zdeduct_clr (
+    belnr         varchar(10)   NOT NULL,
+    buzei         varchar(3)    NOT NULL,              -- 001, 002 ...
+    zzkind        char(1)       NOT NULL,              -- T taken by short payment, P repaid by the customer
+    vbeln_vf      varchar(10),                         -- invoice short-paid (T); NULL for P
+    augdt         date          NOT NULL,              -- clearing date
+    dmbtr         numeric(15,2) NOT NULL,              -- amount in EUR, positive
+    created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL,
+    is_deleted boolean NOT NULL DEFAULT false, deleted_at timestamptz,
+    PRIMARY KEY (belnr, buzei)
+);
+CREATE INDEX IF NOT EXISTS kona_updated_at_idx ON erp.kona (updated_at);
+CREATE INDEX IF NOT EXISTS zkona_item_updated_at_idx ON erp.zkona_item (updated_at);
+CREATE INDEX IF NOT EXISTS zdeduct_updated_at_idx ON erp.zdeduct (updated_at);
+CREATE INDEX IF NOT EXISTS zdeduct_kunnr_idx ON erp.zdeduct (kunnr, bldat);
+CREATE INDEX IF NOT EXISTS zdeduct_knuma_idx ON erp.zdeduct (knuma);
+CREATE INDEX IF NOT EXISTS zdeduct_item_updated_at_idx ON erp.zdeduct_item (updated_at);
+CREATE INDEX IF NOT EXISTS zdeduct_clr_updated_at_idx ON erp.zdeduct_clr (updated_at);
+CREATE INDEX IF NOT EXISTS zdeduct_clr_vbeln_vf_idx ON erp.zdeduct_clr (vbeln_vf);
+COMMENT ON TABLE  erp.kona IS 'Trade promotion agreements (customer table modelled on SAP KONA): the brand''s side of each retailer promotion it co-funds.';
+COMMENT ON COLUMN erp.kona.knuma IS 'Agreement number; one agreement per retailer promotion.';
+COMMENT ON COLUMN erp.kona.botext IS 'The retailer''s wording of the promotion, e.g. AKTION KW10/2026 (deduction claims quote it in zzpromo_text).';
+COMMENT ON COLUMN erp.kona.zzofi_pct IS 'Share of the consumer discount the brand funds off-invoice on forward-buy order lines, percent.';
+COMMENT ON COLUMN erp.kona.zzscan_pct IS 'Share of the consumer discount the brand reimburses per unit sold (scan-back), percent.';
+COMMENT ON TABLE  erp.zkona_item IS 'Promoted materials of a trade promotion agreement with the agreed scan-back amount per unit.';
+COMMENT ON COLUMN erp.zkona_item.zzscan_eur IS 'Agreed scan-back amount per unit sold on promotion, EUR net of VAT.';
+COMMENT ON TABLE  erp.zdeduct IS 'Deduction cases raised by trade customers and short-paid from invoices (customer table). No credit memo is issued for an accepted deduction: accepted trade funding is zzaccepted; vbrk revenue of trade customers is gross of it.';
+COMMENT ON COLUMN erp.zdeduct.zztype IS 'ZP01 promotion (scan-based), ZW01 advertising, ZK01 co-op, ZP05 clearance support, ZS01 shortage, ZL01 service penalty, ZX99 unexplained.';
+COMMENT ON COLUMN erp.zdeduct.xblnr IS 'The retailer''s own claim reference, in its format.';
+COMMENT ON COLUMN erp.zdeduct.wrbtr IS 'Claimed amount, gross, in document currency (waers).';
+COMMENT ON COLUMN erp.zdeduct.zzstatus IS 'O claimed, M matched, D disputed, A accepted, R reversed.';
+COMMENT ON COLUMN erp.zdeduct.zzdisp_reason IS 'D01 over agreement, D02 no promotion, D03 proof of delivery complete, D04 duplicate.';
+COMMENT ON COLUMN erp.zdeduct.zzaccepted IS 'Accepted amount once accepted (partial allowed); 0 when reversed.';
+COMMENT ON COLUMN erp.zdeduct.zztaken IS 'Amount taken by short payment so far (sum of zdeduct_clr rows with zzkind T).';
+COMMENT ON COLUMN erp.zdeduct.zzrepaid IS 'Amount repaid by the customer so far (sum of zdeduct_clr rows with zzkind P).';
+COMMENT ON COLUMN erp.zdeduct.zzclose_date IS 'Date the case closed (taken - repaid = accepted amount).';
+COMMENT ON TABLE  erp.zdeduct_item IS 'Articles and units claimed on a deduction.';
+COMMENT ON COLUMN erp.zdeduct_item.kdmat IS 'Article number as claimed by the retailer (erp.knmt.kdmat).';
+COMMENT ON COLUMN erp.zdeduct_item.matnr IS 'Material number; NULL when the retailer article is not mapped in erp.knmt.';
+COMMENT ON TABLE  erp.zdeduct_clr IS 'Clearing items of a deduction: amounts taken by short payment of an invoice (T) and repaid by the customer (P).';
+COMMENT ON COLUMN erp.zdeduct_clr.vbeln_vf IS 'Invoice short-paid (zzkind T); NULL for repayments.';

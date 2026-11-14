@@ -35,3 +35,4 @@ CREATE INDEX IF NOT EXISTS planted_effects_updated_at_idx ON truth.planted_effec
 COMMENT ON COLUMN truth.planted_effects.entity_id IS 'Neutral simulator id (not any system key); see system_refs for the per-system keys.';
 COMMENT ON COLUMN truth.planted_effects.system_refs IS 'Keys of the affected entity in each source system (shop UUIDs, SAP numbers, WMS ids).';
 COMMENT ON COLUMN truth.scenario_windows.end_at IS 'NULL while the scenario window is still open.';
+COMMENT ON COLUMN truth.scenario_windows.source IS 'config | cli | chaos';

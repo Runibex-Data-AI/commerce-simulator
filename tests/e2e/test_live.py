@@ -366,9 +366,12 @@ def test_evicting_customers_changes_nothing_in_the_data(fresh_db, monkeypatch):
         with simulation(b, small_cfg(), start) as sim:
             sim.backfill(until)
             all_customers = sim.store.count("customer")
+            dup_entities = sum(1 for cid, _ in sim.store.items("customer") if int(cid) >= keys.DUPLICATE_CUSTOMER_BASE)
     assert_same(digest(a), digest(b))
     ((n_shop,),) = q(a, "SELECT count(*) FROM shop.customers")
-    assert all_customers == n_shop
+    # duplicate accounts (chaos) are shop records; only those that took over a person become entities
+    ((n_dup,),) = q(a, "SELECT count(*) FROM truth.planted_effects WHERE effect = 'duplicate_record'")
+    assert all_customers - dup_entities == n_shop - n_dup
     assert kept < 0.8 * n_shop, (kept, n_shop)
     ((stored,),) = q(a, "SELECT count(*) FROM sim.entity_state WHERE kind = 'customer'")
     assert stored == kept

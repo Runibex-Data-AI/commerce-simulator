@@ -27,7 +27,16 @@ Lifecycle:
   Delisted SKUs are not replenished; their leftover stock is written off
   (scrap) 60 days after the delisting and the position is removed;
 * ``wh.snapshot`` (23:55 local, every day): ``StockSnapshotTaken`` for all
-  positions and the EWMA of daily outflow.
+  positions and the EWMA of daily outflow;
+* ``wh.block`` / ``wh.unblock`` (``hero_oos_substitution``): at the window
+  start all available stock of the hero (``on_hand - reserved``) goes under a
+  quality block (``blocked``, movement ``adjustment`` with reference
+  ``QI-BLOCK <window>``); while the block is active, hero stock that becomes
+  available (unreserved, returned) is blocked too and production receipts are
+  held on the position (``held_receipts``). Stock already reserved for open
+  deliveries still ships. At the window end the blocked lot is scrapped
+  (``QI-RECALL <window>``) and the held receipts are booked in order. A window
+  already open at history start is blocked by a bootstrap.
 
 The planner forecast blends the demand model
 (``demandplan.expected_daily_units``) with the observed outflow and carries a
@@ -46,6 +55,8 @@ from ..engine.queue import Event
 from ..engine.registry import arrival_source, bootstrap, handler
 from .events import StockMoved, StockSnapshotRow, StockSnapshotTaken
 from .model import StockPosition
+
+QI_BLOCK_PRIORITY = 10
 
 PLAN_HOUR = 7
 SNAPSHOT_HOUR, SNAPSHOT_MINUTE = 23, 55
@@ -188,6 +199,9 @@ def unreserve(world, sku_id: int, qty: int) -> None:
         return
     pos = world.store.mut("stock", sku_id)
     pos.reserved = max(0, pos.reserved - qty)
+    b = _active_block(world, sku_id)
+    if b is not None:  # released hero units go straight to the quality block
+        _block_available(world, pos, b.window_id)
 
 
 def issue(world, sku_id: int, qty: int, delivery_id: int) -> None:
@@ -219,6 +233,10 @@ def receive_return(world, sku_id: int, qty: int, return_id: int | None, resaleab
         pos.on_hand -= qty
         _move(world, sku_id, "scrap", -qty, delivery_id=delivery_id, return_id=return_id,
               reference="return not resaleable")
+        return
+    b = _active_block(world, sku_id)
+    if b is not None:  # returned hero units are booked into the quality block
+        _block_available(world, pos, b.window_id)
 
 
 # -- forecasting ---------------------------------------------------------------
@@ -376,11 +394,123 @@ def _plan_sku(world, sku, d: date) -> None:
 
 @handler("wh.receipt")
 def on_receipt(world, ev) -> None:
-    sku_id, qty = int(ev.data["sku_id"]), int(ev.data["qty"])
+    sku_id = int(ev.data["sku_id"])
+    if _active_block(world, sku_id) is not None:  # held until the block ends (booked by wh.unblock)
+        pos = _position(world, sku_id)
+        pos.held_receipts.append(dict(ev.data))
+        return
+    _book_receipt(world, ev.data)
+
+
+def _book_receipt(world, data: dict) -> None:
+    sku_id, qty = int(data["sku_id"]), int(data["qty"])
     pos = _position(world, sku_id)
     pos.on_hand += qty
     pos.in_production = max(0, pos.in_production - qty)
-    _move(world, sku_id, "goods_receipt", qty, reference=ev.data.get("order"))
+    _move(world, sku_id, "goods_receipt", qty, reference=data.get("order"))
+
+
+# -- hero quality block (hero_oos_substitution) ----------------------------------------
+
+
+def _hero_api():
+    import importlib
+
+    return importlib.import_module("cpgsim.scenarios.hero_oos_substitution")
+
+
+def _blocks(world) -> list:
+    """Quality blocks of all hero_oos_substitution windows (cached per scenario version)."""
+    sc = world.scenarios
+    if sc is None or not hasattr(sc, "windows"):
+        return []
+    from . import promotions
+
+    key = promotions._version(world)
+    c = world.__dict__.get("_wh_blocks")
+    if c is None or c[0] != key:
+        c = (key, _hero_api().blocks(world))
+        world.__dict__["_wh_blocks"] = c
+    return c[1]
+
+
+def _active_block(world, sku_id: int):
+    """The block of hero ``sku_id`` active now (latest start first), or None."""
+    hit = [b for b in _blocks(world) if b.sku_id == sku_id and b.start <= world.now < b.end]
+    return max(hit, key=lambda b: b.start) if hit else None
+
+
+def _block_available(world, pos: StockPosition, window_id: str) -> int:
+    """Move the position's available units (``on_hand - reserved``) into the quality block."""
+    q = pos.on_hand - pos.reserved
+    if q <= 0:
+        return 0
+    pos.on_hand -= q
+    pos.blocked += q
+    _move(world, pos.sku_id, "adjustment", -q, reference=f"QI-BLOCK {window_id}")
+    return q
+
+
+@arrival_source("wh.quality_block")
+def quality_block_arrivals(world, start: datetime, end: datetime):
+    """Block and unblock events of the hero windows (pure in the current scenario windows)."""
+    out = []
+    for b in _blocks(world):
+        data = {"window_id": b.window_id, "sku_id": b.sku_id}
+        if start < b.start <= end:
+            out.append(Event(due=b.start, kind="wh.block", key=f"wh.block:{b.window_id}", data=data,
+                             priority=QI_BLOCK_PRIORITY))
+        if start < b.end <= end:
+            out.append(Event(due=b.end, kind="wh.unblock", key=f"wh.unblock:{b.window_id}", data=dict(data),
+                             priority=QI_BLOCK_PRIORITY))
+    return out
+
+
+@bootstrap(order=21)
+def bootstrap_quality_blocks(world) -> None:
+    """A hero window already open at history start is blocked right away (after the stock bootstrap)."""
+    hs = world.now
+    for b in _blocks(world):
+        if b.start <= hs < b.end:
+            _apply_block(world, b)
+
+
+def _apply_block(world, b) -> None:
+    hero_mod = _hero_api()
+    pos = _position(world, b.sku_id)
+    q = _block_available(world, pos, b.window_id)
+    w = world.scenarios.window(b.window_id)
+    resolved_on = hero_mod.resolution_date(world, w).isoformat() if w is not None else None
+    detail = {"window_id": b.window_id, "hero": b.sku_id, "sibling": b.sibling_id, "resolved_on": resolved_on}
+    world.scenarios.record_effect(world, hero_mod.SCENARIO_ID, b.window_id, "sku", b.sku_id, "stock_block",
+                                  q, detail)
+    world.scenarios.record_effect(world, hero_mod.SCENARIO_ID, b.window_id, "sku", b.sibling_id,
+                                  "substitution_target", b.share, detail)
+
+
+@handler("wh.block")
+def on_block(world, ev) -> None:
+    wid, sku_id = ev.data["window_id"], int(ev.data["sku_id"])
+    b = _active_block(world, sku_id)
+    if b is None or b.window_id != wid:
+        return  # window withdrawn or changed since the event was queued
+    _apply_block(world, b)
+
+
+@handler("wh.unblock")
+def on_unblock(world, ev) -> None:
+    wid, sku_id = ev.data["window_id"], int(ev.data["sku_id"])
+    if not world.store.has("stock", sku_id):
+        return
+    if _active_block(world, sku_id) is not None:
+        return  # another window of the same hero still blocks it; its unblock releases everything
+    pos = world.store.mut("stock", sku_id)
+    if pos.blocked > 0:
+        _move(world, sku_id, "scrap", -pos.blocked, reference=f"QI-RECALL {wid}")
+        pos.blocked = 0
+    held, pos.held_receipts = list(pos.held_receipts), []
+    for data in held:
+        _book_receipt(world, data)
 
 
 # -- snapshots -----------------------------------------------------------------

@@ -43,7 +43,7 @@ from ..engine.registry import arrival_source, handler
 from ..engine.rng import Rng
 from ..models import arrivals, baskets, payments, seasonality
 from ..models.pricing import split_gross
-from .customers import cache, copy_address, lazy, pick
+from .customers import _Lazy, cache, copy_address, lazy, pick
 from .events import (
     PaymentRecorded,
     PaymentStatusChanged,
@@ -65,9 +65,14 @@ fulfilment = lazy("fulfilment")
 billing = lazy("billing")
 returns = lazy("returns")
 subscriptions = lazy("subscriptions")
+marketing = lazy("marketing")
+chaos = _Lazy("cpgsim.chaos")
 
 SCENARIO_PROMO_BASE = 900_000
-NEW_ORDER_LAM_MAX_FACTOR = 12.0
+# Thinning bound of the new-customer source, relative to the base hourly rate.
+# Phase-1 peak of event x intraday factor is 6.58 (Cyber Monday 20:00); 24 leaves
+# x3.6 for the SKU level and marketing.MULTIPLIER_MAX = 2.0.
+NEW_ORDER_LAM_MAX_FACTOR = 24.0
 REPEAT_KEEP_PROB = 0.85
 REPEAT_EXTRA_PROB = 0.45
 REPEAT_EXTRA_MEAN = 0.5
@@ -144,6 +149,7 @@ def new_customer_rate_per_hour(world, t: datetime) -> float:
         / 24.0
         * seasonality.intraday_factor(world.cfg.seasonality, world.local(t))
         * world.scenarios.factor("web_new_customers", t)
+        * marketing.new_customer_multiplier(world, t)
     )
 
 
@@ -422,7 +428,9 @@ def place_order(
     discount_total = round(sum(ln.discount for ln in olines), 2)
     applied = promo if promo is not None and (discount_total > 0 or waived > 0) else None
 
-    is_repeat = c.orders > 0
+    # The shop's repeat flag counts the account's own orders: a duplicate account
+    # (chaos duplicate_customer) starts at the person's earlier count.
+    is_repeat = c.orders > int(c.meta.get("account_order_offset", 0))
     prev = c.meta.get("pm")
     if prev and rng.random() < SAME_METHOD_PROB:
         method = prev
@@ -445,12 +453,16 @@ def place_order(
     )
     if applied is not None and applied.scenario_id:
         order.scenario_tags.append(applied.scenario_id)
+    order.meta["src"] = source  # traffic source, attributed by marketing once the payment is authorised
+    if c.orders > 0 and not is_repeat:
+        order.meta["person_repeat"] = True  # first order of a duplicate account: the person has ordered before
     c.orders += 1
     c.last_order_at = now
     c.last_skus = list(sku_ids)
     c.meta["pm"] = method
     world.store.put("web_order", oid, order)
     world.emit(WebOrderPlaced(at=now, order=order, customer=c, source=source, promotion=applied))
+    chaos.on_order_placed(world, order)
 
     if applied is not None and applied.scenario_id:
         world.scenarios.record_effect(
@@ -657,6 +669,10 @@ def on_payment(world, ev) -> None:
     if ok:
         o.meta["auth_payment"] = pid
         set_status(world, o, "authorised")
+        # Last-click export fires on the order confirmation (payment authorised), so
+        # orders whose payment fails never reach mkt. The open order keeps its customer.
+        marketing.note_order(world, o, world.store.get("customer", o.customer_id), o.meta.get("src", "direct"),
+                             new_customer=not o.is_repeat)
         delay = min(rng.lognormal_median(world.cfg.fulfilment.release_delay_minutes, RELEASE_SIGMA), 360.0)
         world.schedule(
             "web.release", world.now + timedelta(minutes=max(1.0, delay)), f"web.release:{oid}", {"order_id": oid}
@@ -781,6 +797,7 @@ def on_release(world, ev) -> None:
         shipping_tax=ship_tax,
     )
     world.store.put("sales_doc", sid, doc)
+    chaos.order_ref(world, doc)
     world.emit(SalesDocCreated(at=now, doc=doc))
     o.sales_doc_id = sid
     o.released_at = now
@@ -1092,7 +1109,7 @@ def on_delivery_outcome(world, ev) -> None:
         if c is not None:
             if first:
                 customers.schedule_repurchase(world, c, o)
-                if o.is_repeat and o.subscription_id is None:
+                if (o.is_repeat or o.meta.get("person_repeat")) and o.subscription_id is None:
                     subscriptions.maybe_start_subscription(world, c, o)
             returns.maybe_schedule_return(world, o, dlv)
     elif outcome in ("returned_to_sender", "lost"):

@@ -353,16 +353,23 @@ def create_credit_memo(
 # -- clearing --------------------------------------------------------------------
 
 
-def clear(world, billing_id: int, amount: float | None = None) -> None:
-    """Payment received for a billing document (invoice, or credit memo paid out)."""
+def clear(world, billing_id: int, amount: float | None = None, status: str | None = None) -> None:
+    """Payment received for a billing document (invoice, or credit memo paid out).
+
+    The status is derived (``partially_cleared`` when less than the total was
+    paid) unless ``status`` is given: retail payments that short-pay trade
+    deductions clear the invoice in full (``status="cleared"``); the residual is
+    recorded on the deduction cases (``erp.zdeduct_clr``).
+    """
     doc = world.store.get("billing", billing_id)
     total = None
     if doc is not None:
         total = round(doc.net_value + doc.tax, 2)
     paid = round(float(amount), 2) if amount is not None else total
-    status = "cleared"
+    derived = "cleared"
     if total is not None and paid is not None and paid < total - 0.005:
-        status = "partially_cleared"
+        derived = "partially_cleared"
+    status = status if status is not None else derived
     if doc is not None:
         doc = world.store.mut("billing", billing_id)
         doc.paid_at = world.now

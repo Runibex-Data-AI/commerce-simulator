@@ -112,7 +112,8 @@ def test_load_cfg_with_overlay_and_seed_override(tmp_path, monkeypatch):
     assert cfg.seed == 99
     assert cfg.channels.web.base_orders_per_day == 120
     assert cfg.channels.web.free_shipping_eur == 29.0  # merged, not replaced
-    assert [s.id for s in cfg.scenarios] == ["carrier_decay", "promo_margin_trap", "carrier_decay"]
+    assert [s.id for s in cfg.scenarios] == ["carrier_decay", "promo_margin_trap", "influencer_cohort_churn",
+                                             "retailer_overstock", "hero_oos_substitution", "carrier_decay"]
     assert cli.apply_seed_override(cfg, None) is cfg
     assert cli.apply_seed_override(cfg, 99) is cfg
     over = cli.apply_seed_override(cfg, 4242)
@@ -138,8 +139,8 @@ def test_default_config_values():
     assert (cfg.seed, cfg.history_months, cfg.tick_seconds) == (20261114, 24, 30)
     assert cfg.company.name == "Northvale Consumer Care GmbH"
     assert cfg.erp["naming"] == "sap"
-    assert set(cfg.channels.retailers()) == {"drogerie_kranz", "mylo"}
-    assert not cfg.channels.shopnova.enabled and not cfg.channels.belle.enabled
+    assert set(cfg.channels.retailers()) == {"drogerie_kranz", "mylo", "shopnova", "belle"}
+    assert cfg.channels.shopnova.enabled and cfg.channels.belle.enabled
     sc = {s.id: s for s in cfg.scenarios}
     cd = sc["carrier_decay"]
     assert (cd.start, cd.end) == (date(2026, 8, 3), None)
@@ -152,8 +153,9 @@ def test_default_config_values():
         "brand": "Velmora", "discount_pct": 0.25, "free_shipping": True,
         "deal_seeker_share": 1.0, "deal_seeker_return_rate": 0.15, "cherry_pick_share": 0.8,
     }
-    assert cfg.chaos["duplicate_customer_rate"] == 0.02
-    assert cfg.chaos["sellout_restatement_rate"] == 0.10
+    assert cfg.chaos.duplicate_customer_rate == 0.02
+    assert cfg.chaos.sellout_restatement_rate == 0.10
+    assert cfg.chaos.dst_truth is True
     # The emails used by default are on reserved/example domains only.
     for domains in cfg.customers.email_domains.values():
         assert all(is_reserved_domain(d) for d in domains)
@@ -735,3 +737,14 @@ def test_reset_requires_confirmation_without_tty(monkeypatch, capsys):
     assert "pass --yes" in capsys.readouterr().err and not called
     assert cli.main(["--dsn", "x", "reset", "--yes", "--seed", "3"]) == 0
     assert called == [{"seed": 3, "clear_seed": False, "force": False}]
+
+
+def test_scenario_windows_end_self_limited_windows():
+    """`sim scenario list` shows the end the engine applies (start + duration_weeks)."""
+    scen = [ScenarioCfg(id="hero_oos_substitution", start=date(2026, 4, 13))]
+    (w,) = cli.scenario_windows(scen, [], BERLIN)
+    assert w.end == datetime(2026, 5, 4, tzinfo=BERLIN).astimezone(timezone.utc)
+    (w,) = cli.scenario_windows([], [(1, "retailer_overstock", "enable", _t("2026-01-05T10:00"), {})], BERLIN)
+    # 13 weeks in local wall-clock time (one hour less in UTC across the spring DST change)
+    assert w.end.astimezone(BERLIN).replace(tzinfo=None) - w.start.astimezone(BERLIN).replace(tzinfo=None) == timedelta(
+        weeks=13)

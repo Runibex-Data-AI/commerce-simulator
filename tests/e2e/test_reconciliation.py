@@ -21,7 +21,7 @@ from decimal import Decimal
 import psycopg
 import pytest
 
-from .conftest import simulation, small_cfg, utc
+from .conftest import CHAOS_OFF, simulation, small_cfg, utc
 
 pytestmark = [pytest.mark.db, pytest.mark.slow]
 
@@ -37,7 +37,7 @@ WEB_ORDERS = """
 @pytest.fixture(scope="module")
 def run(fresh_db_module):
     dsn = fresh_db_module()
-    with simulation(dsn, small_cfg(), START) as sim:
+    with simulation(dsn, small_cfg(**CHAOS_OFF), START) as sim:  # exact reconciliation: chaos off (AMB-20)
         sim.backfill(UNTIL)
     conn = psycopg.connect(dsn)
     yield conn
@@ -85,10 +85,16 @@ def test_pricing_conditions_add_up(run):
     assert not bad
     hd00 = run.execute("SELECT DISTINCT kposn FROM erp.konv WHERE kschl = 'HD00'").fetchall()
     assert hd00 == [("000900",)]
-    # promotion conditions carry the promotion's nominal rate
-    rates = {r[0] for r in run.execute("SELECT DISTINCT kbetr FROM erp.konv WHERE kschl = 'ZPRO'")}
+    # web promotion conditions carry the promotion's nominal rate; retail ones the brand-funded off-invoice share
+    zpro = ("SELECT DISTINCT k.kbetr FROM erp.konv k JOIN erp.vbak h ON h.knumv = k.knumv"
+            " WHERE k.kschl = 'ZPRO' AND h.auart = %s")
+    rates = {r[0] for r in run.execute(zpro, ("ZWEB",))}
     nominal = {-100 * r[0] for r in run.execute("SELECT DISTINCT discount_pct FROM shop.promotions")}
     assert rates and rates <= nominal, rates - nominal
+    pcfg = small_cfg(**CHAOS_OFF).promotions
+    funded = {Decimal(str(round(-100 * pcfg.retail_funding_share * d, 3))) for d in pcfg.retail_discount_choices}
+    retail_rates = {r[0] for r in run.execute(zpro, ("ZEDI",))}
+    assert retail_rates and retail_rates <= funded, retail_rates - funded
 
 
 def test_invoices_minus_credit_memos_equal_shop_total(run):
@@ -182,3 +188,45 @@ def test_master_data_dates_plausible(run):
     assert "KP9010" in groups or not run.execute(
         "SELECT 1 FROM erp.mara WHERE prdha LIKE '_____GIFTS%'").fetchone()
     assert not any(g.startswith("KP8") for g in groups)
+
+
+# -- trade deductions (section 4.3 R1-R3) -----------------------------------------------------------
+
+
+def test_r1_paid_retail_invoices_reconcile_with_clearing_items(run):
+    rows = run.execute("""
+        SELECT k.vbeln, k.netwr + k.mwsbk gross, k.zzpaid_amount,
+               coalesce((SELECT sum(c.dmbtr) FROM erp.zdeduct_clr c
+                         WHERE c.zzkind = 'T' AND c.vbeln_vf = k.vbeln), 0) taken
+        FROM erp.vbrk k JOIN erp.kna1 a ON a.kunnr = k.kunag
+        WHERE k.fkart = 'F2' AND k.zzpaid_amount IS NOT NULL AND a.ktokd = 'Z001'
+    """).fetchall()
+    assert rows  # Belle pays after 30 days: some retail invoices are paid inside the window
+    bad = [r for r in rows if r[2] + r[3] != r[1]]
+    assert not bad, bad[:5]
+
+
+def test_r2_closed_deductions_reconcile_with_clearing_items(run):
+    bad = run.execute("""
+        SELECT z.belnr FROM erp.zdeduct z LEFT JOIN erp.zdeduct_clr c USING (belnr)
+        WHERE z.zzclose_date IS NOT NULL GROUP BY z.belnr, z.zzaccepted, z.zztaken, z.zzrepaid
+        HAVING coalesce(sum(c.dmbtr) FILTER (WHERE c.zzkind = 'T'), 0)
+             - coalesce(sum(c.dmbtr) FILTER (WHERE c.zzkind = 'P'), 0) <> coalesce(z.zzaccepted, 0)
+            OR coalesce(sum(c.dmbtr) FILTER (WHERE c.zzkind = 'T'), 0) <> z.zztaken
+            OR coalesce(sum(c.dmbtr) FILTER (WHERE c.zzkind = 'P'), 0) <> z.zzrepaid
+    """).fetchall()
+    assert not bad
+    orphans = run.execute(
+        "SELECT count(*) FROM erp.zdeduct_clr c WHERE NOT EXISTS (SELECT 1 FROM erp.zdeduct z WHERE z.belnr = c.belnr)"
+    ).fetchone()[0]
+    assert orphans == 0
+
+
+def test_r3_promotion_claims_match_items_and_agreements(run):
+    bad = run.execute("""
+        SELECT z.belnr FROM erp.zdeduct z JOIN erp.zdeduct_item i USING (belnr)
+        LEFT JOIN erp.kona k ON k.knuma = z.knuma
+        WHERE z.zztype = 'ZP01' GROUP BY z.belnr, z.wrbtr
+        HAVING z.wrbtr <> sum(i.wrbtr) OR NOT bool_and(k.knuma IS NOT NULL)
+    """).fetchall()
+    assert not bad

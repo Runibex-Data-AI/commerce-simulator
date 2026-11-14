@@ -58,6 +58,55 @@ def test_system_refs():
     assert w.system_refs("delivery", "abc") == {}
 
 
+def test_system_refs_phase2_entity_types():
+    sku = SimpleNamespace(ean="4000000000017")
+    accounts = {"KRANZ": SimpleNamespace(retailer="drogerie_kranz"),
+                "MYLO-DC2": SimpleNamespace(retailer="mylo")}
+
+    def get_account(a):
+        if a not in accounts:
+            raise KeyError(a)
+        return accounts[a]
+
+    ref = SimpleNamespace(
+        catalogue=SimpleNamespace(
+            get=lambda i: sku if i == 5 else None,
+            customer_article=lambda ch, i: f"{ch[:2].upper()}{i:06d}",
+        ),
+        accounts=SimpleNamespace(numbers={"KRANZ": 100001, "MYLO-DC2": 200005}, get=get_account),
+    )
+    w = TruthWriter(WriterContext(seed=7, cfg=None, ref=ref, tz=None))
+    from cpgsim.writers.wms import carrier_event_id, rma_no
+
+    assert w.system_refs("carrier_scan", "3:2") == {
+        "wms_event_id": carrier_event_id(3, 2), "wms_shipment_id": keys.wms_shipment_id(3),
+        "erp_delivery": keys.vbeln_delivery(3)}
+    assert w.system_refs("customer_material", "KRANZ:5") == {
+        "kunnr": "0000100001", "matnr": keys.matnr(5), "kdmat": "DR000005", "ean": "4000000000017"}
+    assert w.system_refs("feed_load", "KRZ_SO_20260302_01") == {
+        "feeds_load_id": "KRZ_SO_20260302_01", "feeds_restatement_load_id": "KRZ_SO_20260302_02"}
+    assert w.system_refs("feed_load", "BEL_SOM_20260302_02")["feeds_restatement_load_id"] == "BEL_SOM_20260302_03"
+    assert w.system_refs("retailer_dc_week", "MYLO-DC2:2026-03-02") == {
+        "kunnr": "0000200005", "week_start": "2026-03-02"}
+    # a cut-phase row is keyed by the PO order day (a Friday here): week_start is still the Monday
+    assert w.system_refs("retailer_dc_week", "MYLO-DC2:2026-04-10") == {
+        "kunnr": "0000200005", "week_start": "2026-04-06", "order_date": "2026-04-10"}
+    assert w.system_refs("deduction", "12") == {"erp_deduction": keys.belnr_deduction(12)}
+    assert w.system_refs("campaign", "PS-2026Q1-01") == {"mkt_campaign_id": "PS-2026Q1-01"}
+    assert w.system_refs("web_return", "42") == {"wms_return_id": keys.wms_return_id(42), "rma_no": rma_no(42)}
+    assert w.system_refs("dst_transition", "2026-03-29") == {}
+    # duplicate customers are customers with a derived id
+    dup = keys.DUPLICATE_CUSTOMER_BASE + 4
+    assert w.system_refs("customer", str(dup)) == {"shop_customer_id": keys.shop_customer_id(7, dup)}
+    # unparsable ids give no refs instead of failing the commit
+    for etype, eid in [("carrier_scan", "3"), ("customer_material", "KRANZ"), ("feed_load", "XYZ_SO_20260302_01"),
+                       ("feed_load", "garbage"), ("retailer_dc_week", "MYLO-DC2:soon"), ("deduction", "x"),
+                       ("web_return", "x")]:
+        assert w.system_refs(etype, eid) == {}, (etype, eid)
+    # an unknown account still gives the material refs
+    assert w.system_refs("customer_material", "NOPE:5") == {"matnr": keys.matnr(5), "ean": "4000000000017"}
+
+
 def test_window_update_in_same_batch():
     d, w = make_dispatcher()
     d.dispatch(window(T0))

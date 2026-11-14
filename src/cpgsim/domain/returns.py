@@ -37,7 +37,7 @@ from datetime import timedelta
 
 from ..engine.registry import handler
 from ..engine.rng import Rng
-from .customers import lazy, pick
+from .customers import _Lazy, lazy, pick
 from .events import (
     PaymentStatusChanged,
     RefundChanged,
@@ -52,6 +52,7 @@ web = lazy("web")
 warehouse = lazy("warehouse")
 billing = lazy("billing")
 customers = lazy("customers")
+chaos = _Lazy("cpgsim.chaos")
 
 ALLERGIC = "allergic_reaction"
 RESALEABLE_BY_REASON = {"damaged_in_transit": 0.12, ALLERGIC: 0.35, "wrong_item": 0.92}
@@ -247,6 +248,7 @@ def on_request(world, ev) -> None:
         lines=_return_lines(world, rng, o, dlv, reason),
         requested_at=world.now,
     )
+    r.free_text_reason = chaos.return_free_text(world, r, o.country or "DE")
     world.store.put("web_return", rid, r)
     world.emit(ReturnCreated(at=world.now, ret=r))
     o.return_ids.append(rid)

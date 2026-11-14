@@ -156,6 +156,8 @@ def test_retail_orders_weekly_per_dc(year):
     weeks = conn.execute(
         "SELECT zzkunwe, count(*), count(DISTINCT date_trunc('week', audat))"
         " FROM erp.vbak WHERE auart = 'ZEDI' GROUP BY 1").fetchall()
-    assert len(weeks) == 5
-    for _, docs, distinct_weeks in weeks:
-        assert docs == distinct_weeks >= 50
+    # 3 + 2 drugstore DCs and 2 perfumery warehouses order weekly, 2 marketplace FCs Mon/Wed/Fri
+    assert len(weeks) == 9
+    per_week = sorted(docs / distinct_weeks for _, docs, distinct_weeks in weeks)
+    assert per_week == [1.0] * 7 + [3.0] * 2, weeks
+    assert all(distinct_weeks >= 50 for *_, distinct_weeks in weeks)

@@ -518,3 +518,221 @@ def test_roundtrip_against_postgres():
             idx = conn.execute("SELECT indexdef FROM pg_indexes WHERE schemaname = 'erp'"
                                " AND tablename = %s", (tname,)).fetchall()
             assert any("(updated_at)" in r[0] for r in idx), spec.name
+
+
+# -- phase 2: trade promotion agreements and deductions ------------------------------
+
+from cpgsim.domain.events import (  # noqa: E402
+    DeductionChanged,
+    DeductionClaimed,
+    DeductionCleared,
+    TradeAgreementDefined,
+    TradeAgreementItem,
+)
+from cpgsim.domain.model import Deduction, DeductionItem  # noqa: E402
+
+T3 = datetime(2025, 5, 12, 8, 30, tzinfo=timezone.utc)  # 10:30 local
+T4 = datetime(2025, 6, 2, 13, 0, tzinfo=timezone.utc)
+
+
+def agreement():
+    return TradeAgreementDefined(
+        at=T0, promo_id=80_251_100, channel="drogerie_kranz", account_id="KRANZ",
+        text="AKTION KW15/2025", start=date(2025, 4, 7), end=date(2025, 4, 13), discount_pct=0.25,
+        off_invoice_share=0.5, scanback_share=0.25, advertising_fee_eur=2500.0,
+        items=[TradeAgreementItem(1, "KR-778812", 0.3125), TradeAgreementItem(2, "KR-778813", 0.12345)],
+    )
+
+
+def promo_claim(status="claimed"):
+    return Deduction(
+        deduction_id=12, kind="promotion", channel="drogerie_kranz", payer="KRANZ",
+        claimed_on=date(2025, 5, 12), claimed_at=T3, amount=9.11, validated_amount=8.0, status=status,
+        items=[DeductionItem(1, "KR-778812", True, 20, 0.3125, 7.44),
+               DeductionItem(2, "KR-778813", False, 11, 0.1276, 1.67)],
+        promo_id=80_251_100, promo_text="AKTION KW15/2025", period_from=date(2025, 4, 7),
+        period_to=date(2025, 4, 13),
+    )
+
+
+def coop_claim():
+    return Deduction(
+        deduction_id=13, kind="coop", channel="drogerie_kranz", payer="KRANZ", claimed_on=date(2025, 6, 2),
+        claimed_at=T4, amount=40.0, validated_amount=40.0, status="accepted", billing_id=11,
+        accepted_amount=40.0,
+    )
+
+
+def deduction_events():
+    return [
+        agreement(),
+        DeductionClaimed(at=T3, deduction=promo_claim()),
+        DeductionCleared(at=T4, deduction_id=12, seq=1, kind="taken", billing_id=11, amount=9.11,
+                         on=date(2025, 6, 2), taken_total=9.11, repaid_total=0.0),
+        DeductionChanged(at=T4, deduction_id=12, status="disputed",
+                         fields={"disputed_on": date(2025, 6, 2), "dispute_reason": "D01"}),
+        DeductionClaimed(at=T4, deduction=coop_claim()),
+        DeductionCleared(at=T4, deduction_id=13, seq=1, kind="taken", billing_id=11, amount=40.0,
+                         on=date(2025, 6, 2), taken_total=40.0, repaid_total=0.0),
+        DeductionChanged(at=T4, deduction_id=13, fields={"closed_on": date(2025, 6, 2)}),
+    ]
+
+
+def deduction_updates():
+    return [
+        DeductionChanged(at=T4, deduction_id=12, status="accepted",
+                         fields={"resolved_on": "2025-06-20", "accepted_amount": 8.0}),
+        DeductionCleared(at=T4, deduction_id=12, seq=2, kind="repaid", billing_id=None, amount=1.11,
+                         on="2025-07-01", taken_total=9.11, repaid_total=1.11),
+        DeductionChanged(at=T4, deduction_id=12, fields={"closed_on": date(2025, 7, 1)}),
+    ]
+
+
+def test_trade_agreement_rows():
+    d, _ = make_dispatcher()
+    d.dispatch(agreement())
+    k = d.batch.table("erp.kona").pending("0080251100")
+    assert k is not None and k["knuma"] == keys.knuma_promotion(80_251_100)
+    assert (k["boart"], k["kunnr"], k["botext"], k["datab"], k["datbi"]) == (
+        "ZPRO", "0000100001", "AKTION KW15/2025", date(2025, 4, 7), date(2025, 4, 13))
+    assert (k["zzdisc_pct"], k["zzofi_pct"], k["zzscan_pct"], k["zzwkz_eur"]) == (25.0, 50.0, 25.0, 2500.0)
+    assert k["erdat"] == date(2025, 3, 1) and k["ernam"] == "TPM_IF"
+    i2 = d.batch.table("erp.zkona_item").pending((k["knuma"], "000020"))
+    assert (i2["matnr"], i2["kdmat"], i2["zzscan_eur"]) == (keys.matnr(2), "KR-778813", 0.1235)
+
+
+def test_deduction_rows_items_and_clearing():
+    d, _ = make_dispatcher()
+    for ev in deduction_events():
+        d.dispatch(ev)
+    zd = d.batch.table("erp.zdeduct")
+    h = zd.pending("0070000012")
+    assert (h["bukrs"], h["gjahr"], h["kunnr"], h["zztype"], h["xblnr"]) == (
+        "1000", "2025", "0000100001", "ZP01", "BL2500000012")
+    assert (h["wrbtr"], h["dmbtr"], h["waers"], h["bldat"], h["budat"]) == (
+        9.11, 9.11, "EUR", date(2025, 5, 12), date(2025, 5, 12))
+    assert h["knuma"] == keys.knuma_promotion(80_251_100) and h["zzpromo_text"] == "AKTION KW15/2025"
+    assert (h["zzperiod_from"], h["zzperiod_to"]) == (date(2025, 4, 7), date(2025, 4, 13))
+    assert (h["vbeln_vl"], h["vbeln_va"], h["vbeln_vf"]) == (None, None, None)
+    assert (h["zzstatus"], h["zzdisp_date"], h["zzdisp_reason"], h["zztaken"], h["zzrepaid"]) == (
+        "D", date(2025, 6, 2), "D01", 9.11, 0.0)
+    assert (h["erdat"], h["erzet"], h["ernam"]) == (date(2025, 5, 12), time(10, 30), "DEDUCT_IN")
+    items = d.batch.table("erp.zdeduct_item")
+    i1, i2 = items.pending(("0070000012", "000010")), items.pending(("0070000012", "000020"))
+    assert (i1["matnr"], i1["kdmat"], i1["zzunits"], i1["zzrate"], i1["wrbtr"]) == (
+        keys.matnr(1), "KR-778812", 20, 0.3125, 7.44)
+    assert i2["matnr"] is None and i2["kdmat"] == "KR-778813"  # not mapped in knmt
+    assert h["wrbtr"] == round(i1["wrbtr"] + i2["wrbtr"], 2)  # R3
+    clr = d.batch.table("erp.zdeduct_clr").pending(("0070000012", "001"))
+    assert (clr["zzkind"], clr["vbeln_vf"], clr["augdt"], clr["dmbtr"]) == (
+        "T", "0090000011", date(2025, 6, 2), 9.11)
+    # contractual co-op: accepted, taken and closed in one go
+    c = zd.pending("0070000013")
+    assert (c["zztype"], c["zzstatus"], c["vbeln_vf"], c["zzaccepted"], c["zzres_date"]) == (
+        "ZK01", "A", "0090000011", 40.0, date(2025, 6, 2))
+    assert (c["zztaken"], c["zzclose_date"], c["knuma"]) == (40.0, date(2025, 6, 2), None)
+
+
+def test_deduction_type_and_reference_mapping():
+    d, _ = make_dispatcher()
+    base = dict(channel="mylo", payer="KRANZ", claimed_on=date(2026, 1, 9), claimed_at=T3, amount=1.0,
+                validated_amount=1.0)
+    cases = [
+        (Deduction(1, "shortage", delivery_id=8, **base), "ZS01", "vbeln_vl", "0080000008"),
+        (Deduction(2, "service_penalty", sales_doc_id=5, **base), "ZL01", "vbeln_va", "0010000005"),
+        (Deduction(3, "clearance", window_id="w", **base), "ZP05", "knuma", None),
+        (Deduction(4, "unexplained", promo_id=7, **base), "ZX99", "knuma", "0000000007"),
+        (Deduction(5, "advertising", promo_id=7, **base), "ZW01", "knuma", "0000000007"),
+    ]
+    for ded, zztype, col, val in cases:
+        d.dispatch(DeductionClaimed(at=T3, deduction=ded))
+        row = d.batch.table("erp.zdeduct").pending(keys.belnr_deduction(ded.deduction_id))
+        assert row["zztype"] == zztype and row[col] == val and row["zzstatus"] == "O"
+        assert row["xblnr"] == f"MY-DED-{ded.deduction_id:07d}"
+    with pytest.raises(ValueError):
+        d.dispatch(DeductionClaimed(at=T3, deduction=Deduction(9, "bogus", **base)))
+
+
+def _deduction_final_rows(batches):
+    tables: dict[str, dict] = {}
+    for events in batches:
+        d, _ = make_dispatcher()
+        for ev in events:
+            d.dispatch(ev)
+        for name, buf in d.batch.buffers.items():
+            t = tables.setdefault(name, {})
+            for k, row in buf.inserts.items():
+                t[k] = dict(row)
+            for k, ch in buf.updates.items():
+                if k in t:
+                    t[k].update(ch)
+    return tables
+
+
+def test_deduction_final_state_independent_of_batching():
+    events = deduction_events() + deduction_updates()
+    one = _deduction_final_rows([events])
+    split = _deduction_final_rows([deduction_events(), deduction_updates()])
+    each = _deduction_final_rows([[ev] for ev in events])
+    assert one == split == each
+    h = one["erp.zdeduct"][("0070000012",)]
+    assert (h["zzstatus"], h["zzaccepted"], h["zzres_date"], h["zztaken"], h["zzrepaid"], h["zzclose_date"]) == (
+        "A", 8.0, date(2025, 6, 20), 9.11, 1.11, date(2025, 7, 1))
+    p = one["erp.zdeduct_clr"][("0070000012", "002")]
+    assert (p["zzkind"], p["vbeln_vf"], p["augdt"], p["dmbtr"]) == ("P", None, date(2025, 7, 1), 1.11)
+
+
+@pytest.mark.skipif(not DSN, reason="CPGSIM_TEST_DSN not set")
+def test_deduction_roundtrip_against_postgres():
+    import psycopg
+
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        conn.execute("DROP SCHEMA IF EXISTS erp CASCADE")
+        conn.execute((SCHEMAS / "erp.sql").read_text())
+
+    d, _ = make_dispatcher()
+    for ev in deduction_events():
+        d.dispatch(ev)
+    _flush(d)
+    for ev in deduction_updates():
+        d.dispatch(ev)
+    _flush(d)
+
+    with psycopg.connect(DSN) as conn:
+        def one(sql, *args):
+            return conn.execute(sql, args).fetchone()
+
+        assert one("SELECT zzstatus, zzaccepted, zztaken, zzrepaid, zzclose_date, created_at, updated_at"
+                   " FROM erp.zdeduct WHERE belnr = '0070000012'") == (
+            "A", Decimal("8.00"), Decimal("9.11"), Decimal("1.11"), date(2025, 7, 1), T3, T4)
+        # R2 for closed cases
+        bad = conn.execute(
+            "SELECT z.belnr FROM erp.zdeduct z LEFT JOIN erp.zdeduct_clr c USING (belnr)"
+            " WHERE z.zzclose_date IS NOT NULL GROUP BY z.belnr, z.zzaccepted, z.zztaken, z.zzrepaid"
+            " HAVING coalesce(sum(c.dmbtr) FILTER (WHERE c.zzkind = 'T'), 0)"
+            "      - coalesce(sum(c.dmbtr) FILTER (WHERE c.zzkind = 'P'), 0) <> coalesce(z.zzaccepted, 0)"
+            "   OR coalesce(sum(c.dmbtr) FILTER (WHERE c.zzkind = 'T'), 0) <> z.zztaken"
+            "   OR coalesce(sum(c.dmbtr) FILTER (WHERE c.zzkind = 'P'), 0) <> z.zzrepaid").fetchall()
+        assert bad == []
+        # R3: promotion claim amount = sum of items, agreement exists
+        assert one("SELECT z.wrbtr = sum(i.wrbtr), bool_and(k.knuma IS NOT NULL) FROM erp.zdeduct z"
+                   " JOIN erp.zdeduct_item i USING (belnr) LEFT JOIN erp.kona k ON k.knuma = z.knuma"
+                   " WHERE z.zztype = 'ZP01' GROUP BY z.belnr, z.wrbtr") == (True, True)
+        assert one("SELECT count(*) FROM erp.zdeduct_item WHERE matnr IS NULL") == (1,)
+        assert one("SELECT count(*), sum(dmbtr) FROM erp.zdeduct_clr WHERE vbeln_vf = '0090000011'") == (
+            2, Decimal("49.11"))
+        assert one("SELECT count(*) FROM erp.zkona_item") == (2,)
+
+
+def test_kna1_search_terms_are_unique_for_all_accounts():
+    """erp.kna1.sortl (10 characters) tells every account apart, also the two marketplace FCs."""
+    from cpgsim.config import Config
+    from cpgsim.domain.accounts import build_accounts
+    from cpgsim.writers.erp import _sortl
+
+    accounts = build_accounts(Config()).all
+    terms = [_sortl(a.account_id) for a in accounts]
+    assert all(len(t) <= 10 for t in terms)
+    assert len(set(terms)) == len(terms), sorted(terms)
+    assert _sortl("SHOPNOVA") == "SHOPNOVA" and _sortl("SHOPNOVA-DC2") == "SHOPNO-DC2"
+    assert _sortl("KRANZ-DC1") == "KRANZ-DC1"

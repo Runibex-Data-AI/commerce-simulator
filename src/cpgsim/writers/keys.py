@@ -8,6 +8,8 @@ writer stores the ERP delivery number) without shared state.
 
 from __future__ import annotations
 
+from datetime import date
+
 from ..engine.rng import stable_uuid
 
 # -- shop: UUID keys -----------------------------------------------------------
@@ -103,3 +105,77 @@ def wms_return_id(return_id: int) -> int:
 def tracking_number(carrier: str, delivery_id: int) -> str:
     prefix = {"Paketblitz": "PB", "Nordpost": "NP", "Swiftbox": "SX"}.get(carrier, "FR")
     return f"{prefix}{3_000_000_000 + delivery_id * 7 + 3}"
+
+
+# -- erp: deductions and trade promotion agreements (phase 2) --------------------
+
+DEDUCTION_BASE = 70_000_000  # 0070000001 ...
+#: Length a truncated shop order reference keeps on the ERP sales document (chaos).
+TRUNCATED_REF_LEN = 18
+
+
+def belnr_deduction(deduction_id: int) -> str:
+    """Deduction case number, e.g. ``0070000001``."""
+    return f"{DEDUCTION_BASE + deduction_id:010d}"
+
+
+def knuma_promotion(promo_id: int) -> str:
+    """Trade promotion agreement number (``kona.knuma``) of a retailer promotion."""
+    return f"{promo_id:010d}"
+
+
+def retailer_claim_ref(channel: str, deduction_id: int, d: date) -> str:
+    """The retailer's own claim reference (``zdeduct.xblnr``), in its format."""
+    prefix = FEED_PREFIX.get(channel)
+    if prefix == "KRZ":
+        return f"BL{d:%y}{deduction_id:08d}"
+    if prefix == "MYL":
+        return f"MY-DED-{deduction_id:07d}"
+    if prefix == "SNV":
+        return f"SNV-CB-{deduction_id:08d}"
+    if prefix == "BEL":
+        return f"BEL/{d:%Y}/D{deduction_id:05d}"
+    raise ValueError(f"no claim reference format for channel {channel!r}")
+
+
+# -- feeds (phase 2) ---------------------------------------------------------------
+
+FEED_SOURCE = {"drogerie_kranz": "KRANZ", "mylo": "MYLO", "shopnova": "SHOPNOVA", "belle": "BELLE"}
+FEED_PREFIX = {"drogerie_kranz": "KRZ", "mylo": "MYL", "shopnova": "SNV", "belle": "BEL"}
+FEED_TYPE_CODE = {"sellout_weekly": "SO", "sellout_monthly": "SOM", "mp_sales_daily": "SALES", "mp_inventory_daily": "INV"}
+
+
+def feed_load_id(channel: str, feed_type: str, period_start: date, run: int) -> str:
+    """Load id of one delivered feed file, e.g. ``KRZ_SO_20260302_01``."""
+    return f"{FEED_PREFIX[channel]}_{FEED_TYPE_CODE[feed_type]}_{period_start:%Y%m%d}_{run:02d}"
+
+
+# -- mkt (phase 2) -----------------------------------------------------------------
+
+MKT_PREFIX = {"paid_search": "PS", "social": "SO", "influencer": "IN", "email": "EM", "affiliate": "AF"}
+
+
+def mkt_campaign_id(channel: str, year: int, quarter: int, seq: int) -> str:
+    """Regular campaign id, e.g. ``PS-2026Q1-01`` (regular calendar only)."""
+    return f"{MKT_PREFIX[channel]}-{year}Q{quarter}-{seq:02d}"
+
+
+def mkt_promo_campaign_id(promo_id: int) -> str:
+    """Email campaign of a regular web promotion, e.g. ``EM-P1234``."""
+    return f"EM-P{promo_id}"
+
+
+def mkt_scenario_campaign_id(channel: str, index: int) -> str:
+    """Campaign of a scenario window (``index`` as in promotion id 900000 + index)."""
+    return f"{MKT_PREFIX[channel]}-X{index:06d}"
+
+
+def mkt_attribution_id(order_id: int) -> str:
+    """Attribution row id of a tracked web order, e.g. ``ATT-NV-10004711``."""
+    return "ATT-" + shop_order_number(order_id)
+
+
+# -- shop: duplicate customers (chaos, phase 2) ------------------------------------
+
+#: Neutral id of a duplicate customer record = DUPLICATE_CUSTOMER_BASE + original id.
+DUPLICATE_CUSTOMER_BASE = 50_000_000

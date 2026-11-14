@@ -457,6 +457,8 @@ class Catalogue:
         self._assort_cache: dict[tuple[str, date], tuple[int, ...]] = {}
         self._listing_keys: dict[str, dict[int, float]] = {}
         self._listing_threshold: dict[str, float] = {}
+        self._centred_keys: dict[str, dict[int, float]] = {}  # brand_assortment channels
+        self._role_thr: dict[tuple[str, str], float] = {}
         self._articles: dict[str, dict[int, str]] = {}
         self.affinity: dict[int, list[tuple[int, float]]] = self._build_affinity()
 
@@ -521,7 +523,8 @@ class Catalogue:
         except KeyError:
             raise ValueError(f"unknown retailer channel {channel!r}") from None
 
-    def _keys(self, channel: str) -> dict[int, float]:
+    def _raw_keys(self, channel: str) -> dict[int, float]:
+        """Listing keys on ``catalogue.listing`` (popular SKUs tend to get higher keys)."""
         keys = self._listing_keys.get(channel)
         if keys is None:
             keys = {}
@@ -531,42 +534,111 @@ class Catalogue:
             self._listing_keys[channel] = keys
         return keys
 
+    def _keys(self, channel: str) -> dict[int, float]:
+        """Listing keys compared with :meth:`_threshold`: listed iff hero or ``key >= threshold``.
+
+        Channels without ``brand_assortment`` use the raw keys (phase 1). With
+        ``brand_assortment`` each SKU's raw key is centred on its brand role's
+        threshold (``raw - threshold(role)``) and the channel threshold is 0, so
+        the single comparison ``key >= threshold`` (also used by
+        ``masterdata.retailer_lists``) applies the per-role cut-off.
+        """
+        rc = self._retailer_cfg(channel)
+        if rc.brand_assortment is None:
+            return self._raw_keys(channel)
+        keys = self._centred_keys.get(channel)
+        if keys is None:
+            raw = self._raw_keys(channel)
+            thr = {role: self._role_threshold(channel, role) for role in BRAND_ROLES}
+            keys = {}
+            for s in self.skus:
+                t = thr.get(self.brand_roles.get(s.brand, ""), math.inf)
+                if t == math.inf:
+                    keys[s.sku_id] = -math.inf
+                elif t == -math.inf:
+                    keys[s.sku_id] = math.inf
+                else:
+                    keys[s.sku_id] = raw[s.sku_id] - t
+            self._centred_keys[channel] = keys
+        return keys
+
+    def _role_share(self, rc: RetailerCfg, s: Sku) -> float:
+        """Listing share of the SKU's brand role at a ``brand_assortment`` channel (0 if not set)."""
+        return float((rc.brand_assortment or {}).get(self.brand_roles.get(s.brand, ""), 0.0))
+
     def _eligible(self, s: Sku, rc: RetailerCfg) -> bool:
+        if rc.brand_assortment is not None:
+            return self._role_share(rc, s) > 0.0
         if not rc.cutara_listed and self.brand_roles.get(s.brand) == "derma":
             return False
         return True
+
+    @staticmethod
+    def _cutoff(keys: dict[int, float], ref: list[Sku], share: float) -> float:
+        target = round(share * len(ref))
+        heroes = sum(1 for s in ref if s.hero)
+        others = sorted((keys[s.sku_id] for s in ref if not s.hero), reverse=True)
+        need = target - heroes
+        if need <= 0:
+            return math.inf
+        if need >= len(others):
+            return -math.inf
+        return (others[need - 1] + others[need]) / 2.0
+
+    def _role_threshold(self, channel: str, role: str) -> float:
+        """Raw-key cut-off of one brand role at a ``brand_assortment`` channel (+inf: heroes only / none)."""
+        thr = self._role_thr.get((channel, role))
+        if thr is None:
+            rc = self._retailer_cfg(channel)
+            share = float((rc.brand_assortment or {}).get(role, 0.0))
+            if share <= 0.0:
+                thr = math.inf
+            else:
+                ref = [s for s in self.active(REFERENCE_DATE) if self.brand_roles.get(s.brand) == role]
+                thr = self._cutoff(self._raw_keys(channel), ref, share)
+            self._role_thr[(channel, role)] = thr
+        return thr
 
     def _threshold(self, channel: str) -> float:
         """Listing-key cut-off, calibrated once on the SKUs active on ``REFERENCE_DATE``.
 
         A fixed cut-off keeps each SKU's listing stable over time; only launches
-        and delists change a retailer's range.
+        and delists change a retailer's range. Channels with ``brand_assortment``
+        calibrate one cut-off per brand role (with that role's share, on the same
+        keys and reference date) and compare centred keys against 0 (see
+        :meth:`_keys`).
         """
         thr = self._listing_threshold.get(channel)
         if thr is None:
             rc = self._retailer_cfg(channel)
-            keys = self._keys(channel)
-            ref = [s for s in self.active(REFERENCE_DATE) if self._eligible(s, rc)]
-            target = round(rc.assortment_share * len(ref))
-            heroes = sum(1 for s in ref if s.hero)
-            others = sorted((keys[s.sku_id] for s in ref if not s.hero), reverse=True)
-            need = target - heroes
-            if need <= 0:
-                thr = math.inf
-            elif need >= len(others):
-                thr = -math.inf
+            if rc.brand_assortment is not None:
+                thr = 0.0
             else:
-                thr = (others[need - 1] + others[need]) / 2.0
+                keys = self._keys(channel)
+                ref = [s for s in self.active(REFERENCE_DATE) if self._eligible(s, rc)]
+                thr = self._cutoff(keys, ref, rc.assortment_share)
             self._listing_threshold[channel] = thr
         return thr
+
+    def lists(self, channel: str, sku: Sku) -> bool:
+        """Whether ``channel`` lists ``sku`` at some point of its life (gift sets: every Nov-Dec)."""
+        if channel == "web":
+            return True
+        rc = self._retailer_cfg(channel)
+        if not self._eligible(sku, rc):
+            return False
+        return sku.hero or self._keys(channel)[sku.sku_id] >= self._threshold(channel)
 
     def retailer_assortment(self, channel: str, d: date) -> list[int]:
         """Sorted sku_ids a channel lists on date ``d``.
 
         Retailers list ``assortment_share`` of the eligible active SKUs (the
         dermocosmetic brand is eligible only with ``cutara_listed``), always
-        including heroes and preferring popular SKUs. Gift sets are listed in
-        November and December only. ``web`` lists every active SKU.
+        including heroes and preferring popular SKUs. A channel with
+        ``brand_assortment`` lists each brand role's share of that role's SKUs
+        instead (roles with share 0 are not listed; heroes of the other roles
+        always are). Gift sets are listed in November and December only.
+        ``web`` lists every active SKU.
         """
         if channel == "web":
             return [s.sku_id for s in self.active(d)]

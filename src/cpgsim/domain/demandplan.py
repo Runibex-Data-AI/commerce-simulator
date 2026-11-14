@@ -15,9 +15,15 @@ SKU weight on a local date ``d`` for a channel::
     * launch ramp (0.3 -> 1.0 over the first 8 weeks after launch_date)
     * scenarios.factor("sku_demand", noon of d, channel=..., sku_id=...)
 
+Web weights then apply the scenario demand transfers
+(``scenarios.transfers("sku_demand", ...)``: ``hero_oos_substitution`` moves
+``share`` of the hero's weight to its sibling and drops the rest).
+
 Expected web units for planning (``expected_daily_units``) add the deal-site
 orders of ``promo_margin_trap`` windows (``_deal_seeker_units``), which come on
-top of the regular web order rate.
+top of the regular web order rate. Expected retail units are multiplied by the
+``retail_push`` factor (``retailer_overstock``), so the central warehouse
+plans production for a pushing retailer's over-orders.
 
 Sizing of retail demand: a retailer's annual sell-in value is the web annual
 net value estimate times ``share_r / share_web``; it is converted to units with
@@ -47,10 +53,12 @@ _CACHE_LIMIT = 6000
 # run above base_orders_per_day (promotion, event and launch lifts, repeat
 # customers' response to Black Friday / Christmas, the promo_margin_trap deal
 # seekers) while repeat and subscription baskets are ~15 % smaller than the
-# new-customer basket model, net 0.97 (recalibrated after existing customers
-# started responding to events: 0.94 gave a 14.7 % web goods share instead of
-# 10 / 70 = 14.3 %).
-WEB_VALUE_REALISATION = 0.97
+# new-customer basket model. Phase 1 (web and two drugstore chains): 0.97.
+# Phase 2 (five channels, marketing-driven acquisition): 0.94; 0.97 gave a web
+# goods share of 9.85 % in 2025 and 9.78 % in the last 12 months of the default
+# 24-month backfill, and 9.21 % in the acceptance run from 2025-01-06 (shorter
+# history, fewer repeat customers), against 10 %.
+WEB_VALUE_REALISATION = 0.94
 _DC_WEIGHT_SPREAD = 0.5  # DC weights are 0.75 + 0.5 * u before normalising
 
 
@@ -161,7 +169,33 @@ def _weights(world, channel: str, d: date) -> _Weights:
         ids.append(s.sku_id)
         cum.append(acc)
         by_sku[s.sku_id] = w
+    if channel == "web":
+        moves = _transfers(world, t, d)
+        if moves:
+            for src, dst, share in moves:
+                if src in by_sku and dst in by_sku:
+                    by_sku[dst] += share * by_sku[src]
+                    by_sku[src] = 0.0
+            acc = 0.0
+            cum = []
+            for sid in ids:
+                acc += by_sku[sid]
+                cum.append(acc)
     return _put(st.weights, key, _Weights(ids, cum, acc, sum_pop, by_sku))
+
+
+def _transfers(world, t: datetime, d: date) -> list[tuple[int, int, float]]:
+    """Web demand transfers ``(from_sku, to_sku, share)`` of the scenario windows active at ``t``.
+
+    ``hero_oos_substitution`` moves ``share`` of the hero's expected units to
+    its sibling and loses the rest (AMB-12). Retail channels get no transfer:
+    retailer DC stock buffers the stock-out, and retail substitution acts on
+    lost units (``retail.on_sellout``).
+    """
+    sc = world.scenarios
+    if sc is None or not hasattr(sc, "transfers"):
+        return []
+    return [(src, dst, share) for _, src, dst, share in sc.transfers("sku_demand", t, world=world, channel="web", d=d)]
 
 
 # ---------------------------------------------------------------------------
@@ -451,7 +485,11 @@ def _expected_map(world, channel: str, d: date) -> dict[int, float]:
                 hit[s] = hit.get(s, 0.0) + u
         else:
             week = _retail_week(world, channel, d - timedelta(days=d.weekday()))
-            hit = {s: u / 7.0 for s, u in week.items()}
+            # retailer_overstock: the pushing retailer's orders run ``over_order``
+            # above demand, and the central warehouse plans for them (pure in the
+            # scenario windows).
+            push = _scen_factor(world, "retail_push", world.at_local(d, 12), channel=channel)
+            hit = {s: u * push / 7.0 for s, u in week.items()}
         _put(st.expected, key, hit)
     return hit
 

@@ -21,14 +21,21 @@ from .conftest import BUSINESS, READER, business_tables, primary_key, simulation
 pytestmark = [pytest.mark.db, pytest.mark.slow]
 
 START = date(2025, 3, 3)
-SNAPSHOT_TABLES = {"wms.stock_levels_daily"}
+#: Snapshot and feed tables: insert-only, no soft-delete columns, rows never change.
+INSERT_ONLY_TABLES = {
+    "wms.stock_levels_daily",
+    "feeds.feed_loads",
+    "feeds.retailer_sellout",
+    "feeds.marketplace_sales_daily",
+    "feeds.marketplace_inventory_daily",
+}
 
 
 def test_schema_contract(fresh_db):
     dsn = fresh_db()
     with psycopg.connect(dsn) as conn:
         tables = [(s, t) for s, t in business_tables(conn) if s in BUSINESS]
-        assert len(tables) >= 25
+        assert len(tables) >= 40
         for s, t in tables:
             assert primary_key(conn, s, t), f"{s}.{t} has no primary key"
             cols = dict(
@@ -40,8 +47,10 @@ def test_schema_contract(fresh_db):
             )
             for c in ("created_at", "updated_at"):
                 assert cols.get(c) == "timestamp with time zone:NO", f"{s}.{t}.{c}: {cols.get(c)}"
-            if f"{s}.{t}" not in SNAPSHOT_TABLES:
+            if f"{s}.{t}" not in INSERT_ONLY_TABLES:
                 assert "is_deleted" in cols and "deleted_at" in cols, f"{s}.{t} lacks soft-delete columns"
+            else:
+                assert "is_deleted" not in cols, f"{s}.{t} is insert-only but has soft-delete columns"
             idx = conn.execute(
                 "SELECT count(*) FROM pg_indexes WHERE schemaname = %s AND tablename = %s"
                 " AND indexdef ~ '\\(updated_at[,)]'",
@@ -88,7 +97,7 @@ def test_watermark_load_replicates_every_table_and_nothing_is_deleted(fresh_db):
             store = replica.setdefault(name, {})
             for r in rows:
                 key = tuple(r[i] for i in pki)
-                if name in SNAPSHOT_TABLES and key in store:
+                if name in INSERT_ONLY_TABLES and key in store:
                     raise AssertionError(f"snapshot row changed: {name} {key}")
                 store[key] = tuple(r)
                 if wm is None or r[ui] > wm:
