@@ -871,8 +871,9 @@ def note_order(world, order, customer, source: str, new_customer: bool) -> None:
     code = getattr(customer, "influencer_code", None) if source == "influencer" else None
     attr_source = source
     if (source in COUPON_SOURCES and getattr(order, "promo_id", None) is not None
-            and world.rng("mkt.coupon", order.order_id).random() < COUPON_INTERCEPT_SHARE):
-        attr_source = COUPON_SOURCE
+            and world.rng("mkt.coupon", order.order_id).random() < COUPON_INTERCEPT_SHARE
+            and _candidates(world, COUPON_SOURCE, None, t)):
+        attr_source = COUPON_SOURCE  # only while a coupon campaign is usable
     campaign_id = attribute(world, order.order_id, attr_source, code, t)
     channel = "affiliate" if attr_source == COUPON_SOURCE else MKT_CHANNEL.get(source, source)
     did = d.isoformat()

@@ -676,3 +676,14 @@ def test_erp_writer_renders_order_ref_flag():
     assert rows[1] == full and len(full) == 36
     assert rows[2] is None
     assert rows[3] == keys.shop_order_id(7, 103)[: keys.TRUNCATED_REF_LEN]
+
+
+def test_promo_weeks_per_quarter_is_capped_by_the_slot_rule():
+    assert RetailerCfg(share=0.1, promo_weeks_per_quarter=5).promo_weeks_per_quarter == 5
+    with pytest.raises(ValidationError):
+        RetailerCfg(share=0.1, promo_weeks_per_quarter=6)
+
+
+def test_removed_dispute_accept_share_is_rejected():
+    with pytest.raises(ValidationError):
+        load_config(deductions={"dispute_accept_share": 0.5})

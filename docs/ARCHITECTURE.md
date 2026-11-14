@@ -401,7 +401,8 @@ affiliate clicks (`clicks >= sessions >= orders`), and `platform_conversions`
 never exceed clicks. `influencer_cohort_churn` raises the budget of every
 influencer campaign of its code: each gets a truth `spend_boost` row and a
 `daily_budget_eur` update on the first export it is boosted in, and the budget
-goes back on the first export after the window. The campaign calendar
+goes back on the first export after the window if the campaign still runs
+(a campaign that ends inside the window keeps the boosted budget). The campaign calendar
 is a pure function of seed, config, year and the regular promotion calendar
 (`domain/marketing.py`); ids never depend on scenario windows, and a campaign
 row is written before any spend or attribution that references it, also for

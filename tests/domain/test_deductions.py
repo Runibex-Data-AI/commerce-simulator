@@ -292,8 +292,7 @@ def test_claim_without_basis_does_nothing():
 
 
 def test_overclaim_disputed_then_resolved_and_repaid():
-    cfg = make_cfg(enable=(), deductions={"overclaim_rate": 1.0, "invalid_claim_rate": 0.0,
-                                          "dispute_accept_share": 1.0})
+    cfg = make_cfg(enable=(), deductions={"overclaim_rate": 1.0, "invalid_claim_rate": 0.0})
     world, out = make_world(cfg, local(2025, 1, 6))
     p, ws, brand, sold = _promo_week_basis(world)
     world.now = local(2025, 7, 1, 11)
@@ -322,8 +321,7 @@ def test_overclaim_disputed_then_resolved_and_repaid():
 
 def test_overclaim_always_settles_at_the_validated_amount():
     """An over-agreement dispute (D01) is never fully reversed: the agreed scan-back on the feed units is owed."""
-    cfg = make_cfg(enable=(), deductions={"overclaim_rate": 1.0, "invalid_claim_rate": 0.0,
-                                          "dispute_accept_share": 0.0})
+    cfg = make_cfg(enable=(), deductions={"overclaim_rate": 1.0, "invalid_claim_rate": 0.0})
     world, out = make_world(cfg, local(2025, 1, 6))
     p, ws, brand, _ = _promo_week_basis(world)
     world.now = local(2025, 7, 1, 11)

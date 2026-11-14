@@ -97,7 +97,8 @@ class RetailerCfg(_M):
     trade_discount: float = 0.36  # off trade list price (customer discount condition)
     assortment_share: float = 0.7  # share of eligible active SKUs listed (eligible: brand listed here; gift sets Nov-Dec)
     cutara_listed: bool = False  # whether the dermocosmetic brand is listed
-    promo_weeks_per_quarter: int = 2
+    # promotions start in quarter-weeks 3-12 with a free week either side: at most 5 fit
+    promo_weeks_per_quarter: int = Field(2, ge=0, le=5)
     model: str | None = None  # marketplace: "1p" (the brand sells wholesale to the marketplace)
     sellout_frequency: Literal["weekly", "monthly", "daily"] = "weekly"
     order_weekdays: list[int] | None = None  # 0=Mon..6=Sun, unique; overrides order_cycle_days
@@ -424,7 +425,6 @@ class DeductionsCfg(_M):
     match_tolerance: float = 0.02
     overclaim_rate: float = 0.15
     overclaim_range: tuple[float, float] = (0.05, 0.30)
-    dispute_accept_share: float = 0.55  # unused since phase-2 review: over-agreement disputes settle at validated
     invalid_claim_rate: float = 0.05
     shortage_claim_rate: float = 0.03
     shortage_valid_share: float = 0.60
