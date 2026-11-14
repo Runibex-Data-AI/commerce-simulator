@@ -1,0 +1,83 @@
+# cpg-commerce-simulator: Postgres + generator.
+#
+#   cp .env.example .env     # fill in the three passwords (>= 16 chars, all different)
+#   docker compose up -d
+#
+# On first start Postgres creates a self-signed certificate and the roles
+# sim_writer and bi_reader; the generator then runs `sim init`, backfills
+# history_months of data and keeps running live (`sim start`).
+# Only Postgres is published (5432, SSL required; only bi_reader may connect
+# from outside the Compose network). Restrict access to it with a firewall to
+# the BI tool's outbound IPs, or bind it with CPGSIM_PG_BIND.
+
+name: cpgsim
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-cpgsim}
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      CPGSIM_WRITER_PASSWORD: ${CPGSIM_WRITER_PASSWORD:?set CPGSIM_WRITER_PASSWORD in .env}
+      CPGSIM_READER_PASSWORD: ${CPGSIM_READER_PASSWORD:?set CPGSIM_READER_PASSWORD in .env}
+    # Tuned for a 2 GB VM shared with the generator.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=128MB
+      # Per autovacuum worker (up to three); unset, each could take maintenance_work_mem.
+      - -c
+      - autovacuum_work_mem=64MB
+      - -c
+      - wal_compression=on
+      - -c
+      - max_wal_size=2GB
+      - -c
+      - checkpoint_timeout=15min
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/initdb:/docker-entrypoint-initdb.d:ro
+      - ./sql/roles.sql:/cpgsim/roles.sql:ro
+    ports:
+      - "${CPGSIM_PG_BIND:-0.0.0.0}:${CPGSIM_PG_PORT:-5432}:5432"
+    shm_size: 256mb
+    healthcheck:
+      # Over the Unix socket (trust, nothing logged): a TCP probe as postgres is
+      # rejected by pg_hba.conf and logs two FATAL lines per check. The
+      # temporary server of the first-start initialisation runs with
+      # listen_addresses='', so this turns healthy once the real server is up.
+      test: ["CMD-SHELL", "[ \"$$(psql -U postgres -d \"$${POSTGRES_DB}\" -XAtc 'SHOW listen_addresses' 2>/dev/null)\" = '*' ]"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  generator:
+    build: .
+    restart: unless-stopped
+    init: true               # forward SIGTERM so the generator commits and stops cleanly
+    stop_grace_period: 60s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Over the Compose network, SSL required (self-signed certificate).
+      CPGSIM_DSN: host=postgres port=5432 dbname=${POSTGRES_DB:-cpgsim} user=sim_writer sslmode=require
+      PGPASSWORD: ${CPGSIM_WRITER_PASSWORD:?set CPGSIM_WRITER_PASSWORD in .env}
+      CPGSIM_CONFIG: /app/config/default.yaml
+      CPGSIM_OVERLAY: /app/overlay/overlay.yaml
+    volumes:
+      - ./config:/app/config:ro
+      # Private overlay (host path in CPGSIM_OVERLAY); an empty placeholder otherwise.
+      - ${CPGSIM_OVERLAY:-./docker/empty-overlay.yaml}:/app/overlay/overlay.yaml:ro
+
+volumes:
+  pgdata:

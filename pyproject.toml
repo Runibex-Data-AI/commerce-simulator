@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cpgsim"
+version = "0.1.0"
+description = "Realistic, continuously changing commerce data for a fictional consumer goods brand, across several source systems in Postgres."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.12"
+authors = [{ name = "Runibex Data & AI" }]
+dependencies = [
+  "numpy==2.5.4",  # pinned: random streams and numeric results are determinism-relevant
+  "faker==40.54.0",  # pinned: names/streets depend on Faker's bundled lists
+  "psycopg[binary]>=3.2",
+  "pydantic>=2.8",
+  "pyyaml>=6",
+  "holidays==0.108",  # pinned: holiday calendars affect delivery dates
+  "tzdata==2026.6",  # pinned: timezone rules affect timestamps
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+sim = "cpgsim.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+cpgsim = ["data/*.csv"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "db: needs a reachable Postgres (CPGSIM_TEST_DSN)",
+  "slow: long-running statistical or end-to-end checks",
+]

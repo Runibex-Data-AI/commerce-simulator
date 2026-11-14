@@ -1,0 +1,3 @@
+# Placeholder mounted as the overlay when CPGSIM_OVERLAY is not set in .env.
+# An empty overlay changes nothing. Do not put private settings here: keep them
+# in a file outside the repository and point CPGSIM_OVERLAY at it.

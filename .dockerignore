@@ -1,0 +1,21 @@
+# Keep the build context small and free of secrets.
+.git
+.gitignore
+.venv
+**/__pycache__
+**/*.pyc
+**/*.egg-info
+.pytest_cache
+build
+dist
+.env
+.env.*
+*.local.yaml
+private*.yaml
+tests
+docs
+examples
+docker
+docker-compose.yml
+Dockerfile
+.dockerignore

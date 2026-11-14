@@ -126,6 +126,7 @@ stateDiagram-v2
     InTransit --> Lost: under 0.5%
     Delivered --> Returned: within 14 days, 3%
     Returned --> Refunded: full or partial
+    Returned --> ReturnRejected: fails inspection, goods sent back
 ```
 
 Every transition is an update to the same order row, which is what an incremental load has to catch.
@@ -209,10 +210,10 @@ Every noise event is also written to `truth.planted_effects`, so data quality fi
 Any tool with a Postgres connector and a query-based incremental strategy can load every business table without custom logic. The contract below is what the generator guarantees.
 
 1. **Keys.** Every table has a primary key. Composite keys are allowed for item tables (header id plus line number).
-2. **Change tracking.** Every table has `created_at` and `updated_at`. The generator sets both from the simulation clock, and `updated_at` changes on every update to the row. In live mode the clock equals wall time, so a watermark on `updated_at` catches every change. Each `updated_at` column is indexed.
+2. **Change tracking.** Every table has `created_at` and `updated_at`, and `updated_at` changes on every update to the row. The backfill sets both from the simulation clock; in live mode (including the catch-up after downtime) they carry the commit time, so a watermark on `max(updated_at)` catches every change. Each `updated_at` column is indexed.
 3. **No hard deletes.** Business rows are never deleted. Cancellations are states, erasures are anonymisation updates, and anything withdrawn carries `is_deleted` and `deleted_at`. Query-based incremental loads cannot see deletes, so none happen.
 4. **Snapshots are insert-only.** Daily snapshot tables (`wms.stock_levels_daily`, `shelf.digital_shelf_daily`, the marketplace reports) only receive new rows. A restatement arrives as a new row with a new load id, never an update.
-5. **Roles.** `sim_writer` owns all schemas and is used only by the generator over localhost. `bi_reader` has `SELECT` on the six business schemas and nothing else: No access to `sim` or `truth`, no write rights.
+5. **Roles.** `sim_writer` owns all schemas and is used only by the generator, over the Compose network (SSL). `bi_reader` has `SELECT` on the six business schemas and nothing else: No access to `sim` or `truth`, no write rights.
 6. **Transport.** Postgres listens with SSL required for remote connections. Only the BI tool's outbound IPs should be allowed in.
 7. **Freshness.** A change committed in a tick is visible to `bi_reader` at the end of that tick, so the lag a BI tool sees is the tick length plus its own load schedule. A five- to fifteen-minute incremental schedule is the recommended setting.
 
@@ -302,7 +303,7 @@ cpg-commerce-simulator/
 
 **Running it.** `docker compose up` starts Postgres and the generator. On first start the generator runs `init` and `backfill`, then `run`. The generator reaches Postgres over the Compose network, and only port 5432 is published. A small VM with 2 vCPU, 2 GB RAM and a 50 GB disk is enough for the default volume.
 
-**Sizing.** At the default 300 web orders a day, the 24-month backfill comes to roughly 7 to 8 million rows, about 2 to 3 GB in Postgres including indexes. Live mode then adds about 10,000 rows a day, or 1 to 1.5 GB a year. The required disk is therefore 50 GB, which leaves room for several years of live running, Postgres overhead and Docker images. These are estimates; phase 1 measures the real figures and updates this paragraph.
+**Sizing.** Measured in phase 1 at the default 300 web orders a day. The 24-month backfill writes about 9.3 million business rows (erp 4.8 million, wms 3.1 million, shop 1.5 million), and the database comes to 3.0 GB including indexes (business schemas 2.7 GB, simulator state 0.25 GB). Postgres also keeps up to 2 GB of WAL (`max_wal_size`), so the data directory is about 5 GB. With the Compose stack limited to 2 vCPU and 2 GB RAM without swap (Postgres 1.2 CPU and 1280 MB, generator 0.8 CPU and 768 MB), the backfill took 13 minutes on a laptop, with peak memory of 380 MB for the generator and 460 MB for Postgres (page cache not counted) and no OOM kill. A VM with slower disks takes longer. Live mode then adds about 11,000 rows a day in an ordinary month and 13,000 a day averaged over a year with its seasonal peaks, about 1.5 GB a year. A 50 GB disk therefore leaves room for many years of live running, Postgres overhead and Docker images.
 
 **Public-repository rules.**
 
