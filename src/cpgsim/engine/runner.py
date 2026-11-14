@@ -124,6 +124,9 @@ class Simulation:
         from ..domain.model import Counters
 
         self.store.put("counters", "all", Counters())
+        # Overrides switched before the first run (e.g. `sim scenario enable` right
+        # after `sim init`) must be known from the start, exactly as after a restart.
+        self.refresh_scenarios()
         for fn in ordered(BOOTSTRAPS):
             fn(w)
         for fn in ordered(ON_LOAD):
@@ -147,15 +150,30 @@ class Simulation:
             fn(w)
         log.info("resumed at %s with %d queued events", self.clock.isoformat(), len(self.queue))
 
-    def refresh_scenarios(self) -> None:
+    def refresh_scenarios(self) -> datetime:
+        """Re-read ``sim.scenario_overrides``; returns the wall time to advance to.
+
+        The read runs under the same advisory lock the CLI takes while it picks a
+        switch time and inserts an override, and the wall time is taken while the
+        lock is held. An override the read did not see therefore has a switch time
+        later than the returned time, so its window start (and a live scenario
+        promotion's announcement) can never fall behind the next slice.
+        """
+        from ..db import SCENARIO_LOCK
+
         sm = self.world.scenarios
+        now = utcnow()
         if sm is not None and hasattr(sm, "load_overrides"):
             with self.conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_xact_lock(%s)", (SCENARIO_LOCK,))
                 cur.execute(
                     "SELECT id, scenario_id, action, at, params FROM sim.scenario_overrides ORDER BY id"
                 )
-                sm.load_overrides(cur.fetchall())
+                rows = cur.fetchall()
+                now = utcnow()
             self.conn.commit()
+            sm.load_overrides(rows)
+        return now
 
     # -- commit ------------------------------------------------------------
     def commit(self, sim_from: datetime, sim_to: datetime, mode: str, events: int, fresh=False) -> dict:
@@ -279,15 +297,18 @@ class Simulation:
                 pass
         ticks = 0
         while not self._stop.is_set():
-            self.refresh_scenarios()
-            now = utcnow()
+            now = self.refresh_scenarios()
             assert self.clock is not None
             if now - self.clock > 4 * tick:
                 log.info("catching up from %s to %s", self.clock.isoformat(), now.isoformat())
                 self.backfill(now, progress)
                 continue
             if now > self.clock:
-                self.advance(now, tick, tick, "live")
+                # One slice and one commit per tick: the sleep below wakes a few ms
+                # after clock + tick, and a fixed tick-length slice would leave a
+                # second, empty slice (and commit) for those milliseconds.
+                span = max(tick, now - self.clock)
+                self.advance(now, span, span, "live")
                 ticks += 1
                 if progress:
                     progress(self.clock, ticks)

@@ -226,6 +226,20 @@ def test_scenario_windows_from_config_and_overrides():
     assert act(ws, "2026-09-01T00:00") == ["carrier_decay"]
 
 
+def test_scenario_disable_closes_latest_open_window_only():
+    """Same rule as ScenarioManager: disable closes the most recently started open window."""
+    scen = [ScenarioCfg(id="carrier_decay", start=date(2026, 8, 3), carrier="Swiftbox")]
+    overrides = [
+        (1, "carrier_decay", "enable", _t("2026-09-01T00:00"), {"region": "DE-BW"}),
+        (2, "carrier_decay", "disable", _t("2026-09-10T00:00"), {}),
+    ]
+    ws = cli.scenario_windows(scen, overrides, BERLIN)
+    cfg_win = next(w for w in ws if w.source == "config")
+    cli_win = next(w for w in ws if w.source == "cli")
+    assert cli_win.end == _t("2026-09-10T00:00") and cfg_win.end is None
+    assert len(cli.active_scenarios(ws, _t("2026-09-15T00:00"))) == 1
+
+
 # -- progress ----------------------------------------------------------------------
 
 

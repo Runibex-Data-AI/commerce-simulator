@@ -19,6 +19,7 @@ HANDLER_MODULES = (
     "cpgsim.domain.customers",
     "cpgsim.domain.web",
     "cpgsim.domain.fulfilment",
+    "cpgsim.domain.billing",
     "cpgsim.domain.returns",
     "cpgsim.domain.subscriptions",
     "cpgsim.domain.retail",

@@ -150,6 +150,9 @@ class Window:
         return (self.start is None or self.start <= t) and (self.end is None or t < self.end)
 
 
+_MIN_UTC = datetime.min.replace(tzinfo=UTC)
+
+
 def scenario_windows(
     scenarios: Sequence[ScenarioCfg],
     overrides: Sequence[tuple[Any, ...]],
@@ -160,8 +163,8 @@ def scenario_windows(
     Config dates are local calendar days; ``end`` is inclusive (a window ending
     2026-03-29 covers that whole Sunday). Override rows are
     ``(id, scenario_id, action, at, params)`` in id order: ``enable`` opens a
-    window at ``at``; ``disable`` closes every window of that scenario open at
-    ``at``.
+    window at ``at``; ``disable`` closes the most recently started window of
+    that scenario open at ``at`` (the same rule as ``ScenarioManager``).
     """
     out: list[Window] = []
     for sc in scenarios:
@@ -179,9 +182,10 @@ def scenario_windows(
         if action == "enable":
             out.append(Window(sid, "cli", at, None, dict(params or {})))
         elif action == "disable":
-            for w in out:
-                if w.scenario_id == sid and w.contains(at):
-                    w.end = at
+            open_ = [(i, w) for i, w in enumerate(out) if w.scenario_id == sid and w.contains(at)]
+            if open_:
+                _, w = max(open_, key=lambda iw: (iw[1].start or _MIN_UTC, iw[0]))
+                w.end = at
     return out
 
 
@@ -601,7 +605,11 @@ def _scenario_params(args: argparse.Namespace, cfg: Config, sid: str) -> dict[st
 
 
 def _switch_at(conn) -> datetime:
-    """max(wall now, sim clock): never in the simulation's past."""
+    """max(wall now, sim clock): never in the simulation's past.
+
+    Call it inside the transaction that inserts the override, after taking
+    ``db.SCENARIO_LOCK`` (see ``Simulation.refresh_scenarios``).
+    """
     now = datetime.now(UTC)
     clock = _read_clock(conn)
     return max(now, clock[0].astimezone(UTC)) if clock else now
@@ -619,8 +627,11 @@ def cmd_scenario_switch(args: argparse.Namespace) -> int:
             if args.id not in known:
                 raise CliError(f"unknown scenario {args.id!r}")
             params = {}
-        at = _switch_at(conn)
         with conn.cursor() as cur:
+            # Serialise with the engine's override refresh, so the switch time is
+            # always later than the slice end the engine computed with the rows it saw.
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (db.SCENARIO_LOCK,))
+            at = _switch_at(conn)
             cur.execute(
                 "INSERT INTO sim.scenario_overrides (scenario_id, action, at, params)"
                 " VALUES (%s, %s, %s, %s) RETURNING id",

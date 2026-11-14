@@ -91,18 +91,31 @@ Stateful business logic lives in `domain/`. Each module registers its handlers:
 | `masterdata` | Material/account master emission, monthly FX, annual cost revision | `fx_rate(world, currency, d) -> float` (EUR per unit), `std_cost(world, sku_id, d) -> float` |
 | `demandplan` | Expected consumer demand per SKU, channel and day | `sku_weights(world, channel, d) -> (sku_ids, cum_weights)`, `expected_daily_units(world, sku_id, d, channel=None)` |
 | `promotions` | Web and retailer promotion calendar, lift and dip | `active_web_promos(world, t)`, `web_promo_for_basket(world, t, sku_ids, rng)`, `demand_factor(world, sku_id, channel, d)`, `retail_promos(world, channel, d)` |
+| `billing` | Invoices, credit memos, clearing (called by fulfilment, returns and retail) | `create_invoice(...)`, `create_credit_memo(...) -> BillingDoc \| None` (None when nothing is left to credit), `clear(world, billing_id, amount=None)` |
 | `warehouse` | Central stock, production replenishment, daily snapshots | `available`, `reserve`, `unreserve`, `issue`, `receive_return` |
 | `customers` | Web customer creation and repurchase intents | `new_customer(world, rng, acquisition=None) -> Customer`, `schedule_repurchase(world, customer, order)` |
 | `web` | Web arrivals, basket, pricing, payment, release, cancellation, backorders | `place_order(world, customer, lines, source, subscription_id=None) -> WebOrder` |
 | `fulfilment` | Deliveries for web and retail: pick, ship, carrier scans, outcomes, web invoicing at shipment | `create_delivery(world, kind, sales_doc, lines, ship_to_account, ship_to, carrier, planned_ship_date, order_id, seq_in_order=1) -> Delivery`, `cancel_delivery(world, delivery_id, reason)` |
-| `returns` | Web returns, refunds, credit memos | `maybe_schedule_return(world, order, delivery)`, `refund(world, order, amount, reason, return_id=None)` |
+| `returns` | Web returns, refunds, credit memos | `maybe_schedule_return(world, order, delivery)`, `refund(world, order, amount, reason, return_id=None, credit_items=None, include_shipping=False, delivery_id=None) -> refund_id \| None` |
 | `subscriptions` | Subscription lifecycle and recurring orders | `maybe_start_subscription(world, customer, order)` |
 | `retail` | Hidden retailer demand and inventory, retailer POs, confirmation, delivery planning, invoicing after proof of delivery, payment | none |
 | `scenarios/manager` | Scenario windows from config and CLI, truth recording | `world.scenarios.active(scenario_id, t) -> list[ScenarioWindow]`, `factor(name, t, **ctx) -> float`, `record_effect(...)` |
 
 Fulfilment hands lifecycle outcomes back through `world.schedule` events
 handled by the owning module (`"web.delivery_outcome"`, `"retail.pod"`), so
-fulfilment does not import `web` or `retail`.
+fulfilment does not import `web` or `retail`. Their data: `web.shipped`
+`{delivery_id, order_id, billing_id}`, `web.delivery_outcome`
+`{delivery_id, order_id, outcome}`, `web.delivery_exception`
+`{delivery_id, order_id}`, `retail.shipped` / `retail.pod`
+`{delivery_id, order_id}`.
+
+Scenario switches: the engine reads `sim.scenario_overrides` at a fresh start,
+on resume and before every live tick, under a Postgres advisory lock
+(`db.SCENARIO_LOCK`) that `sim scenario enable/disable` also takes while it
+picks the switch time and inserts the row. The engine takes the wall time it
+advances to while holding the lock, so a switch it did not see always lies
+after that slice and its window start (truth row, live scenario promotion) is
+never skipped.
 
 ## Source system conventions
 

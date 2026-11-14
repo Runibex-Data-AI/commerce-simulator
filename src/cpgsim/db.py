@@ -54,6 +54,8 @@ ENV_DSN = "CPGSIM_DSN"
 ENV_SQL_DIR = "CPGSIM_SQL_DIR"
 
 SEED_KEY = "seed"
+# Advisory lock serialising `sim scenario enable/disable` with the engine's override refresh.
+SCENARIO_LOCK = 0x6370_6773_696D  # "cpgsim"
 
 
 class DsnError(RuntimeError):
