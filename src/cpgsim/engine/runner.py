@@ -44,6 +44,10 @@ class StateMismatch(RuntimeError):
     pass
 
 
+class HistoryStartInFuture(ValueError):
+    pass
+
+
 def months_before(d: date, months: int) -> date:
     y, m = d.year, d.month - months
     while m <= 0:
@@ -96,7 +100,7 @@ class Simulation:
                 history_start = months_before(now.astimezone(self.world.tz).date(), m)
             start = self.world.at_local(history_start, 0)
             if start > now:
-                raise ValueError("history start lies in the future")
+                raise HistoryStartInFuture("history start lies in the future")
             self._fresh_start(start)
             return True
         sim_time, hist, seed, fp = row
@@ -260,6 +264,10 @@ class Simulation:
 
     def stop(self, *_args) -> None:
         self._stop.set()
+
+    @property
+    def stopped(self) -> bool:
+        return self._stop.is_set()
 
     def run_live(self, max_ticks: int | None = None, progress=None) -> None:
         """Run until stopped. Catches up at backfill speed first if behind."""

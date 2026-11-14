@@ -1,0 +1,14 @@
+# Generic scenario definition for live enabling:
+#   sim scenario enable promo_margin_trap [--param discount_pct=0.3]
+# The scenario starts at the current simulation time and stays on until
+# `sim scenario disable promo_margin_trap`. No dates here: fixed windows go in
+# the `scenarios:` list of the config.
+id: promo_margin_trap
+description: >
+  A web promotion grows volume but loses money: a deep discount plus free
+  shipping on one brand pushes baskets below break-even once shipping and
+  returns are costed. Orders up, contribution margin negative (shop, wms, erp, mkt).
+params:
+  brand: Velmora             # brand on promotion
+  discount_pct: 0.25         # 0.25 = 25 % off
+  free_shipping: true        # free shipping on baskets with a promoted line

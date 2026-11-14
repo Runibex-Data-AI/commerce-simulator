@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import date
 from pathlib import Path
 from typing import Any, Literal
@@ -80,7 +81,7 @@ class RetailerCfg(_M):
     dcs: int = 2
     payment_terms_days: int = 45
     trade_discount: float = 0.36  # off trade list price (customer discount condition)
-    assortment_share: float = 0.7  # share of active SKUs listed
+    assortment_share: float = 0.7  # share of eligible active SKUs listed (eligible: brand listed here; gift sets Nov-Dec)
     cutara_listed: bool = False  # whether the dermocosmetic brand is listed
     promo_weeks_per_quarter: int = 2
     model: str | None = None  # phase 2 (marketplace 1p)
@@ -119,7 +120,7 @@ class ChannelsCfg(_M):
 
 
 class SeasonalityCfg(_M):
-    black_friday_lift: float = 2.5  # web, Black Friday week (Mon-Sun around 4th Friday of Nov)
+    black_friday_lift: float = 2.5  # web, Black Friday week (Mon-Sun around the Friday after the 4th Thursday of Nov)
     cyber_monday_lift: float = 1.8
     christmas_lift: float = 1.6  # web, run-up 1-20 Dec
     marketplace_sale_lift: float = 3.0  # marketplace only (phase 2)
@@ -328,7 +329,9 @@ class Config(_M):
 
 # -- loading -----------------------------------------------------------------
 
-DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "config" / "default.yaml"
+DEFAULT_CONFIG = Path(
+    os.environ.get("CPGSIM_CONFIG") or Path(__file__).resolve().parents[2] / "config" / "default.yaml"
+)
 
 
 def _deep_merge(base: Any, over: Any) -> Any:
@@ -343,10 +346,9 @@ def _deep_merge(base: Any, over: Any) -> Any:
 def load_config_dict(path: str | Path | None = None, overlay: str | Path | None = None) -> dict:
     p = Path(path) if path else DEFAULT_CONFIG
     data: dict[str, Any] = {}
-    if p.exists():
-        data = yaml.safe_load(p.read_text()) or {}
-    elif path:
-        raise FileNotFoundError(p)
+    if not p.exists():
+        raise FileNotFoundError(f"config file not found: {p} (set --config or CPGSIM_CONFIG)")
+    data = yaml.safe_load(p.read_text()) or {}
     if overlay:
         ov = yaml.safe_load(Path(overlay).read_text()) or {}
         extra = ov.pop("scenarios_append", None)

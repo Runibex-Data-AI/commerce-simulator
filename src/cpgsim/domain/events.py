@@ -42,6 +42,7 @@ StockSnapshotTaken             wms.stock_levels_daily
 ReturnCreated                  wms.returns, wms.return_lines
 ReturnChanged                  wms.returns / wms.return_lines (update)
 ScenarioWindowRecorded         truth.scenario_windows
+ScenarioWindowClosed           truth.scenario_windows (update end_at)
 PlantedEffect                  truth.planted_effects
 =============================  ===============================================
 """
@@ -140,6 +141,7 @@ class WebOrderPlaced(DomainEvent):
     order: WebOrder
     customer: Customer
     source: str  # acquisition / traffic source of this order (utm-like word)
+    promotion: Promotion | None = None  # the promotion actually applied (discount or free shipping)
 
 
 @dataclass(slots=True)
@@ -165,7 +167,9 @@ class PaymentRecorded(DomainEvent):
 class PaymentStatusChanged(DomainEvent):
     payment_id: int
     status: str  # PAYMENT_STATUSES
-    amount: float | None = None  # captured / refunded amount when relevant
+    # captured: cumulative captured amount; refunded / partially_refunded: CUMULATIVE refunded total
+    amount: float | None = None
+    reason: str | None = None  # failure reason for failed (declined | insufficient_funds | authentication_failed)
 
 
 @dataclass(slots=True)
@@ -199,7 +203,8 @@ class SalesDocChanged(DomainEvent):
     # neutral header fields that changed: status, delivery_status, billing_status
     header: dict[str, Any] = field(default_factory=dict)
     # item_no -> changed neutral item fields: confirmed_qty, rejection_reason,
-    # delivered_qty, billed_qty
+    # delivered_qty, billed_qty. Whenever delivered_qty or billed_qty is present, the
+    # item's current confirmed_qty must be included too (writers derive SAP item status).
     items: dict[int, dict[str, Any]] = field(default_factory=dict)
 
 
@@ -214,7 +219,9 @@ class DeliveryChanged(DomainEvent):
     delivery_id: int
     status: str  # DELIVERY_STATUSES
     # optional neutral fields: tracking_no, freight_cost_eur, shipped_at,
-    # delivered_at, picked (dict line_no -> picked_qty), pod_signed_by
+    # delivered_at, picked (dict line_no -> picked_qty), pod_signed_by,
+    # kind (web | retail). For status "cancelled", fields["line_nos"] lists the
+    # delivery's line numbers (writers soft-delete the item rows).
     fields: dict[str, Any] = field(default_factory=dict)
 
 
@@ -226,6 +233,7 @@ class CarrierScan(DomainEvent):
     carrier: str
     location: str  # hub or city name
     detail: str | None = None
+    tracking_no: str | None = None
 
 
 @dataclass(slots=True)
@@ -292,6 +300,14 @@ class ScenarioWindowRecorded(DomainEvent):
     start: datetime
     end: datetime | None
     source: str  # config | cli
+
+
+@dataclass(slots=True)
+class ScenarioWindowClosed(DomainEvent):
+    """A window recorded earlier (possibly in an earlier commit) ends at ``end``."""
+
+    window_id: str
+    end: datetime
 
 
 @dataclass(slots=True)

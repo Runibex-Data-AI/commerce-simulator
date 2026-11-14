@@ -158,6 +158,7 @@ class Customer:
     subscription_id: int | None = None
     lapsed: bool = False
     scenario_tags: list[str] = field(default_factory=list)
+    meta: dict = field(default_factory=dict)  # module scratch space, JSON values only
 
 
 @dataclass(slots=True)
@@ -199,7 +200,12 @@ class WebOrder:
     billing_ids: list[int] = field(default_factory=list)
     return_ids: list[int] = field(default_factory=list)
     refunded_total: float = 0.0
+    captured_total: float = 0.0
+    backorder: dict[int, int] = field(default_factory=dict)  # line_no -> qty still waiting for stock
+    released_at: datetime | None = None
+    delivered_at: datetime | None = None
     scenario_tags: list[str] = field(default_factory=list)
+    meta: dict = field(default_factory=dict)  # module scratch space, JSON values only
 
     @property
     def goods_gross(self) -> float:
@@ -267,6 +273,9 @@ class SalesDoc:
     status: str = "open"  # open | in_process | completed | rejected
     delivery_status: str = "none"  # none | partial | full
     billing_status: str = "none"  # none | partial | full
+    shipping_net: float = 0.0  # web: net shipping charge (doc currency), billed on the first invoice
+    shipping_tax: float = 0.0
+    meta: dict = field(default_factory=dict)  # module scratch space, JSON values only
 
     @property
     def net_value(self) -> float:
@@ -304,19 +313,24 @@ class Delivery:
     delivered_at: datetime | None = None
     scan_seq: int = 0
     attempts: int = 0
+    outcome: str | None = None  # delivered | returned_to_sender | lost (final)
+    billing_id: int | None = None  # invoice raised at shipment (web) or after POD (retail)
     scenario_tags: list[str] = field(default_factory=list)
+    meta: dict = field(default_factory=dict)  # module scratch space, JSON values only
 
 
 @dataclass(slots=True)
 class BillingItem:
-    item_no: int
-    sku_id: int
+    item_no: int  # SAP-style 10, 20, 30 ... (shipping charge item: 900)
+    sku_id: int  # 0 for the shipping charge item
     qty: int
     net_value: float  # doc currency; negative never, credit memos are positive with doc_kind
     tax: float
     cost: float  # EUR
     sales_item_no: int
     delivery_id: int | None = None
+    delivery_line_no: int | None = None  # invoices: the delivery line billed
+    reference_item_no: int | None = None  # credit memos: the original invoice item_no
 
 
 @dataclass(slots=True)
@@ -409,6 +423,7 @@ class RetailPO:
     delivery_id: int | None = None
     billing_id: int | None = None
     promo_ids: list[int] = field(default_factory=list)
+    meta: dict = field(default_factory=dict)  # module scratch space, JSON values only
 
 
 @dataclass(slots=True)
@@ -427,6 +442,8 @@ class StockPosition:
     reserved: int = 0
     in_production: int = 0
     backorder_qty: int = 0
+    avg_daily_out: float = 0.0  # smoothed outbound units per day (planning)
+    issued_today: int = 0  # units issued since the last daily snapshot
 
 
 @dataclass(slots=True)

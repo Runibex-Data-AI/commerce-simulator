@@ -1,0 +1,77 @@
+# cpg-commerce-simulator: Postgres + generator.
+#
+#   cp .env.example .env     # set the passwords
+#   docker compose up -d
+#
+# On first start Postgres creates a self-signed certificate and the roles
+# sim_writer and bi_reader; the generator then runs `sim init`, backfills
+# history_months of data and keeps running live (`sim start`).
+# Only Postgres is published (5432, SSL required). Restrict access to it with
+# a firewall to the BI tool's outbound IPs.
+
+name: cpgsim
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-cpgsim}
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      CPGSIM_WRITER_PASSWORD: ${CPGSIM_WRITER_PASSWORD:?set CPGSIM_WRITER_PASSWORD in .env}
+      CPGSIM_READER_PASSWORD: ${CPGSIM_READER_PASSWORD:?set CPGSIM_READER_PASSWORD in .env}
+    # Tuned for a 2 GB VM shared with the generator.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - wal_compression=on
+      - -c
+      - max_wal_size=2GB
+      - -c
+      - checkpoint_timeout=15min
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/initdb:/docker-entrypoint-initdb.d:ro
+      - ./sql/roles.sql:/cpgsim/roles.sql:ro
+    ports:
+      - "${CPGSIM_PG_PORT:-5432}:5432"
+    shm_size: 256mb
+    healthcheck:
+      # TCP on purpose: during first-start initialisation the server listens on
+      # the Unix socket only, so this turns healthy once the real server is up.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U postgres -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  generator:
+    build: .
+    restart: unless-stopped
+    init: true               # forward SIGTERM so the generator commits and stops cleanly
+    stop_grace_period: 60s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Over the Compose network, SSL required (self-signed certificate).
+      CPGSIM_DSN: host=postgres port=5432 dbname=${POSTGRES_DB:-cpgsim} user=sim_writer sslmode=require
+      PGPASSWORD: ${CPGSIM_WRITER_PASSWORD:?set CPGSIM_WRITER_PASSWORD in .env}
+      CPGSIM_CONFIG: /app/config/default.yaml
+      CPGSIM_OVERLAY: /app/overlay/overlay.yaml
+    volumes:
+      - ./config:/app/config:ro
+      # Private overlay (host path in CPGSIM_OVERLAY); an empty placeholder otherwise.
+      - ${CPGSIM_OVERLAY:-./docker/empty-overlay.yaml}:/app/overlay/overlay.yaml:ro
+
+volumes:
+  pgdata:

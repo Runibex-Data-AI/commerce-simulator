@@ -1,0 +1,166 @@
+# cpg-commerce-simulator: default business configuration.
+#
+# Validated at start-up against cpgsim.config.Config. Anything left out here
+# takes the default defined there, so this file shows the main knobs only.
+# All values are synthetic defaults chosen to look credible; they are not
+# market data, and every name is fictional.
+#
+# Private, prospect-specific settings belong in an overlay file kept outside
+# the repository (`sim --overlay /path/to/private.yaml ...`, or CPGSIM_OVERLAY).
+# Mappings in the overlay merge into this file; lists and scalars replace;
+# `scenarios_append:` adds scenarios instead of replacing the list.
+#
+# Changing anything below changes the simulated business. A running simulation
+# warns when its config fingerprint changes; `sim reset` starts over.
+
+seed: 20261114            # same seed + same config = same business (`sim reset --seed N` overrides it)
+history_months: 24        # backfill length for a new simulation
+tick_seconds: 30          # live tick; live mode never runs ahead of wall time
+timezone: Europe/Berlin
+
+backfill:
+  tick_minutes: 60        # simulated slice length during backfill
+  commit_every_hours: 24  # simulated hours per transaction during backfill
+
+database:
+  dsn: null               # never commit real values; use --dsn or CPGSIM_DSN
+
+company:
+  name: Northvale Consumer Care GmbH
+  short_name: Northvale
+  brands: [Velmora, Cutara, Sorell]
+  catalogue_size: 180     # active SKUs
+  hero_skus: 12
+  hero_volume_share: 0.5  # target share of unit volume on hero SKUs
+  new_launches_per_year: 14
+  delists_per_year: 10
+  warehouse:
+    name: Zentrallager Nordhessen
+    city: Kassel
+    ship_cutoff_hour: 16  # local; picks after this ship the next working day
+    target_cover_days: 35
+    reorder_cover_days: 21
+
+channels:
+  web:                    # own web shop, DE / AT / CH
+    share: 0.10
+    base_orders_per_day: 300
+    new_customer_share: 0.42
+    country_mix: { DE: 0.78, AT: 0.14, CH: 0.08 }
+    free_shipping_eur: 29.0
+    free_shipping_chf: 35.0
+    shipping_fee_eur: 4.95
+    shipping_fee_chf: 7.90
+    basket_extra_lines_mean: 1.4   # basket lines = 1 + Poisson(mean)
+  drogerie_kranz:         # drugstore chain A
+    share: 0.35
+    order_cycle_days: 7
+    dcs: 3
+    payment_terms_days: 45
+    assortment_share: 0.72
+  mylo:                   # drugstore chain B (Mylo Drogeriemarkt)
+    share: 0.25
+    order_cycle_days: 7
+    dcs: 2
+    payment_terms_days: 60
+    assortment_share: 0.62
+  shopnova:               # marketplace, 1P wholesale: phase 2
+    share: 0.20
+    model: 1p
+    enabled: false
+  belle:                  # perfumery chain (Parfümerie Belle), mainly Cutara: phase 2
+    share: 0.10
+    sellout_frequency: monthly
+    cutara_listed: true
+    enabled: false
+
+erp:
+  naming: sap             # SAP-style tables and fields; a readable English profile is phase 3
+
+seasonality:
+  black_friday_lift: 2.5  # web, Black Friday week
+  cyber_monday_lift: 1.8
+  christmas_lift: 1.6     # web, 1-20 December
+  mothers_day_lift: 1.6   # Cutara, ten days before Mother's Day
+  marketplace_sale_lift: 3.0  # marketplace only (phase 2)
+
+promotions:
+  elasticity: -2.0
+  pull_forward_share: 0.30  # post-promo dip = this share of the incremental lift
+  dip_weeks: 3
+  web_promos_per_month: 2.0
+  retail_forward_buy_weeks: 2
+
+customers:
+  repurchase_prob: 0.62     # conversion of the first repurchase intent
+  repurchase_decay: 0.55    # multiplier per missed intent
+  subscription_rate: 0.08   # share of repeat customers who subscribe
+  subscription_intervals: [4, 8, 12]   # weeks
+
+payments:
+  auth_rate: 0.97
+  retry_share: 0.5
+
+fulfilment:
+  cancel_before_pick: 0.015
+  delivered_first_time: 0.96
+  exception_rate: 0.03
+  lost_rate: 0.004
+  return_rate: 0.03
+  return_window_days: 14
+
+carriers:
+  parcel:                   # median transit days by region (ISO 3166-2), "default" fallback
+    Paketblitz:
+      share: { DE: 0.45, AT: 0.35, CH: 0.30 }
+      median_days: { default: 1.3, DE-BY: 1.5, AT: 2.1, CH: 2.6 }
+      sigma: 0.40
+      exception_multiplier: 0.9
+      cost_eur: { DE: 4.10, AT: 6.90, CH: 9.80 }
+    Nordpost:
+      share: { DE: 0.35, AT: 0.40, CH: 0.45 }
+      median_days: { default: 1.6, DE-SH: 1.3, DE-HH: 1.2, AT: 2.3, CH: 2.4 }
+      sigma: 0.50
+      exception_multiplier: 1.1
+      cost_eur: { DE: 3.80, AT: 6.40, CH: 9.20 }
+    Swiftbox:
+      share: { DE: 0.20, AT: 0.25, CH: 0.25 }
+      median_days: { default: 1.1, DE-BY: 1.2, AT: 1.8, CH: 2.2 }
+      sigma: 0.35
+      exception_multiplier: 1.0
+      cost_eur: { DE: 4.40, AT: 7.20, CH: 10.40 }
+  pallet_forwarder: Frachtwerk Logistik
+
+retail:
+  forecast_error_sd: 0.12
+  safety_weeks: 1.0
+  lead_days: [2, 4]
+
+# Planted scenarios with fixed windows (local dates; `end` inclusive, omit for
+# open-ended). Each one is recorded in the truth schema. Switch scenarios on
+# live with `sim scenario enable <id>` (defaults in config/scenarios/).
+scenarios:
+  - id: carrier_decay       # one carrier quietly gets worse in one region
+    carrier: Swiftbox
+    region: DE-BY
+    start: 2026-08-03
+    delay_multiplier: 2.5
+    exception_multiplier: 3.0
+  - id: promo_margin_trap   # a promotion grows volume but loses money
+    brand: Velmora
+    discount_pct: 0.25
+    free_shipping: true
+    start: 2026-03-02
+    end: 2026-03-29
+
+# Data quality noise: phase 2. Spec default rates, not applied in phase 1.
+chaos:
+  duplicate_customer_rate: 0.02         # shop: same person, slightly different name or email
+  malformed_postcode_rate: 0.005        # shop: missing or malformed postcode
+  status_error_rate: 0.003              # shop, wms: status set in error, corrected hours later
+  duplicate_carrier_event_rate: 0.01    # wms
+  missing_order_ref_rate: 0.01          # erp: missing or truncated shop order reference
+  unmapped_article_rate: 0.05           # erp, feeds: retailer article without EAN mapping
+  sellout_restatement_rate: 0.10        # feeds: retailer weeks restated the following week
+  free_text_return_reason_rate: 0.15    # wms
+  gdpr_erasure_rate_monthly: 0.0005     # shop: customers anonymised per month

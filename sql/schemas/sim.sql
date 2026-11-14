@@ -49,3 +49,10 @@ CREATE TABLE IF NOT EXISTS sim.scenario_overrides (
     params       jsonb       NOT NULL DEFAULT '{}'::jsonb,
     created_wall timestamptz NOT NULL DEFAULT now()
 );
+
+-- Operator settings that survive `sim reset` (e.g. `seed`, set by `sim reset --seed N`
+-- and applied by the CLI on top of the config).
+CREATE TABLE IF NOT EXISTS sim.settings (
+    key    text PRIMARY KEY,
+    value  text NOT NULL
+);

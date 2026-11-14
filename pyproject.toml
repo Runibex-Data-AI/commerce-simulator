@@ -12,11 +12,11 @@ requires-python = ">=3.12"
 authors = [{ name = "Runibex Data & AI" }]
 dependencies = [
   "numpy>=2.0",
-  "faker>=30",
+  "faker==40.54.0",  # pinned: names/streets depend on Faker's bundled lists
   "psycopg[binary]>=3.2",
   "pydantic>=2.8",
   "pyyaml>=6",
-  "holidays>=0.60",
+  "holidays==0.108",  # pinned: holiday calendars affect delivery dates
   "tzdata>=2024.1",
 ]
 
