@@ -159,10 +159,57 @@ def _topup(world, rng: Rng, d: date, currency: str, lines: list[list[int]], sku_
     threshold = w.free_shipping_chf if currency == "CHF" else w.free_shipping_eur
     gross = round(sum(unit_price(cat.get(s), currency) * q for s, q in lines), 2)
     in_basket = {s for s, _ in lines}
-    cands = [c for c in _cheap_candidates(world, d, currency, sku_ids) if c[0] not in in_basket]
+    pool = [c for c in _cheap_candidates(world, d, currency, sku_ids) if c[0] not in in_basket]
+    # Shoppers top up with something they want, not always the single cheapest
+    # item: offer a few cheap SKUs drawn by today's (seasonal) weight, then take
+    # the cheapest of those that clears the threshold.
+    cands = _sample_by_weight(world, rng, d, pool, TOPUP_OFFER)
     add = baskets.threshold_topup(rng, gross, threshold, w.threshold_topup_prob, cands)
     if add is not None:
         lines.append([add[0], add[1]])
+
+
+TOPUP_OFFER = 4
+
+
+def _sample_by_weight(world, rng: Rng, d: date, pool: list, k: int) -> list:
+    """Up to ``k`` distinct candidates from ``pool`` drawn by today's web SKU weight."""
+    if len(pool) <= k:
+        return pool
+    wmap = _weight_map(world, d)
+    items = list(pool)
+    weights = [wmap.get(c[0], 0.0) for c in items]
+    out = []
+    for _ in range(k):
+        total = sum(weights)
+        if total <= 0:
+            break
+        x = rng.random() * total
+        acc = 0.0
+        for i, wt in enumerate(weights):
+            acc += wt
+            if x < acc:
+                break
+        out.append(items.pop(i))
+        weights.pop(i)
+    return out
+
+
+def _weight_map(world, d: date) -> dict[int, float]:
+    c = cache(world, "weight_map")
+    key = (d, world.scenarios.version)
+    m = c.get(key)
+    if m is None:
+        if len(c) > 8:
+            c.clear()
+        sku_ids, cum = _weights(world, d)
+        m = {}
+        prev = 0.0
+        for sid, cw in zip(sku_ids, cum):
+            m[sid] = cw - prev
+            prev = cw
+        c[key] = m
+    return m
 
 
 def draw_lines(world, rng: Rng, d: date, country: str = "DE", topup: bool = False) -> list[list[int]]:
@@ -200,8 +247,11 @@ def repeat_basket(world, rng: Rng, country: str, intent_lines: list[list[int]]) 
     lines: list[list[int]] = []
     seen: set[int] = set()
     for s, q in intent_lines:
-        keep = rng.random() < REPEAT_KEEP_PROB
-        if not keep:
+        # Seasonal products are rebought far less out of season (nobody restocks
+        # sun lotion in December): scale the keep probability by the SKU's
+        # seasonal factor today, capped at 1.
+        keep_p = REPEAT_KEEP_PROB * min(1.0, _season_today(world, cat.get(s).season_profile, d))
+        if not rng.random() < keep_p:
             continue
         if s not in act:
             sib = [x.sku_id for x in cat.siblings(s, d) if x.sku_id in act]
@@ -212,13 +262,8 @@ def repeat_basket(world, rng: Rng, country: str, intent_lines: list[list[int]]) 
             continue
         seen.add(s)
         lines.append([s, q])
-    if not lines and intent_lines:
-        # The customer came back for something: keep the first available intent SKU.
-        for s, q in intent_lines:
-            if s in act and s not in seen:
-                lines.append([s, q])
-                seen.add(s)
-                break
+    # A customer who keeps none of the intent SKUs still came back to shop:
+    # the basket is then drawn from today's (seasonal) popularity below.
     if not lines or rng.random() < REPEAT_EXTRA_PROB:
         extra = baskets.draw_basket(rng, sku_ids, cum, cat.affinity, REPEAT_EXTRA_MEAN, w.qty_two_prob)
         for s, q in extra:
@@ -228,6 +273,17 @@ def repeat_basket(world, rng: Rng, country: str, intent_lines: list[list[int]]) 
     if lines:
         _topup(world, rng, d, currency_of(country), lines, sku_ids)
     return lines
+
+
+def _season_today(world, profile: str, d: date) -> float:
+    c = cache(world, "season_factor")
+    key = (profile, d)
+    v = c.get(key)
+    if v is None:
+        if len(c) > 64:
+            c.clear()
+        v = c[key] = seasonality.category_factor(profile, d)
+    return v
 
 
 # ---------------------------------------------------------------------------
