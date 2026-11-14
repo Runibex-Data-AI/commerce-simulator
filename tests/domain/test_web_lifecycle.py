@@ -33,6 +33,7 @@ from cpgsim.domain.events import (
     SubscriptionChanged,
     SubscriptionCreated,
     WebOrderLinesChanged,
+    WebOrderMilestoneReached,
     WebOrderPlaced,
     WebOrderStatusChanged,
     BillingDocCreated,
@@ -995,3 +996,134 @@ def test_customer_return_keeps_its_status_when_the_rest_ships():
     assert web._only_parcels_failed(o)
     o.status, o.return_ids, o.meta["outcomes"] = "refunded", [], {"7": "delivered"}
     assert not web._only_parcels_failed(o)
+
+
+def _first_parcel_returned(monkeypatch, **fulfilment):
+    """Split order whose first parcel the customer returns; the second parcel is never returned."""
+    from cpgsim.domain import returns as real_returns
+
+    real = real_returns.maybe_schedule_return
+
+    def only_first(world, order, delivery):
+        if delivery.seq_in_order == 1:
+            real(world, order, delivery)
+
+    monkeypatch.setattr(real_returns, "maybe_schedule_return", only_first)
+    fcfg = {"cancel_before_pick": 0.0, "return_rate": 1.0, "return_reject_rate": 0.0, "return_window_days": 1}
+    fcfg.update(fulfilment)
+    h = Harness(monkeypatch, payments={"auth_rate": 1.0}, fulfilment=fcfg)
+    a, b = _sku(h, "mass", min_price=6.0), _sku(h, "seasonal", min_price=6.0)
+    h.s.stock[b.sku_id] = 0
+    o = web.place_order(h.world, h.customer(country="DE"), [(a.sku_id, 2), (b.sku_id, 1)], source="direct")
+    return h, o, b
+
+
+def _milestones(h, order_id):
+    return {e.milestone: e for e in h.of(WebOrderMilestoneReached) if e.order_id == order_id}
+
+
+def test_remainder_ships_after_customer_return_of_first_parcel(monkeypatch):
+    """Return of parcel 1 refunded before the backordered rest ships: the return status stays,
+    shipped_at / delivered_at are recorded at the remainder's goods issue and delivery scan,
+    and the order is only partially refunded once the remainder is captured."""
+    h, o, b = _first_parcel_returned(monkeypatch, backorder_max_days=40)
+    t = START
+    while not set(h.statuses(o.order_id)) & {"refunded", "partially_refunded"}:
+        t += timedelta(hours=1)
+        assert t < START + timedelta(days=30)
+        h.run_until(t)
+    assert "shipped" not in h.statuses(o.order_id)  # never completed before the return
+    h.s.stock[b.sku_id] = 100
+    h.run_until(t + timedelta(days=10))
+    order = h.world.store.get("web_order", o.order_id)
+    st = h.statuses(o.order_id)
+    assert "shipped" not in st and "delivered" not in st, st
+    assert st[-1] == "partially_refunded", st
+    assert [ln.shipped_qty for ln in order.lines] == [2, 1]
+    second = h.world.store.get("delivery", order.delivery_ids[1])
+    ms = _milestones(h, o.order_id)
+    assert set(ms) == {"shipped", "delivered"}
+    assert (ms["shipped"].effective_at or ms["shipped"].at) == second.shipped_at
+    assert (ms["delivered"].effective_at or ms["delivered"].at) == second.delivered_at
+    # refunded_at keeps the refund's time when the status becomes partially_refunded
+    by_status = {e.status: e for e in h.of(WebOrderStatusChanged) if e.order_id == o.order_id}
+    if "refunded" in by_status:
+        assert by_status["partially_refunded"].effective_at == by_status["refunded"].at
+    assert order.refunded_total < order.captured_total
+
+
+def test_backorder_cancelled_after_customer_return_of_first_parcel(monkeypatch):
+    """The remainder is cancelled while the return of parcel 1 is under way: milestones only."""
+    h, o, _ = _first_parcel_returned(monkeypatch, backorder_max_days=6)
+    h.run_until(START + timedelta(days=30))
+    order = h.world.store.get("web_order", o.order_id)
+    st = h.statuses(o.order_id)
+    assert "return_requested" in st and "shipped" not in st and "delivered" not in st, st
+    assert st[-1] in ("partially_refunded", "refunded"), st
+    assert order.lines[1].cancelled_qty == 1
+    (dlv,) = [h.world.store.get("delivery", d) for d in order.delivery_ids]
+    ms = _milestones(h, o.order_id)
+    assert ms["shipped"].effective_at == dlv.shipped_at
+    assert ms["delivered"].effective_at == dlv.delivered_at
+    cancel_at = [e.at for e in h.of(WebOrderLinesChanged)
+                 if e.order_id == o.order_id and 2 in e.lines and "cancelled_qty" in e.lines[2]][0]
+    assert ms["shipped"].at == cancel_at and ms["delivered"].at == cancel_at
+    # the return started before the cancel
+    req = [e.at for e in h.of(WebOrderStatusChanged) if e.order_id == o.order_id and e.status == "return_requested"]
+    assert req[0] < cancel_at
+
+
+def test_no_milestone_when_status_passed_through():
+    """A milestone the order already reached as a status is not recorded twice."""
+    events = []
+    w = types.SimpleNamespace(now=START, emit=events.append)
+    o = types.SimpleNamespace(order_id=1, status="released", return_ids=[], meta={})
+    web.set_status(w, o, "shipped")
+    web.set_status(w, o, "return_requested")
+    web._milestone(w, o, "shipped", START)
+    web._milestone(w, o, "delivered", START - timedelta(hours=1))
+    web._milestone(w, o, "delivered", START)
+    ms = [e for e in events if isinstance(e, WebOrderMilestoneReached)]
+    assert [(e.milestone, e.effective_at) for e in ms] == [("delivered", START - timedelta(hours=1))]
+
+
+def test_subscription_cancel_evicts_customer_without_open_order(monkeypatch):
+    """A subscription cancelled with no open order (e.g. every SKU delisted) evicts its customer;
+    one cancelled right after its last order keeps the customer until that order is cleaned up."""
+    h = Harness(monkeypatch, **_happy_cfg())
+    sku = _sku(h)
+    idle, busy = h.customer(), h.customer()
+    subs = {}
+    for c in (idle, busy):
+        c = h.world.store.mut("customer", c.customer_id)
+        subs[c.customer_id] = subscriptions._create(
+            h.world, c, [sku.sku_id], [1], 4, START, START + timedelta(days=28)
+        )
+    web.place_order(h.world, busy, [(sku.sku_id, 1)], source="subscription",
+                    subscription_id=subs[busy.customer_id].subscription_id)
+    for cid, sub in subs.items():
+        subscriptions._cancel(h.world, h.world.store.mut("subscription", sub.subscription_id),
+                              h.world.store.get("customer", cid))
+    assert not h.world.store.has("customer", idle.customer_id)
+    assert h.world.store.has("customer", busy.customer_id)
+    left = h.world.store.get("customer", busy.customer_id)
+    assert left.lapsed and left.subscription_id is None
+    h.run_until(START + timedelta(days=60))  # the order is delivered and cleaned up
+    assert not h.world.store.has("customer", busy.customer_id)
+
+
+def test_backorder_cancelled_after_first_parcel_returned_to_sender(monkeypatch):
+    """Nothing arrived, the rest is cut: the refund status stays, shipped_at is still recorded."""
+    h = Harness(monkeypatch, payments={"auth_rate": 1.0},
+                fulfilment={"cancel_before_pick": 0.0, "return_rate": 0.0, "backorder_max_days": 6})
+    a, b = _sku(h, "mass"), _sku(h, "derma")
+    h.s.stock[b.sku_id] = 0
+    h.s.outcome_fn = lambda d: "returned_to_sender"
+    o = web.place_order(h.world, h.customer(), [(a.sku_id, 1), (b.sku_id, 1)], source="direct")
+    h.run_until(START + timedelta(days=20))
+    st = h.statuses(o.order_id)
+    assert "shipped" not in st and st[-1] == "refunded", st
+    order = h.world.store.get("web_order", o.order_id)
+    (dlv,) = [h.world.store.get("delivery", d) for d in order.delivery_ids]
+    ms = _milestones(h, o.order_id)
+    assert set(ms) == {"shipped"} and ms["shipped"].effective_at == dlv.shipped_at

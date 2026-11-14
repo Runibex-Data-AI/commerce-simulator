@@ -186,13 +186,33 @@ once a BI tool loads.
 **Memory.** Resume streams `sim.entity_state` and `sim.event_queue` through
 server-side cursors (JSON text decoded row by row). Customers who can never
 act again (no open web order, no subscription, no live repurchase intent) are
-evicted from the store (`customers.maybe_evict`, on lapse and when their last
-order is cleaned up; a one-off `on_load` pass counts open orders for states
-written before). Their shop rows stay; ids are never reused. New code must not
+evicted from the store (`customers.maybe_evict`, on lapse, on subscription
+cancellation and when their last order is cleaned up; a one-off `on_load` pass
+counts open orders for states written before). Their shop rows stay; ids are never reused. New code must not
 look customers up in the store by id unless an open order, intent or
 subscription guarantees they are there. Measured on a 24-month state: resident
 memory after resume 880 MB before, 415 MB on the first resume (eviction pass),
 250 MB afterwards.
+
+**Housekeeping.** `sim.entity_state` and `sim.event_queue` are rewritten on
+every commit (upserts and deletes, about 7,000 rows per simulated day in a
+backfill), faster than autovacuum reclaims the dead rows: a 24-month backfill
+left `sim.entity_state` at 480 to 890 MB for 62 MB of live state. The
+engine therefore vacuums both tables between commits every
+`runner.VACUUM_EVERY_STATE_ROWS` state rows (`SKIP_LOCKED`: a table
+autovacuum is busy with is left to it, the engine never waits), `sim.sql` gives
+`sim.entity_state` a fill factor of 70 (upserts stay on their page as HOT
+updates) and both tables a 5 % autovacuum threshold, and `sim start` /
+`sim backfill` finish with `Simulation.after_backfill`: `VACUUM (ANALYZE)` of
+the state tables and `ANALYZE` of the business and truth schemas, so BI
+queries plan on fresh statistics right away. Housekeeping changes no rows.
+Measured on a 24-month backfill: `sim.entity_state` about 220 MB (92 % HOT
+updates), `sim.event_queue` 31 MB, the `sim` schema 250 MB instead of 557 MB;
+the 140 or so periodic vacuums did not measurably slow the backfill (168 s
+with, 167 s without them on a 6-month A/B run), and the final pass took 5 to
+10 seconds. Postgres logs a `skipping vacuum ... lock not available` warning
+when a periodic vacuum meets a running autovacuum (up to about ten times per
+backfill).
 
 ## Source system conventions
 
@@ -222,7 +242,11 @@ UTC, statuses as lower-case words (the neutral vocabulary), money as
 * A parcel returned to sender or lost (and its refund) does not end the order
   when a backordered remainder ships later: that shipment moves the order on to
   `shipped` and `delivered` (`web._only_parcels_failed`); a customer return
-  keeps its status.
+  keeps its status. A return of an earlier parcel can start before the rest
+  of a split order ships or its backorder is cancelled: the return status
+  stays and `WebOrderMilestoneReached` sets only `shipped_at` / `delivered_at`
+  (at the last goods issue / delivery scan); a `refunded` order becomes
+  `partially_refunded` when the remainder is captured.
 * A rejected return reduces `order_lines.qty_returned` again and moves a
   `returned` order to `return_rejected` (no refund). Refunds are `issued`, then
   `completed` (`RefundChanged`) when the payment provider has paid out, by

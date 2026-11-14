@@ -30,6 +30,7 @@ from ..domain.events import (
     SubscriptionCreated,
     WebOrderLinesChanged,
     WebOrderPlaced,
+    WebOrderMilestoneReached,
     WebOrderStatusChanged,
 )
 from ..domain.model import (
@@ -156,6 +157,7 @@ class ShopWriter(Writer):
             PromotionChanged: self.on_promotion_changed,
             WebOrderPlaced: self.on_order_placed,
             WebOrderStatusChanged: self.on_order_status_changed,
+            WebOrderMilestoneReached: self.on_order_milestone,
             WebOrderLinesChanged: self.on_order_lines_changed,
             PaymentRecorded: self.on_payment_recorded,
             PaymentStatusChanged: self.on_payment_status_changed,
@@ -390,6 +392,13 @@ class ShopWriter(Writer):
         if status == "cancelled":
             changes["cancel_reason"] = e.reason
         self.t(ORDERS).update(keys.shop_order_id(self.seed, e.order_id), changes, e.at)
+
+    def on_order_milestone(self, e: WebOrderMilestoneReached) -> None:
+        if e.milestone not in ("shipped", "delivered"):
+            raise ValueError(f"unknown order milestone {e.milestone!r}")
+        col = ORDER_STATUS_TIMESTAMPS[e.milestone]
+        eff = e.effective_at if e.effective_at is not None else e.at
+        self.t(ORDERS).update(keys.shop_order_id(self.seed, e.order_id), {col: eff}, e.at)
 
     def on_order_lines_changed(self, e: WebOrderLinesChanged) -> None:
         buf = self.t(ORDER_LINES)

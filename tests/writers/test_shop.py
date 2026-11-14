@@ -19,6 +19,7 @@ from cpgsim.domain.events import (
     SubscriptionCreated,
     WebOrderLinesChanged,
     WebOrderPlaced,
+    WebOrderMilestoneReached,
     WebOrderStatusChanged,
 )
 from cpgsim.domain.model import (
@@ -157,6 +158,19 @@ def test_late_status_uses_effective_time_and_refund_completion():
     assert rc["status"] == "completed" and rc["completed_at"] == T3 and rc["updated_at"] == T3
     with pytest.raises(ValueError, match="refund status"):
         d.dispatch(RefundChanged(at=T3, refund_id=4, status="bogus"))
+
+
+def test_milestone_sets_timestamp_without_status():
+    """A return status hides the later shipment: only shipped_at / delivered_at are set."""
+    d, _ = make_dispatcher()
+    d.dispatch(WebOrderStatusChanged(at=T1, order_id=7, status="refunded"))
+    d.dispatch(WebOrderMilestoneReached(at=T3, order_id=7, milestone="shipped", effective_at=T2))
+    d.dispatch(WebOrderMilestoneReached(at=T3, order_id=7, milestone="delivered"))
+    ch = d.batch.table("shop.orders").updates[(keys.shop_order_id(SEED, 7),)]
+    assert ch["status"] == "refunded" and ch["refunded_at"] == T1
+    assert ch["shipped_at"] == T2 and ch["delivered_at"] == T3 and ch["updated_at"] == T3
+    with pytest.raises(ValueError, match="milestone"):
+        d.dispatch(WebOrderMilestoneReached(at=T3, order_id=7, milestone="returned"))
 
 
 def test_customer_and_default_address():

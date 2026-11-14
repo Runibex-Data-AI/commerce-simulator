@@ -26,6 +26,7 @@ PromotionDefined               shop.promotions (web promos only)
 PromotionChanged               shop.promotions (update of ends_at; soft delete if withdrawn)
 WebOrderPlaced                 shop.orders, shop.order_lines, shop.promo_redemptions
 WebOrderStatusChanged          shop.orders (update)
+WebOrderMilestoneReached       shop.orders (update of shipped_at / delivered_at only)
 WebOrderLinesChanged           shop.order_lines (update)
 PaymentRecorded                shop.payments
 PaymentStatusChanged           shop.payments (update)
@@ -177,6 +178,20 @@ class WebOrderStatusChanged(DomainEvent):
     # happened (e.g. 'delivered' at the carrier's scan, recognised when the
     # backordered remainder is cancelled). Writers use it for the status
     # timestamp column; ``at`` stays the change time (updated_at).
+    effective_at: datetime | None = None
+
+
+@dataclass(slots=True)
+class WebOrderMilestoneReached(DomainEvent):
+    """A fulfilment milestone ('shipped' / 'delivered') reached without a status change.
+
+    Used when the order already carries a customer-return status (a return of
+    an earlier parcel) by the time its remaining goods ship or are delivered:
+    the status stays, only the milestone's timestamp column is set.
+    """
+
+    order_id: int
+    milestone: str  # 'shipped' | 'delivered'
     effective_at: datetime | None = None
 
 

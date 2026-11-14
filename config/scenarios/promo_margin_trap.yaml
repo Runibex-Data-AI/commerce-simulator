@@ -10,8 +10,9 @@ description: >
   customers buy more, deal-site shoppers arrive), baskets shrink (no threshold
   top-ups, cherry-picking, single cheap deal items), and once freight, cost of
   goods and returns are costed the promoted orders' contribution is negative
-  in aggregate: deal-seeker orders lose about EUR 2.7 each, regular promoted
-  orders barely break even (shop, wms, erp).
+  in aggregate (roughly EUR -0.5 per redeemed order on the default config):
+  deal-seeker orders lose a few euros each, regular promoted orders make
+  about a euro (shop, wms, erp).
 params:
   brand: Velmora                 # brand on promotion
   discount_pct: 0.25             # 0.25 = 25 % off

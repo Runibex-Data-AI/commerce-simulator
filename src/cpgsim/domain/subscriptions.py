@@ -195,6 +195,10 @@ def _cancel(world, sub: Subscription, c: Customer | None) -> None:
         c.subscription_id = None
         c.lapsed = True  # churned with the subscription; customer record stays
     world.store.remove("subscription", sub.subscription_id)
+    if c is not None and world.store.has("customer", c.customer_id):
+        # No subscription and lapsed: without an open order the customer can never
+        # act again (an open order evicts at its cleanup, customers.order_closed).
+        customers.maybe_evict(world, world.store.get("customer", c.customer_id))
 
 
 # ---------------------------------------------------------------------------

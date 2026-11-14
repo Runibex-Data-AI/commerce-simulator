@@ -17,6 +17,11 @@ Backfill uses long slices and commits every ``backfill.commit_every_hours``
 of simulated time. Live mode uses ``tick_seconds`` slices against wall time
 and commits every tick; it never runs ahead of wall time.
 
+Housekeeping: every ``VACUUM_EVERY_STATE_ROWS`` state rows written, the engine
+vacuums ``sim.entity_state`` and ``sim.event_queue`` between commits (a
+backfill churns them faster than autovacuum keeps up); :meth:`Simulation.after_backfill`
+vacuums and analyzes them and analyzes the business schemas.
+
 Scenario overrides apply exactly from their ``at`` on: slices are split so that
 no slice straddles a switch (``ScenarioManager.advance_to / next_switch``).
 
@@ -84,6 +89,16 @@ def months_before(d: date, months: int) -> date:
     return date(y, m, min(d.day, monthrange(y, m)[1]))
 
 
+#: Shortest wait of a live loop iteration that had nothing to advance.
+MIN_IDLE_SECONDS = 0.25
+#: State rows written (entity upserts/deletes plus queue inserts/deletes) after
+#: which ``sim.entity_state`` and ``sim.event_queue`` are vacuumed. A backfill
+#: commits about 7,000 such rows per simulated day, faster than autovacuum
+#: reclaims them: without this, 24 months left 480-890 MB of heap for 62 MB of
+#: live state (about 220 MB with it). The dead rows between two runs stay under ~70 MB.
+VACUUM_EVERY_STATE_ROWS = 50_000
+
+
 def utcnow() -> datetime:
     return datetime.now(UTC)
 
@@ -110,6 +125,7 @@ class Simulation:
         self._committed: datetime | None = None  # sim_time of the last commit (fence)
         self._locked = False
         self._stop = threading.Event()
+        self._state_rows = 0  # state rows written since the last vacuum
 
     # -- state -------------------------------------------------------------
     def read_clock(self):
@@ -441,7 +457,42 @@ class Simulation:
         self.batch.clear()
         self.store.mark_flushed()
         self.queue.mark_flushed()
+        self._state_rows += sum(ent) + sum(q)
+        if self._state_rows >= VACUUM_EVERY_STATE_ROWS:
+            self.vacuum_state(skip_locked=True)  # never wait for a running autovacuum
         return {"rows": rows, "entities": ent, "queue": q}
+
+    # -- maintenance -----------------------------------------------------------
+    def vacuum_state(self, analyze: bool = False, skip_locked: bool = False) -> None:
+        """VACUUM the state tables (``db.STATE_TABLES``) between commits.
+
+        Pure database housekeeping: it changes no rows, so determinism is
+        unaffected. A failure is logged, never fatal.
+        """
+        self._state_rows = 0
+        t0 = time.perf_counter()
+        try:
+            db.vacuum(self.conn, db.STATE_TABLES, analyze=analyze, skip_locked=skip_locked)
+        except psycopg.Error as e:
+            log.warning("vacuum of the simulator state tables failed: %s", e)
+            return
+        log.debug("vacuumed state tables in %.2fs", time.perf_counter() - t0)
+
+    def after_backfill(self) -> None:
+        """After a backfill: VACUUM (ANALYZE) the state tables, ANALYZE business and truth.
+
+        Fresh statistics right away, so BI queries plan well on the new history
+        without waiting for autovacuum. Called by ``sim start`` / ``sim backfill``,
+        not by the catch-up inside :meth:`run_live`.
+        """
+        t0 = time.perf_counter()
+        self.vacuum_state(analyze=True)
+        try:
+            n = db.analyze(self.conn)
+        except psycopg.Error as e:
+            log.warning("ANALYZE after backfill failed: %s", e)
+            return
+        log.info("vacuumed state tables and analyzed %d tables in %.1fs", n, time.perf_counter() - t0)
 
     # -- advancing -----------------------------------------------------------
     def _process_slice(self, start: datetime, end: datetime) -> int:
@@ -547,12 +598,18 @@ class Simulation:
         try:
             while not self._stop.is_set():
                 now = self.refresh_scenarios()
+                # The target runs on the database clock (capped at the host clock).
+                # When the host clock is ahead of the database clock, the sleep below
+                # must wait on the target's timeline, or it never sleeps and the loop
+                # spins with millisecond slices.
+                lag = max(timedelta(0), utcnow() - now)
                 assert self.clock is not None
                 if now - self.clock > 4 * tick:
                     log.info("catching up from %s to %s", self.clock.isoformat(), now.isoformat())
                     self.backfill(now, progress)
                     continue
-                if now > self.clock:
+                advanced = now > self.clock
+                if advanced:
                     # One slice and one commit per tick: the sleep below wakes a few ms
                     # after clock + tick, and a fixed tick-length slice would leave a
                     # second, empty slice (and commit) for those milliseconds.
@@ -563,7 +620,11 @@ class Simulation:
                         progress(self.clock, ticks)
                 if max_ticks is not None and ticks >= max_ticks:
                     break
-                sleep_for = (self.clock + tick - utcnow()).total_seconds()
+                # Wake when the target's clock (host clock - lag) reaches clock + tick.
+                sleep_for = (self.clock + tick + lag - utcnow()).total_seconds()
+                if sleep_for <= 0 and not advanced:
+                    # Nothing to do (e.g. a clock stepped back): never spin.
+                    sleep_for = min(tick.total_seconds(), MIN_IDLE_SECONDS)
                 if sleep_for > 0:
                     self._stop.wait(sleep_for)
         finally:

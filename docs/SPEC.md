@@ -303,7 +303,7 @@ cpg-commerce-simulator/
 
 **Running it.** `docker compose up` starts Postgres and the generator. On first start the generator runs `init` and `backfill`, then `run`. The generator reaches Postgres over the Compose network, and only port 5432 is published. A small VM with 2 vCPU, 2 GB RAM and a 50 GB disk is enough for the default volume.
 
-**Sizing.** At the default 300 web orders a day, the 24-month backfill comes to roughly 7 to 8 million rows, about 2 to 3 GB in Postgres including indexes. Live mode then adds about 10,000 rows a day, or 1 to 1.5 GB a year. The required disk is therefore 50 GB, which leaves room for several years of live running, Postgres overhead and Docker images. These are estimates; phase 1 measures the real figures and updates this paragraph.
+**Sizing.** Measured in phase 1 at the default 300 web orders a day. The 24-month backfill writes about 9.3 million business rows (erp 4.8 million, wms 3.1 million, shop 1.5 million), and the database comes to 3.0 GB including indexes (business schemas 2.7 GB, simulator state 0.25 GB). Postgres also keeps up to 2 GB of WAL (`max_wal_size`), so the data directory is about 5 GB. With the Compose stack limited to 2 vCPU and 2 GB RAM without swap (Postgres 1.2 CPU and 1280 MB, generator 0.8 CPU and 768 MB), the backfill took 13 minutes on a laptop, with peak memory of 380 MB for the generator and 460 MB for Postgres (page cache not counted) and no OOM kill. A VM with slower disks takes longer. Live mode then adds about 11,000 rows a day in an ordinary month and 13,000 a day averaged over a year with its seasonal peaks, about 1.5 GB a year. A 50 GB disk therefore leaves room for many years of live running, Postgres overhead and Docker images.
 
 **Public-repository rules.**
 

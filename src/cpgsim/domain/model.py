@@ -246,6 +246,16 @@ class Condition:
 FREIGHT_ITEM_NO = 900
 
 
+def goods_item_no(n: int) -> int:
+    """Item number of the ``n``-th (1-based) goods item: 10, 20, ... 890, then 910, 920, ...
+
+    900 is reserved for the freight item, so a document with 90 or more goods
+    lines (retailer orders and invoices) never collides with it.
+    """
+    no = 10 * n
+    return no + 10 if no >= FREIGHT_ITEM_NO else no
+
+
 @dataclass(slots=True)
 class SalesItem:
     item_no: int  # 10, 20, 30 ... (SAP style numbering is neutral enough); freight: FREIGHT_ITEM_NO

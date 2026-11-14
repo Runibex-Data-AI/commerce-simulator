@@ -75,3 +75,62 @@ def test_fingerprint_ignores_tick_backfill_and_history_length():
     assert a.legacy_fingerprint() != b.legacy_fingerprint()  # the old scheme hashed them
     assert a.fingerprint() != load_config(seed=1).fingerprint()
     assert a.fingerprint() != load_config(channels={"web": {"base_orders_per_day": 301}}).fingerprint()
+
+
+class _FakeStop:
+    """threading.Event stand-in whose wait advances a fake host clock."""
+
+    def __init__(self, clock: list) -> None:
+        self.clock = clock
+        self.waits: list[float] = []
+
+    def is_set(self) -> bool:
+        return False
+
+    def wait(self, seconds: float) -> bool:
+        self.waits.append(seconds)
+        self.clock[0] += timedelta(seconds=seconds)
+        return False
+
+
+def _live_loop(monkeypatch, skew: timedelta, ticks: int = 6):
+    """Drive Simulation.run_live with a fake host clock ``skew`` ahead of the database clock."""
+    import types as _types
+
+    from cpgsim.engine import runner
+
+    host = [datetime(2026, 5, 4, 10, 0, tzinfo=UTC)]
+    monkeypatch.setattr(runner, "utcnow", lambda: host[0])
+    sim = runner.Simulation.__new__(runner.Simulation)
+    sim.cfg = _types.SimpleNamespace(tick_seconds=5)
+    sim.commit_time_stamps = False
+    sim._stop = _FakeStop(host)
+    sim.clock = min(host[0] - skew, host[0]) - timedelta(seconds=5)  # one tick behind the target
+    calls = {"refresh": 0}
+    spans: list[timedelta] = []
+
+    def refresh():
+        calls["refresh"] += 1
+        assert calls["refresh"] < 200, "live loop spins without sleeping"
+        return min(host[0] - skew, host[0])  # database clock, capped at the host clock
+
+    def advance(target, slice_len, commit_every, mode, progress=None):
+        spans.append(target - sim.clock)
+        sim.clock = target
+        host[0] += timedelta(milliseconds=30)  # the commit takes a little time
+        return 1
+
+    sim.refresh_scenarios = refresh
+    sim.advance = advance
+    sim.backfill = lambda *a, **k: (_ for _ in ()).throw(AssertionError("no catch-up expected"))
+    sim.run_live(max_ticks=ticks)
+    return spans, sim._stop.waits, calls["refresh"]
+
+
+def test_live_loop_sleeps_on_the_database_clock_when_the_host_is_ahead(monkeypatch):
+    """Host clock 10 min ahead of the database clock: one tick-sized slice per tick, no spinning."""
+    for skew in (timedelta(0), timedelta(minutes=10), -timedelta(minutes=10)):
+        spans, waits, refreshes = _live_loop(monkeypatch, skew)
+        assert refreshes == 6, (skew, refreshes)
+        assert all(timedelta(seconds=5) <= s < timedelta(seconds=5.1) for s in spans[1:]), (skew, spans)
+        assert len(waits) == 5 and all(4.9 < w <= 5.0 for w in waits), (skew, waits)

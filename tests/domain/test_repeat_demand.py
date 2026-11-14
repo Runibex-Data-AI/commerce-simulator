@@ -197,3 +197,39 @@ def test_unannounced_promotions_are_not_windows_yet():
     assert pw.kind == "promotion"
     # calendar events are always known
     assert demandplan.demand_windows(w, [], date(2025, 11, 1), date(2025, 11, 30), known_at=w.at_local(date(2025, 1, 1), 0))
+
+
+def test_planning_demand_includes_deal_seekers():
+    """Warehouse planning sees the deal-site units: same rate and basket weights as the draw."""
+    w, spec = _deal_world()
+    w0, _ = _deal_world(share=0.0)
+    cat = w.ref.catalogue
+    d = date(2026, 3, 10)
+    active = [s.sku_id for s in cat.active(d)]
+    extra = {s: demandplan.expected_daily_units(w, s, d, "web") - demandplan.expected_daily_units(w0, s, d, "web")
+             for s in active}
+    assert all(v >= -1e-9 for v in extra.values())
+    assert all(abs(v) < 1e-9 for s, v in extra.items() if cat.get(s).brand != "Velmora")
+    # daily deal orders = sum of the hourly arrival rate; units per order (1 + p2) (1 + q2) at most
+    orders = sum(customers.deal_seeker_rate_per_hour(w, w.at_local(d, h) + timedelta(minutes=30)) for h in range(24))
+    upo = (1 + customers.DEAL_SECOND_LINE_PROB) * (1 + customers.DEAL_QTY_TWO_PROB)
+    assert sum(extra.values()) == pytest.approx(orders * upo, rel=1e-6)
+    base = w.cfg.channels.web.base_orders_per_day
+    assert 0.6 * base < orders < 1.6 * base
+    # the per-SKU split matches the deal basket draw
+    w.now = w.at_local(d, 12)
+    units: dict[int, int] = {}
+    for i in range(6000):
+        for s, q in customers.deal_basket(w, w.rng("t.deal_plan", i), "Velmora"):
+            units[s] = units.get(s, 0) + q
+    n = sum(units.values())
+    top = sorted(extra, key=lambda s: -extra[s])[:3]
+    for s in top:
+        assert units.get(s, 0) / n == pytest.approx(extra[s] / sum(extra.values()), abs=0.02)
+    # outside the window (and its last day boundary) nothing is added; total = sum of parts
+    out = date(2026, 4, 10)
+    assert all(demandplan.expected_daily_units(w, s, out, "web") == demandplan.expected_daily_units(w0, s, out, "web")
+               for s in top)
+    sid = top[0]
+    parts = sum(demandplan.expected_daily_units(w, sid, d, ch) for ch in ("web",) + tuple(sorted(w.cfg.channels.retailers())))
+    assert demandplan.expected_daily_units(w, sid, d) == pytest.approx(parts)

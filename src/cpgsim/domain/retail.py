@@ -72,7 +72,7 @@ from ..models.delays import next_working_moment
 from ..models.pricing import elasticity_lift
 from ..models.seasonality import category_factor
 from .events import SalesDocChanged, SalesDocCreated
-from .model import Condition, RetailerInventory, RetailPO, RetailPOLine, SalesDoc, SalesItem
+from .model import Condition, RetailerInventory, RetailPO, RetailPOLine, SalesDoc, SalesItem, goods_item_no
 
 RETAIL_VAT = 0.19
 SELLOUT_HOUR, SELLOUT_MINUTE = 0, 30
@@ -414,7 +414,7 @@ def on_po_cycle(world, ev) -> None:
         po_lines.append(RetailPOLine(line_no=n, sku_id=sku_id, customer_article=article, qty=qty))
         items.append(
             SalesItem(
-                item_no=n * 10,
+                item_no=goods_item_no(n),  # 900 is the freight item number
                 sku_id=sku_id,
                 qty=qty,
                 confirmed_qty=qty,  # requested; cuts follow at confirmation

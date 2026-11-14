@@ -33,6 +33,9 @@ services:
       - work_mem=8MB
       - -c
       - maintenance_work_mem=128MB
+      # Per autovacuum worker (up to three); unset, each could take maintenance_work_mem.
+      - -c
+      - autovacuum_work_mem=64MB
       - -c
       - wal_compression=on
       - -c
@@ -47,9 +50,11 @@ services:
       - "${CPGSIM_PG_BIND:-0.0.0.0}:${CPGSIM_PG_PORT:-5432}:5432"
     shm_size: 256mb
     healthcheck:
-      # TCP on purpose: during first-start initialisation the server listens on
-      # the Unix socket only, so this turns healthy once the real server is up.
-      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U postgres -d \"$${POSTGRES_DB}\""]
+      # Over the Unix socket (trust, nothing logged): a TCP probe as postgres is
+      # rejected by pg_hba.conf and logs two FATAL lines per check. The
+      # temporary server of the first-start initialisation runs with
+      # listen_addresses='', so this turns healthy once the real server is up.
+      test: ["CMD-SHELL", "[ \"$$(psql -U postgres -d \"$${POSTGRES_DB}\" -XAtc 'SHOW listen_addresses' 2>/dev/null)\" = '*' ]"]
       interval: 5s
       timeout: 5s
       retries: 30

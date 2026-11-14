@@ -512,3 +512,71 @@ def reset_data(
     except BaseException:
         conn.rollback()
         raise
+
+
+# -- maintenance ---------------------------------------------------------------
+
+#: Simulator state rewritten on every commit (entity upserts and deletes, queue
+#: inserts and deletes). A backfill turns these over far faster than autovacuum
+#: (one-minute naptime, cost-limited) reclaims the dead rows, so the engine
+#: vacuums them itself (``Simulation`` and ``after_backfill``).
+STATE_TABLES: tuple[str, ...] = ("sim.entity_state", "sim.event_queue")
+
+
+def _outside_transaction(conn: psycopg.Connection, statement: sql.Composable) -> None:
+    """Run ``statement`` in autocommit mode (VACUUM cannot run in a transaction).
+
+    The connection must be idle (no open transaction); its autocommit setting
+    is restored afterwards.
+    """
+    if conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
+        raise RuntimeError("maintenance needs an idle connection (commit or roll back first)")
+    prev = conn.autocommit
+    conn.autocommit = True
+    try:
+        conn.execute(statement)
+    finally:
+        conn.autocommit = prev
+
+
+def _idents(tables: Sequence[str]) -> sql.Composable:
+    return sql.SQL(", ").join(sql.Identifier(*t.split(".", 1)) for t in tables)
+
+
+def vacuum(
+    conn: psycopg.Connection,
+    tables: Sequence[str] = STATE_TABLES,
+    analyze: bool = False,
+    skip_locked: bool = False,
+) -> None:
+    """``VACUUM`` (with ``ANALYZE`` if asked) the given schema-qualified tables.
+
+    ``skip_locked`` skips a table autovacuum is working on right now (Postgres
+    logs a WARNING) instead of waiting until autovacuum is cancelled.
+    """
+    if not tables:
+        return
+    opts = [o for o, on in (("ANALYZE", analyze), ("SKIP_LOCKED", skip_locked)) if on]
+    verb = sql.SQL(f"VACUUM ({', '.join(opts)}) " if opts else "VACUUM ")
+    _outside_transaction(conn, verb + _idents(tables))
+
+
+def owned_tables(conn: psycopg.Connection, schemas: Sequence[str]) -> list[str]:
+    """Tables in ``schemas`` the current role may vacuum/analyze (owner or superuser)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT schemaname, tablename FROM pg_tables WHERE schemaname = ANY(%s)"
+            " AND pg_has_role(tableowner, 'USAGE') ORDER BY schemaname, tablename",
+            (list(schemas),),
+        )
+        rows = cur.fetchall()
+    conn.commit()
+    return [f"{s}.{t}" for s, t in rows]
+
+
+def analyze(conn: psycopg.Connection, schemas: Sequence[str] = BUSINESS_SCHEMAS + ("truth",)) -> int:
+    """``ANALYZE`` every table of ``schemas`` (fresh planner statistics). Returns the table count."""
+    tables = owned_tables(conn, schemas)
+    if tables:
+        _outside_transaction(conn, sql.SQL("ANALYZE ") + _idents(tables))
+    return len(tables)

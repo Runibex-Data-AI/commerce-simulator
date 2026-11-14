@@ -6,11 +6,14 @@ waived shipping fee, the freight cost, the standard cost of goods and the
 returns are costed, the promoted orders lose money in aggregate: their
 contribution margin is negative.
 
-Measured with the default parameters (default config, window 2026-03-02 to
-03-29): orders per day about 2.3x the four weeks before; about 19,000 orders
-redeem the promotion, 44 % of them from deal seekers at about EUR -2.7 each,
-the rest at about EUR +1; aggregate contribution about EUR -11,000 (net
-revenue - credit memos - cost of goods - freight). The reduced-volume check is
+Order of magnitude with the default parameters (default config, window
+2026-03-02 to 03-29; approximate, it moves with model changes): orders per day
+roughly double against the four weeks before (measured 2.3x); a bit over
+40 % of the orders that redeem the promotion come from deal seekers, who lose
+around EUR 2.5 each, while the regular redeemed orders make about EUR +1; the
+contribution of all redeemed orders is negative, roughly EUR -0.5 per order
+(net revenue - credit memos - cost of goods - freight; about EUR -10,000 on
+some 19,000 redeemed orders). The reduced-volume check is
 ``tests/e2e/test_scenarios_e2e.py``. Finding it means joining shop orders and
 promotion redemptions (``shop``) with freight cost (``wms`` / ``erp`` delivery
 ``zzfreight_eur``) and cost of goods and credit memos (``erp``).

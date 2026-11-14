@@ -650,6 +650,9 @@ class _RecSim:
         self.calls.append(("backfill", until))
         progress(datetime(2025, 1, 1, tzinfo=UTC), 10)
 
+    def after_backfill(self):
+        self.calls.append(("after_backfill",))
+
     def run_live(self, max_ticks=None, progress=None):
         self.calls.append(("run_live", max_ticks))
 
@@ -687,6 +690,7 @@ def test_backfill_command(fake_engine, capsys):
     assert sim.cfg.seed == 9  # sim.settings seed overrides the config
     assert sim.calls[0] == ("open", {"history_start": date(2025, 1, 1), "months": 3})
     assert sim.calls[1] == ("backfill", datetime(2025, 2, 1, 11, 0, tzinfo=UTC))  # CET -> UTC
+    assert sim.calls[2] == ("after_backfill",)  # fresh statistics for BI
     out = capsys.readouterr().out
     assert "backfill  sim 2025-01-01" in out and "backfill done: 10 events" in out
     assert cli.main(["--dsn", "x", "backfill", "--start", "01.01.2025"]) == 1
@@ -704,7 +708,9 @@ def test_start_command_backfills_only_when_new(fake_engine):
     assert cli.main(["--dsn", "x", "start"]) == 0
     assert state["init"] == 1
     lock = {"lock_wait": cli.START_LOCK_WAIT_SECONDS}  # waits for a previous container's session
-    assert made[0].calls == [("open", {"months": 24, **lock}), ("backfill", None), ("run_live", None)]
+    assert made[0].calls == [
+        ("open", {"months": 24, **lock}), ("backfill", None), ("after_backfill",), ("run_live", None),
+    ]
     state["clock"] = (datetime(2026, 1, 1, tzinfo=UTC),)
     assert cli.main(["--dsn", "x", "start"]) == 0
     assert state["init"] == 2

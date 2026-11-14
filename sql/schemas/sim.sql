@@ -27,6 +27,21 @@ CREATE TABLE IF NOT EXISTS sim.entity_state (
     PRIMARY KEY (kind, id)
 );
 
+-- Both state tables are rewritten on every commit (upserts, deletes). Free
+-- space on each page lets an upsert stay on its page (HOT update, no index
+-- entry, pruned without VACUUM); autovacuum runs after 5 % instead of 20 %
+-- dead rows. The engine also vacuums both during a backfill (runner.py,
+-- VACUUM_EVERY_STATE_ROWS). Applied on every init, so existing tables get it too.
+ALTER TABLE sim.entity_state SET (
+    fillfactor = 70,
+    autovacuum_vacuum_scale_factor = 0.05,
+    autovacuum_analyze_scale_factor = 0.05
+);
+ALTER TABLE sim.event_queue SET (
+    autovacuum_vacuum_scale_factor = 0.05,
+    autovacuum_analyze_scale_factor = 0.05
+);
+
 CREATE TABLE IF NOT EXISTS sim.run_log (
     id           bigserial   PRIMARY KEY,
     wall_time    timestamptz NOT NULL,

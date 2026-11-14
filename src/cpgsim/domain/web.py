@@ -50,6 +50,7 @@ from .events import (
     SalesDocChanged,
     SalesDocCreated,
     WebOrderLinesChanged,
+    WebOrderMilestoneReached,
     WebOrderPlaced,
     WebOrderStatusChanged,
 )
@@ -103,6 +104,31 @@ def _only_parcels_failed(o: WebOrder) -> bool:
         and any(v in _UNDELIVERED for v in o.meta.get("outcomes", {}).values())
     )
 _IN_FLIGHT = frozenset({"released", "partially_shipped", "shipped", "delivery_exception"})
+# Statuses of a customer return (and its refund). A return of an earlier parcel
+# can start before the rest of a split order ships (backorder) or arrives; the
+# later shipment then keeps the return status and only records the 'shipped' /
+# 'delivered' milestone (WebOrderMilestoneReached -> shop shipped_at / delivered_at).
+_RETURN_STATUSES = frozenset({"return_requested", "returned", "return_rejected", "partially_refunded", "refunded"})
+# Statuses whose shop timestamp column must be set even when a return status hides them.
+_MILESTONES = ("shipped", "delivered")
+
+
+def _in_customer_return(o: WebOrder) -> bool:
+    return o.status in _RETURN_STATUSES and not _only_parcels_failed(o)
+
+
+def _milestone(world, o: WebOrder, milestone: str, at: datetime | None) -> None:
+    """Record a fulfilment milestone the order reached without entering it as a status.
+
+    Emitted once per milestone (not if the order passed through that status);
+    ``at`` is the business time (goods issue / delivery scan).
+    """
+    reached = o.meta.setdefault("ms", [])
+    if milestone in reached:
+        return
+    reached.append(milestone)
+    eff = at if at is not None and at != world.now else None
+    world.emit(WebOrderMilestoneReached(at=world.now, order_id=o.order_id, milestone=milestone, effective_at=eff))
 
 
 # ---------------------------------------------------------------------------
@@ -512,6 +538,12 @@ def set_status(
     if o.status == status:
         return
     o.status = status
+    if status in _MILESTONES:
+        reached = o.meta.setdefault("ms", [])
+        if status not in reached:
+            reached.append(status)
+    elif status == "refunded":
+        o.meta["refunded_at"] = (at or world.now).isoformat()
     eff = at if at is not None and at != world.now else None
     world.emit(
         WebOrderStatusChanged(at=world.now, order_id=o.order_id, status=status, reason=reason, effective_at=eff)
@@ -885,15 +917,25 @@ def _cancel_backorder(world, o: WebOrder, doc: SalesDoc) -> None:
     # (web.shipped and the delivery outcomes keep it 'partially_shipped'), so
     # the complete shipment is recognised now, effective at the last goods
     # issue; 'delivered' is effective at the last successful delivery.
+    # A customer return of an earlier parcel keeps its status: only the
+    # milestones are recorded (shop shipped_at / delivered_at).
+    # A parcel that did not arrive (and its refund) or a pending delivery
+    # exception keeps its status too; the order's goods did all ship, so
+    # 'shipped' is recorded as a milestone.
     shipped_t, delivered_t = _last_shipment_times(world, o)
-    if _deliveries_final(o):
-        if "delivered" in o.meta.get("outcomes", {}).values() and o.status in _IN_FLIGHT:
-            set_status(world, o, "shipped", at=shipped_t)
-            set_status(world, o, "delivered", at=delivered_t)
-    elif o.status == "partially_shipped" and all(
-        ln.shipped_qty + ln.cancelled_qty >= ln.qty for ln in o.lines
-    ):
+    delivered_any = "delivered" in o.meta.get("outcomes", {}).values()
+    final = _deliveries_final(o)
+    if final and delivered_any and o.status in _IN_FLIGHT:
         set_status(world, o, "shipped", at=shipped_t)
+        set_status(world, o, "delivered", at=delivered_t)
+    elif final and delivered_any and _in_customer_return(o):
+        _milestone(world, o, "shipped", shipped_t)
+        _milestone(world, o, "delivered", delivered_t)
+    elif all(ln.shipped_qty + ln.cancelled_qty >= ln.qty for ln in o.lines):
+        if o.status == "partially_shipped":
+            set_status(world, o, "shipped", at=shipped_t)
+        elif o.status in _RETURN_STATUSES or o.status in _UNDELIVERED or o.status == "delivery_exception":
+            _milestone(world, o, "shipped", shipped_t)
     maybe_final(world, o)
 
 
@@ -960,8 +1002,12 @@ def on_shipped(world, ev) -> None:
     # An earlier parcel returned to sender or lost (and refunded) does not stop
     # the rest of the order: shipping the remainder makes the order (partially)
     # shipped again, so it reaches 'shipped' before a later 'delivered'.
+    # A customer return of an earlier parcel keeps its status; completing the
+    # shipment is then recorded as a milestone only.
     if _only_parcels_failed(o) or (o.status not in _LATE_STATUSES and o.status not in _DEAD_STATUSES):
         set_status(world, o, "shipped" if complete else "partially_shipped")
+    elif complete and _in_customer_return(o):
+        _milestone(world, o, "shipped", world.now)
 
     rng = world.rng("web.shipped", did)
     bid = dlv.billing_id
@@ -982,6 +1028,12 @@ def on_shipped(world, ev) -> None:
         world.emit(PaymentStatusChanged(at=world.now, payment_id=int(pid), status="captured", amount=o.captured_total))
     if bill is not None:
         schedule_settlement(world, bid, amount, rng)
+    if o.status == "refunded" and _in_customer_return(o) and o.refunded_total < o.captured_total - 0.01:
+        # The return refunded everything captured so far; the rest of the order
+        # has now been captured, so the order is only partially refunded (and
+        # its remaining goods can still be returned). refunded_at stays the refund's time.
+        rt = o.meta.get("refunded_at")
+        set_status(world, o, "partially_refunded", at=datetime.fromisoformat(rt) if rt else None)
 
 
 @handler("web.settle")
@@ -1027,10 +1079,13 @@ def on_delivery_outcome(world, ev) -> None:
             o.meta["first_delivered"] = True
             o.delivered_at = dlv.delivered_at or world.now
         if all_final:
-            if _only_parcels_failed(o) or o.status not in (
-                "return_requested", "returned", "return_rejected", "partially_refunded", "refunded"
-            ):
+            if _only_parcels_failed(o) or o.status not in _RETURN_STATUSES:
                 set_status(world, o, "delivered")
+            else:
+                # A customer return of an earlier parcel keeps its status.
+                shipped_t, _ = _last_shipment_times(world, o)
+                _milestone(world, o, "shipped", shipped_t)
+                _milestone(world, o, "delivered", dlv.delivered_at or world.now)
         elif o.status == "delivery_exception":
             set_status(world, o, "partially_shipped" if o.backorder else "shipped")
         c = world.store.get("customer", o.customer_id)
@@ -1041,7 +1096,8 @@ def on_delivery_outcome(world, ev) -> None:
                     subscriptions.maybe_start_subscription(world, c, o)
             returns.maybe_schedule_return(world, o, dlv)
     elif outcome in ("returned_to_sender", "lost"):
-        if o.status not in ("partially_refunded", "refunded"):
+        # A refund, or a customer return of an earlier parcel, keeps its status.
+        if o.status not in _RETURN_STATUSES:
             set_status(world, o, outcome)
         open_work(o, +1)
         rng = world.rng("web.undelivered", did)

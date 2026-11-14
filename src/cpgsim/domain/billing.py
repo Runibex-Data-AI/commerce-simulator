@@ -6,8 +6,11 @@ remainder, so the billed totals of an item add up to its net value exactly.
 The web shipping charge is the sales document's freight item (item 900,
 ``sku_id`` 0, see ``SalesItem.item_type``); it goes on the first invoice of the
 order as item 900 with ``sales_item_no`` 900. The freight item is never
-delivered: it counts for the billing status only. Credit memos reference an
-earlier invoice and are priced like it. ``clear`` records the incoming payment.
+delivered: it counts for the billing status only. Goods items are numbered
+10, 20, ... skipping 900 (``model.goods_item_no``), so long retailer invoices
+never collide with it, and the shipping charge is recognised by ``sku_id`` 0.
+Credit memos reference an earlier invoice and are priced like it. ``clear``
+records the incoming payment.
 
 Billing documents are entities of kind ``billing``. They are removed
 ``RETENTION_DAYS`` after their billing date (``ful.billing_purge``), long after
@@ -23,11 +26,16 @@ from datetime import date, timedelta
 
 from ..engine.registry import handler
 from .events import BillingDocChanged, BillingDocCreated, SalesDocChanged
-from .model import FREIGHT_ITEM_NO, BillingDoc, BillingItem, Delivery, SalesDoc, SalesItem
+from .model import FREIGHT_ITEM_NO, BillingDoc, BillingItem, Delivery, SalesDoc, SalesItem, goods_item_no
 
 SHIPPING_ITEM_NO = FREIGHT_ITEM_NO
 RETENTION_DAYS = 100
 PURGE_HOUR = 3
+
+
+def is_shipping_item(it: BillingItem) -> bool:
+    """The billed shipping charge (``sku_id`` 0), whatever its item number."""
+    return it.sku_id == 0
 
 
 # -- sales document flow status (shared with fulfilment) ------------------------
@@ -177,7 +185,7 @@ def create_invoice(
         item_changes[sales_item_no] = {"billed_qty": si.billed_qty, "confirmed_qty": si.confirmed_qty}
         out.append(
             BillingItem(
-                item_no=10 * (len(out) + 1),
+                item_no=goods_item_no(len(out) + 1),
                 sku_id=si.sku_id,
                 qty=qty,
                 net_value=net,
@@ -274,7 +282,7 @@ def create_credit_memo(
         raise KeyError(f"invoice {invoice_id} not found (purged or never created)")
     by_sales_item: dict[int, BillingItem] = {}
     for it in inv.items:
-        if it.item_no != SHIPPING_ITEM_NO:
+        if not is_shipping_item(it):
             by_sales_item.setdefault(it.sales_item_no, it)
     out: list[BillingItem] = []
     for sales_item_no, qty in items or []:
@@ -290,7 +298,7 @@ def create_credit_memo(
             cost = round(ref.cost / ref.qty * qty, 2)
         out.append(
             BillingItem(
-                item_no=10 * (len(out) + 1),
+                item_no=goods_item_no(len(out) + 1),
                 sku_id=ref.sku_id,
                 qty=qty,
                 net_value=net,
@@ -304,7 +312,7 @@ def create_credit_memo(
         )
     if include_shipping:
         for it in inv.items:
-            if it.item_no == SHIPPING_ITEM_NO:
+            if is_shipping_item(it):
                 out.append(
                     BillingItem(
                         item_no=SHIPPING_ITEM_NO,
@@ -315,7 +323,7 @@ def create_credit_memo(
                         cost=0.0,
                         sales_item_no=it.sales_item_no,
                         delivery_id=it.delivery_id,
-                        reference_item_no=SHIPPING_ITEM_NO,
+                        reference_item_no=it.item_no,
                     )
                 )
                 break

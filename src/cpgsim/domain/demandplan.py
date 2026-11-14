@@ -15,6 +15,10 @@ SKU weight on a local date ``d`` for a channel::
     * launch ramp (0.3 -> 1.0 over the first 8 weeks after launch_date)
     * scenarios.factor("sku_demand", noon of d, channel=..., sku_id=...)
 
+Expected web units for planning (``expected_daily_units``) add the deal-site
+orders of ``promo_margin_trap`` windows (``_deal_seeker_units``), which come on
+top of the regular web order rate.
+
 Sizing of retail demand: a retailer's annual sell-in value is the web annual
 net value estimate times ``share_r / share_web``; it is converted to units with
 the popularity-weighted net trade price of the retailer's assortment.
@@ -443,11 +447,71 @@ def _expected_map(world, channel: str, d: date) -> dict[int, float]:
             rate = web_order_rate_per_day(world, world.at_local(d, 12))
             k = rate * b["lines"] * b["qty"] / w.total if w.total > 0 else 0.0
             hit = {s: k * x for s, x in w.by_sku.items()}
+            for s, u in _deal_seeker_units(world, d).items():
+                hit[s] = hit.get(s, 0.0) + u
         else:
             week = _retail_week(world, channel, d - timedelta(days=d.weekday()))
             hit = {s: u / 7.0 for s, u in week.items()}
         _put(st.expected, key, hit)
     return hit
+
+
+def _deal_seeker_units(world, d: date) -> dict[int, float]:
+    """Expected web units per SKU on local date ``d`` from promo_margin_trap deal seekers.
+
+    Pure in config, catalogue and the scenario windows: the hourly arrival rate
+    of ``customers.deal_seeker_rate_per_hour`` (summed over the local day, DST
+    days included) times the expected deal basket, spread over the promoted
+    brand's SKUs with the weights ``customers.deal_basket`` draws by (web weight
+    / price ** DEAL_PRICE_SENSITIVITY; one line, a second distinct line with
+    DEAL_SECOND_LINE_PROB, quantity 2 with DEAL_QTY_TWO_PROB). Like the arrival
+    source, each hour's deal orders go to the first window active then.
+    """
+    from . import customers  # deferred: customers resolves demandplan lazily too
+
+    wins = customers.deal_windows(world)
+    if not wins:
+        return {}
+    t0 = world.at_local(d, 0)
+    t1 = world.at_local(d + timedelta(days=1), 0)
+    if not any(w["share"] > 0 and w["start"] < t1 and w["end"] > t0 for w in wins):
+        return {}
+    orders: dict[str, float] = {}
+    t = t0
+    hour = timedelta(hours=1)
+    while t < t1:
+        mid = t + hour / 2
+        active = [w for w in wins if w["start"] <= mid < w["end"]]
+        if active:
+            rate = customers.deal_seeker_rate_per_hour(world, mid)
+            if rate > 0:
+                brand = active[0]["brand"]
+                orders[brand] = orders.get(brand, 0.0) + rate
+        t += hour
+    if not orders:
+        return {}
+    cat = world.ref.catalogue
+    w = _weights(world, "web", d)
+    qty = 1.0 + customers.DEAL_QTY_TWO_PROB
+    p2 = customers.DEAL_SECOND_LINE_PROB
+    out: dict[int, float] = {}
+    for brand in sorted(orders):
+        pool: list[tuple[int, float]] = []
+        for sid in w.ids:
+            x = w.by_sku[sid]
+            sku = cat.get(sid)
+            if sku.brand == brand and x > 0:
+                pool.append((sid, x / max(sku.rrp_eur, 0.5) ** customers.DEAL_PRICE_SENSITIVITY))
+        tot = sum(x for _, x in pool)
+        if tot <= 0:
+            continue
+        p = [(sid, x / tot) for sid, x in pool]
+        # P(second line is s) = p_s * sum_{j != s} p_j / (1 - p_j) (drawn without replacement)
+        odds = sum(pj / (1.0 - pj) for _, pj in p if pj < 1.0) if len(p) > 1 else 0.0
+        for sid, ps in p:
+            second = ps * (odds - (ps / (1.0 - ps) if ps < 1.0 else 0.0)) if len(p) > 1 else 0.0
+            out[sid] = out.get(sid, 0.0) + orders[brand] * qty * (ps + p2 * second)
+    return out
 
 
 def expected_daily_units(world, sku_id: int, d: date, channel: str | None = None) -> float:

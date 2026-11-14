@@ -37,6 +37,7 @@ from cpgsim.domain.model import (
     Delivery,
     DeliveryLine,
     Promotion,
+    goods_item_no,
 )
 from cpgsim.domain.reference import build_reference
 from cpgsim.engine.entities import EntityStore
@@ -525,7 +526,9 @@ def test_po_lifecycle(quarter):
         assert loc.hour == world.cfg.retail.order_hour_local and loc.minute == 0
         assert doc.doc_type == "retail" and doc.currency == "EUR" and doc.fx_rate_eur == 1.0
         assert doc.ship_to.startswith(doc.sold_to)  # KRANZ / KRANZ-DC1
-        assert [i.item_no for i in doc.items] == [10 * (n + 1) for n in range(len(doc.items))]
+        # 10, 20, ...; 900 is the freight item number, so a 90th line is 910
+        assert [i.item_no for i in doc.items] == [goods_item_no(n + 1) for n in range(len(doc.items))]
+        assert 900 not in [i.item_no for i in doc.items]
         for it in doc.items:
             sku = world.ref.catalogue.get(it.sku_id)
             assert it.qty % sku.units_per_case == 0 and it.qty > 0

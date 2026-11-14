@@ -728,3 +728,40 @@ def test_deterministic_replay():
         return [repr(e) for e in events]
 
     assert run() == run()
+
+
+def test_long_invoice_never_collides_with_the_freight_item_number():
+    """Retailer documents can have 90+ lines: goods items skip 900 (freight), and credit memos
+    recognise the shipping charge by sku_id 0, not by its item number."""
+    from cpgsim.domain.model import goods_item_no
+
+    assert [goods_item_no(n) for n in (1, 89, 90, 91)] == [10, 890, 910, 920]
+    w, _ = make_world()
+    doc = web_sales_doc(w, [])
+    skus = [s.sku_id for s in REF.catalogue.skus][:95]
+    assert len(skus) == 95
+    goods = []
+    for n, sku_id in enumerate(skus, start=1):
+        goods.append(SalesItem(item_no=goods_item_no(n), sku_id=sku_id, qty=2, confirmed_qty=2, net_value=10.0,
+                               tax=1.9, cost=4.0, conditions=[]))
+    doc.items = goods + doc.items  # freight item 900 last, as on a web document
+    inv = billing.create_invoice(w, doc, None, [(it.item_no, 2) for it in goods], START, START,
+                                 include_shipping=True)
+    nos = [i.item_no for i in inv.items]
+    assert len(nos) == len(set(nos)) == 96
+    assert [i.item_no for i in inv.items if i.sku_id == 0] == [900]
+    assert all(i.item_no != 900 for i in inv.items if i.sku_id)
+    # credit the 90th goods line (invoice item 910) and the shipping charge
+    ninetieth = goods[89]
+    cm = billing.create_credit_memo(w, inv.billing_id, [(ninetieth.item_no, 1)], "return", include_shipping=True)
+    assert [(i.item_no, i.sku_id, i.qty, i.reference_item_no) for i in cm.items] == [
+        (10, ninetieth.sku_id, 1, 910), (900, 0, 1, 900)
+    ]
+    # an invoice whose goods item happens to be numbered 900 (state written before) is still
+    # credited as goods, and its shipping is not mistaken for it
+    old = billing.create_invoice(w, web_sales_doc(w, [(1, 1)]), None, [(10, 1)], START, START,
+                                 include_shipping=False)
+    old = w.store.mut("billing", old.billing_id)
+    old.items[0].item_no = 900
+    cm2 = billing.create_credit_memo(w, old.billing_id, [(10, 1)], "return", include_shipping=True)
+    assert [(i.sku_id, i.reference_item_no) for i in cm2.items] == [(1, 900)]

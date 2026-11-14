@@ -384,7 +384,10 @@ def _backfill(sim: Any, cfg: Config, until: datetime | None) -> bool:
     with _StopFlag(sim) as flag:
         sim.backfill(until, progress)
     progress.done()
-    return not flag.stopped
+    if flag.stopped:
+        return False
+    sim.after_backfill()  # VACUUM (ANALYZE) state tables, ANALYZE business schemas
+    return True
 
 
 # -- commands ------------------------------------------------------------------
