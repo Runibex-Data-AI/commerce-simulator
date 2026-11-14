@@ -1,0 +1,15 @@
+# Generic scenario definition for live enabling:
+#   sim scenario enable carrier_decay [--param region=DE-BW --param delay_multiplier=3]
+# The scenario starts at the current simulation time and stays on until
+# `sim scenario disable carrier_decay`. No dates here: fixed windows go in the
+# `scenarios:` list of the config.
+id: carrier_decay
+description: >
+  One carrier quietly gets worse in one region: transit-time median and
+  delivery-exception rate rise for parcels of that carrier into that region.
+  Shows in late deliveries, exceptions, refunds and ratings (shop, wms, erp).
+params:
+  carrier: Swiftbox          # Paketblitz | Nordpost | Swiftbox
+  region: DE-BY              # ISO 3166-2 region of the delivery address
+  delay_multiplier: 2.5      # multiplies the carrier's transit-time median
+  exception_multiplier: 3.0  # multiplies the delivery-exception rate
