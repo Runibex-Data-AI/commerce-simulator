@@ -16,10 +16,24 @@ import json
 import os
 from datetime import date
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+_RESERVED_TLDS = ("example", "test", "invalid")
+_RESERVED_NAMES = ("example.com", "example.net", "example.org")
+
+
+def is_reserved_domain(domain: str) -> bool:
+    """True for names that can never be registered (RFC 2606 / 6761)."""
+    d = domain.strip().lower().rstrip(".")
+    if not d:
+        return False
+    if d.rsplit(".", 1)[-1] in _RESERVED_TLDS:
+        return True
+    return any(d == n or d.endswith("." + n) for n in _RESERVED_NAMES)
 
 
 class _M(BaseModel):
@@ -171,11 +185,23 @@ class CustomersCfg(_M):
     subscription_cancel_prob: float = 0.05  # per subscription order
     email_domains: dict[str, list[str]] = Field(
         default_factory=lambda: {
-            "DE": ["example.de", "mail.example", "post.example", "web.example"],
-            "AT": ["example.at", "mail.example", "web.example"],
-            "CH": ["example.ch", "mail.example", "web.example"],
+            "DE": ["mail.de.example", "post.de.example", "web.de.example", "mail.example"],
+            "AT": ["mail.at.example", "web.at.example", "mail.example"],
+            "CH": ["mail.ch.example", "web.ch.example", "mail.example"],
         }
-    )  # reserved/fictional domains only
+    )  # reserved/fictional domains only (validated below)
+
+    @field_validator("email_domains")
+    @classmethod
+    def _reserved_email_domains(cls, v: dict[str, list[str]]) -> dict[str, list[str]]:
+        for country, domains in v.items():
+            for d in domains:
+                if not is_reserved_domain(d):
+                    raise ValueError(
+                        f"customers.email_domains[{country}]: {d!r} is not a reserved domain; "
+                        "use a name under .example/.test/.invalid or example.com/net/org"
+                    )
+        return v
 
 
 class PaymentsCfg(_M):
@@ -194,7 +220,8 @@ class PaymentsCfg(_M):
 class FulfilmentCfg(_M):
     cancel_before_pick: float = 0.015
     release_delay_minutes: float = 12.0  # median, authorised -> released
-    delivered_first_time: float = 0.96
+    # There is no "delivered first time" knob: that share is the residual
+    # 1 - lost_rate - exception_rate (scaled by the carrier multipliers).
     exception_rate: float = 0.03
     lost_rate: float = 0.004
     exception_redelivered_share: float = 0.7  # rest returned to sender
@@ -321,8 +348,28 @@ class Config(_M):
             raise ValueError("history_months must be >= 0")
         return self
 
+    #: Settings that do not change the simulated business (determinism holds
+    #: whatever their value), so they are not part of :meth:`fingerprint`.
+    NON_BUSINESS_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {"database", "tick_seconds", "history_months", "backfill"}
+    )
+
     def fingerprint(self) -> str:
-        """Hash of the business-relevant config (excludes database settings)."""
+        """Hash of the business-relevant config.
+
+        Excludes database settings, the live tick, backfill slicing/batching and
+        ``history_months`` (only used when a simulation starts; the start is
+        stored in ``sim.clock``).
+        """
+        d = self.model_dump(mode="json", exclude=set(self.NON_BUSINESS_FIELDS))
+        return hashlib.sha256(json.dumps(d, sort_keys=True).encode()).hexdigest()[:16]
+
+    def legacy_fingerprint(self) -> str:
+        """The fingerprint as computed before tick/backfill settings were excluded.
+
+        A simulation started by an older version stores this value; it means
+        "same config" too.
+        """
         d = self.model_dump(mode="json", exclude={"database"})
         return hashlib.sha256(json.dumps(d, sort_keys=True).encode()).hexdigest()[:16]
 
@@ -346,6 +393,14 @@ def _deep_merge(base: Any, over: Any) -> Any:
 def load_config_dict(path: str | Path | None = None, overlay: str | Path | None = None) -> dict:
     p = Path(path) if path else DEFAULT_CONFIG
     data: dict[str, Any] = {}
+    if overlay:
+        ovp = Path(overlay)
+        if not ovp.is_file():
+            what = "is a directory" if ovp.is_dir() else "does not exist"
+            raise FileNotFoundError(
+                f"overlay {ovp} {what}: CPGSIM_OVERLAY / --overlay must point at a YAML file "
+                "(with Docker, a missing host path is created as a directory by the bind mount)"
+            )
     if not p.exists():
         raise FileNotFoundError(f"config file not found: {p} (set --config or CPGSIM_CONFIG)")
     data = yaml.safe_load(p.read_text()) or {}

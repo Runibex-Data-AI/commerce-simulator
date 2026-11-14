@@ -88,6 +88,9 @@ def bootstrap(world):
 # -- construction ----------------------------------------------------------------
 
 
+DEAL_DEFAULTS = {"deal_seeker_share": 1.0, "deal_seeker_return_rate": 0.15, "cherry_pick_share": 0.8}
+
+
 def test_config_windows_local_dates_end_inclusive():
     sm = ScenarioManager(make_cfg())
     ws = sm.windows()
@@ -96,7 +99,7 @@ def test_config_windows_local_dates_end_inclusive():
     assert cd.start == local(2026, 8, 3) and cd.end is None and cd.source == "config"
     assert pm.start == local(2026, 3, 2)
     assert pm.end == local(2026, 3, 30)  # end day inclusive -> midnight after
-    assert pm.params == {"brand": "Velmora", "discount_pct": 0.25, "free_shipping": True}
+    assert pm.params == {"brand": "Velmora", "discount_pct": 0.25, "free_shipping": True, **DEAL_DEFAULTS}
     assert cd.params["exception_multiplier"] == 3.0
     assert sm.version == 0
     assert sm.active("promo_margin_trap", local(2026, 3, 29, 23, 59))
@@ -142,7 +145,7 @@ def test_discount_percent_normalised():
     sm = ScenarioManager(make_cfg([{"id": "promo_margin_trap", "discount_pct": 30,
                                     "free_shipping": "false", "brand": "velmora"}]))
     (w,) = sm.windows()
-    assert w.params == {"brand": "Velmora", "discount_pct": 0.3, "free_shipping": False}
+    assert w.params == {"brand": "Velmora", "discount_pct": 0.3, "free_shipping": False, **DEAL_DEFAULTS}
 
 
 # -- factors -----------------------------------------------------------------------
@@ -286,6 +289,7 @@ def test_scenario_promotions():
         "window_id": "promo_margin_trap:config:1", "scenario_id": "promo_margin_trap",
         "brand": "Velmora", "discount_pct": 0.25, "free_shipping": True,
         "start": local(2026, 3, 2), "end": local(2026, 3, 30), "index": 1, "live": False,
+        **DEAL_DEFAULTS,
     }
     t = datetime(2026, 11, 14, 9, 30, tzinfo=UTC)
     sm.load_overrides([(4, "promo_margin_trap", "enable", t, {"brand": "Cutara"})])

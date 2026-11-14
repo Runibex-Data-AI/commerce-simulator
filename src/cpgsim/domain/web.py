@@ -53,7 +53,7 @@ from .events import (
     WebOrderPlaced,
     WebOrderStatusChanged,
 )
-from .model import Condition, Customer, OrderLine, Payment, SalesDoc, SalesItem, WebOrder
+from .model import FREIGHT_ITEM_NO, Condition, Customer, OrderLine, Payment, SalesDoc, SalesItem, WebOrder
 
 customers = lazy("customers")
 demandplan = lazy("demandplan")
@@ -79,9 +79,29 @@ FAIL_REASONS = {"declined": 0.55, "insufficient_funds": 0.25, "authentication_fa
 
 # Statuses after which shipping updates no longer change the order status.
 _LATE_STATUSES = frozenset(
-    {"delivered", "returned_to_sender", "lost", "return_requested", "returned", "partially_refunded", "refunded"}
+    {
+        "delivered", "returned_to_sender", "lost", "return_requested", "returned", "return_rejected",
+        "partially_refunded", "refunded",
+    }
 )
 _DEAD_STATUSES = frozenset({"cancelled", "payment_failed"})
+# A parcel of the order did not arrive; later parcels of the same order still ship.
+_UNDELIVERED = frozenset({"returned_to_sender", "lost"})
+
+
+def _only_parcels_failed(o: WebOrder) -> bool:
+    """The late status comes only from a parcel that did not arrive (and its refund).
+
+    Then a later parcel of the same order (a backordered remainder) still moves
+    the order on to 'shipped' and 'delivered'; a customer return keeps its status.
+    """
+    if o.status in _UNDELIVERED:
+        return True
+    return (
+        o.status in ("partially_refunded", "refunded")
+        and not o.return_ids
+        and any(v in _UNDELIVERED for v in o.meta.get("outcomes", {}).values())
+    )
 _IN_FLIGHT = frozenset({"released", "partially_shipped", "shipped", "delivery_exception"})
 
 
@@ -117,7 +137,7 @@ def new_customer_arrivals(world, start: datetime, end: datetime):
 def on_new_order(world, ev) -> None:
     rng = world.rng("web.new_order", ev.key)
     c = customers.new_customer(world, rng)
-    lines = draw_lines(world, rng, world.local_date(), c.country, topup=True)
+    lines = customers.cherry_pick(world, rng, draw_lines(world, rng, world.local_date(), c.country, topup=True))
     if lines:
         place_order(world, c, lines, source=c.acquisition)
 
@@ -153,9 +173,25 @@ def _cheap_candidates(world, d: date, currency: str, sku_ids: list[int]) -> list
     return hit
 
 
+def free_shipping_promo_covers(world, sku_ids) -> bool:
+    """True if an automatic free-shipping web promotion running now covers one of ``sku_ids``.
+
+    Such a basket ships free whatever its value, so the shopper has no reason
+    to top it up to the free-shipping threshold.
+    """
+    promos = [p for p in promotions.active_web_promos(world, world.now) if p.free_shipping and p.kind == "automatic"]
+    if not promos:
+        return False
+    cat = world.ref.catalogue
+    skus = [cat.get(int(s)) for s in sku_ids]
+    return any(promotions.is_eligible(p, s) for p in promos for s in skus)
+
+
 def _topup(world, rng: Rng, d: date, currency: str, lines: list[list[int]], sku_ids: list[int]) -> None:
     w = world.cfg.channels.web
     cat = world.ref.catalogue
+    if free_shipping_promo_covers(world, [s for s, _ in lines]):
+        return
     threshold = w.free_shipping_chf if currency == "CHF" else w.free_shipping_eur
     gross = round(sum(unit_price(cat.get(s), currency) * q for s, q in lines), 2)
     in_basket = {s for s, _ in lines}
@@ -321,6 +357,7 @@ def place_order(
     cfg = world.cfg
     w = cfg.channels.web
     c = world.store.mut("customer", customer.customer_id)
+    customers.order_opened(c)
     now = world.now
     oid = world.next_id("web_order")
     rng = world.rng("web.order", oid)
@@ -342,10 +379,13 @@ def place_order(
         sku = cat.get(s)
         q = merged[s]
         price = unit_price(sku, currency)
-        disc = 0.0
+        disc = pct = 0.0
         if promo is not None and promo.discount_pct > 0 and promotions.is_eligible(promo, sku):
             disc = round(price * q * promo.discount_pct, 2)
-        olines.append(OrderLine(line_no=i, sku_id=s, qty=q, unit_price=price, discount=disc, tax_rate=vat))
+            pct = promo.discount_pct if disc > 0 else 0.0
+        olines.append(
+            OrderLine(line_no=i, sku_id=s, qty=q, unit_price=price, discount=disc, tax_rate=vat, discount_pct=pct)
+        )
     goods = round(sum(ln.gross for ln in olines), 2)
     threshold = w.free_shipping_chf if currency == "CHF" else w.free_shipping_eur
     fee = w.shipping_fee_chf if currency == "CHF" else w.shipping_fee_eur
@@ -402,6 +442,8 @@ def place_order(
                 "goods_gross": goods,
                 "currency": currency,
                 "eligible_lines": sum(1 for ln in olines if ln.discount > 0),
+                "deal_seeker": bool(c.meta.get("deal")),
+                **contribution_estimate(world, order, waived),
             },
         )
 
@@ -414,17 +456,66 @@ def place_order(
     return order
 
 
+def expected_freight_eur(world, country: str) -> float:
+    """Carrier-share-weighted parcel freight cost (EUR) for a country (what fulfilment will pay on average)."""
+    num = den = 0.0
+    for ccfg in world.cfg.carriers.parcel.values():
+        share = float(ccfg.share.get(country, 0.0))
+        if share > 0 and ccfg.cost_eur:
+            num += share * float(ccfg.cost_eur.get(country, max(ccfg.cost_eur.values())))
+            den += share
+    return num / den if den > 0 else 0.0
+
+
+def contribution_estimate(world, order: WebOrder, shipping_waived: float) -> dict[str, float]:
+    """Contribution of an order at the moment it is placed, in EUR (truth detail of promoted orders).
+
+    ``net_revenue_eur`` (goods after discount plus the shipping fee charged,
+    net of VAT), ``cogs_eur`` (standard cost), ``freight_eur`` (expected
+    parcel cost for the country; the actual cost is in ``wms``/``erp`` once
+    shipped), ``discount_eur`` and ``shipping_waived_eur`` (net of VAT) and
+    ``contribution_eur`` = net revenue - cogs - freight, before returns.
+    """
+    d = world.local_date()
+    fx = masterdata.fx_rate(world, order.currency, d)
+    vat = world.cfg.channels.web.vat[order.country]
+    goods_net = sum(split_gross(ln.gross, vat)[0] for ln in order.lines)
+    ship_net = split_gross(order.shipping_fee, vat)[0]
+    disc_net = sum(split_gross(ln.discount, vat)[0] for ln in order.lines)
+    waived_net = split_gross(shipping_waived, vat)[0]
+    cogs = sum(masterdata.std_cost(world, ln.sku_id, d) * ln.qty for ln in order.lines)
+    freight = expected_freight_eur(world, order.country)
+    net = (goods_net + ship_net) * fx
+    return {
+        "net_revenue_eur": round(net, 2),
+        "cogs_eur": round(cogs, 2),
+        "freight_eur": round(freight, 2),
+        "discount_eur": round(disc_net * fx, 2),
+        "shipping_waived_eur": round(waived_net * fx, 2),
+        "contribution_eur": round(net - cogs - freight, 2),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Helpers shared with returns / subscriptions
 # ---------------------------------------------------------------------------
 
 
-def set_status(world, o: WebOrder, status: str, reason: str | None = None) -> None:
-    """Set and emit an order status (no event if unchanged). ``o`` must be mutable."""
+def set_status(
+    world, o: WebOrder, status: str, reason: str | None = None, at: datetime | None = None
+) -> None:
+    """Set and emit an order status (no event if unchanged). ``o`` must be mutable.
+
+    ``at``: business time of the transition when it happened before now
+    (``WebOrderStatusChanged.effective_at``).
+    """
     if o.status == status:
         return
     o.status = status
-    world.emit(WebOrderStatusChanged(at=world.now, order_id=o.order_id, status=status, reason=reason))
+    eff = at if at is not None and at != world.now else None
+    world.emit(
+        WebOrderStatusChanged(at=world.now, order_id=o.order_id, status=status, reason=reason, effective_at=eff)
+    )
 
 
 def line_gross(o: WebOrder, line_no: int, qty: int) -> float:
@@ -565,7 +656,9 @@ def _sales_item(world, o: WebOrder, ln: OrderLine, d: date) -> SalesItem:
     unit_net, _ = split_gross(ln.unit_price, vat)
     conds = [Condition("list_price", unit_net, list_net)]
     if ln.discount > 0:
-        pct = ln.discount / list_gross if list_gross else 0.0
+        # The condition rate is the promotion's nominal rate (like a condition
+        # record); the amount is the cent-rounded discount actually granted.
+        pct = ln.discount_pct or (ln.discount / list_gross if list_gross else 0.0)
         conds.append(Condition("promo_discount", round(pct, 4), round(net - list_net, 2)))
     cost = round(masterdata.std_cost(world, ln.sku_id, d) * ln.qty, 2)
     return SalesItem(
@@ -618,11 +711,26 @@ def on_release(world, ev) -> None:
     d = world.local_date()
     acct = world.ref.accounts.web_collective(o.country)
     items = [_sales_item(world, o, ln, d) for ln in o.lines]
-    ship_net, ship_tax = split_gross(o.shipping_fee, world.cfg.channels.web.vat[o.country])
-    if ship_net > 0 and items:
-        items[0].conditions.append(Condition("shipping", ship_net, ship_net))
+    vat = world.cfg.channels.web.vat[o.country]
+    ship_net, ship_tax = split_gross(o.shipping_fee, vat)
     for it in items:
         it.conditions.append(Condition("tax", o.lines[it.item_no // 10 - 1].tax_rate, it.tax))
+    if ship_net > 0 and items:
+        # The shipping charge is a freight item of its own (non-stock service
+        # material), so item, header, pricing and invoice values all agree.
+        items.append(
+            SalesItem(
+                item_no=FREIGHT_ITEM_NO,
+                sku_id=0,
+                qty=1,
+                confirmed_qty=1,
+                net_value=ship_net,
+                tax=ship_tax,
+                cost=0.0,
+                conditions=[Condition("shipping", ship_net, ship_net), Condition("tax", vat, ship_tax)],
+                item_type="freight",
+            )
+        )
     sid = world.next_id("sales_doc")
     doc = SalesDoc(
         sales_doc_id=sid,
@@ -703,42 +811,89 @@ def on_backorder(world, ev) -> None:
     _cancel_backorder(world, o, doc)
 
 
+def _freight_item(doc: SalesDoc) -> SalesItem | None:
+    for it in doc.items:
+        if it.item_type == "freight":
+            return it
+    return None
+
+
+def _last_shipment_times(world, o: WebOrder) -> tuple[datetime | None, datetime | None]:
+    """Latest goods issue and latest successful delivery over the order's deliveries."""
+    shipped = delivered = None
+    for did in o.delivery_ids:
+        d = world.store.get("delivery", did)
+        if d is None:
+            continue
+        if d.shipped_at is not None and (shipped is None or d.shipped_at > shipped):
+            shipped = d.shipped_at
+        if d.outcome == "delivered" and d.delivered_at is not None and (delivered is None or d.delivered_at > delivered):
+            delivered = d.delivered_at
+    return shipped, delivered
+
+
 def _cancel_backorder(world, o: WebOrder, doc: SalesDoc) -> None:
-    """Cancel the quantities still waiting for stock."""
+    """Cancel the quantities still waiting for stock.
+
+    Kept items get the reduced confirmed quantity together with their
+    delivered/billed quantities (so the ERP item statuses are recomputed) and
+    the header statuses are refreshed: a document whose shipped part is
+    delivered and billed is completed now. If nothing shipped, the whole
+    document (freight item included) is rejected.
+    """
     line_changes: dict[int, dict[str, Any]] = {}
     item_changes: dict[int, dict[str, Any]] = {}
+    by_no = {it.item_no: it for it in doc.items}
     for line_no in sorted(o.backorder):
         rem = o.backorder[line_no]
         ln = o.lines[line_no - 1]
         ln.cancelled_qty += rem
         line_changes[line_no] = {"cancelled_qty": ln.cancelled_qty}
-        item = doc.items[line_no - 1]
+        item = by_no[line_no * 10]
         kept = ln.qty - ln.cancelled_qty
         if kept > 0:
             item.confirmed_qty = kept
-            item_changes[item.item_no] = {"confirmed_qty": kept}
+            item_changes[item.item_no] = {
+                "confirmed_qty": kept,
+                "delivered_qty": item.delivered_qty,
+                "billed_qty": item.billed_qty,
+            }
         else:
             item.confirmed_qty = 0
             item.rejection_reason = "out_of_stock"
             item_changes[item.item_no] = {"confirmed_qty": 0, "rejection_reason": "out_of_stock"}
     o.backorder = {}
-    header: dict[str, Any] = {}
     nothing = not o.delivery_ids
     if nothing:
+        fi = _freight_item(doc)
+        if fi is not None:
+            fi.confirmed_qty = 0
+            fi.rejection_reason = "out_of_stock"
+            item_changes[fi.item_no] = {"confirmed_qty": 0, "rejection_reason": "out_of_stock"}
         doc.status = "rejected"
-        header["status"] = "rejected"
+        header: dict[str, Any] = {"status": "rejected"}
+    else:
+        header = billing.refresh_header(doc)
     world.emit(WebOrderLinesChanged(at=world.now, order_id=o.order_id, lines=line_changes))
     world.emit(SalesDocChanged(at=world.now, sales_doc_id=doc.sales_doc_id, header=header, items=item_changes))
     if nothing:
         set_status(world, o, "cancelled", reason="out_of_stock")
         _void_payment(world, o)
-    elif _deliveries_final(o):
+        maybe_final(world, o)
+        return
+    # While a backorder was outstanding the order could not reach 'shipped'
+    # (web.shipped and the delivery outcomes keep it 'partially_shipped'), so
+    # the complete shipment is recognised now, effective at the last goods
+    # issue; 'delivered' is effective at the last successful delivery.
+    shipped_t, delivered_t = _last_shipment_times(world, o)
+    if _deliveries_final(o):
         if "delivered" in o.meta.get("outcomes", {}).values() and o.status in _IN_FLIGHT:
-            set_status(world, o, "delivered")
+            set_status(world, o, "shipped", at=shipped_t)
+            set_status(world, o, "delivered", at=delivered_t)
     elif o.status == "partially_shipped" and all(
         ln.shipped_qty + ln.cancelled_qty >= ln.qty for ln in o.lines
     ):
-        set_status(world, o, "shipped")
+        set_status(world, o, "shipped", at=shipped_t)
     maybe_final(world, o)
 
 
@@ -765,6 +920,10 @@ def on_customer_cancel(world, ev) -> None:
         line_changes[ln.line_no] = {"cancelled_qty": ln.qty}
         item.rejection_reason = "customer_cancelled"
         item_changes[item.item_no] = {"rejection_reason": "customer_cancelled"}
+    fi = _freight_item(doc)
+    if fi is not None:
+        fi.rejection_reason = "customer_cancelled"
+        item_changes[fi.item_no] = {"rejection_reason": "customer_cancelled"}
     doc.status = "rejected"
     world.emit(WebOrderLinesChanged(at=world.now, order_id=oid, lines=line_changes))
     world.emit(
@@ -798,7 +957,10 @@ def on_shipped(world, ev) -> None:
         changes[line_no] = {"shipped_qty": ln.shipped_qty}
     world.emit(WebOrderLinesChanged(at=world.now, order_id=o.order_id, lines=changes))
     complete = not o.backorder and all(ln.shipped_qty + ln.cancelled_qty >= ln.qty for ln in o.lines)
-    if o.status not in _LATE_STATUSES and o.status not in _DEAD_STATUSES:
+    # An earlier parcel returned to sender or lost (and refunded) does not stop
+    # the rest of the order: shipping the remainder makes the order (partially)
+    # shipped again, so it reaches 'shipped' before a later 'delivered'.
+    if _only_parcels_failed(o) or (o.status not in _LATE_STATUSES and o.status not in _DEAD_STATUSES):
         set_status(world, o, "shipped" if complete else "partially_shipped")
 
     rng = world.rng("web.shipped", did)
@@ -865,7 +1027,9 @@ def on_delivery_outcome(world, ev) -> None:
             o.meta["first_delivered"] = True
             o.delivered_at = dlv.delivered_at or world.now
         if all_final:
-            if o.status not in ("return_requested", "returned", "partially_refunded", "refunded"):
+            if _only_parcels_failed(o) or o.status not in (
+                "return_requested", "returned", "return_rejected", "partially_refunded", "refunded"
+            ):
                 set_status(world, o, "delivered")
         elif o.status == "delivery_exception":
             set_status(world, o, "partially_shipped" if o.backorder else "shipped")
@@ -947,3 +1111,4 @@ def on_cleanup(world, ev) -> None:
     for pid in o.payment_ids:
         store.remove("payment", pid)
     store.remove("web_order", oid)
+    customers.order_closed(world, o.customer_id)  # may evict a customer who can never act again

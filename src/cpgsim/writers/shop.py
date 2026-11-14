@@ -22,7 +22,9 @@ from ..domain.events import (
     CustomerRegistered,
     PaymentRecorded,
     PaymentStatusChanged,
+    PromotionChanged,
     PromotionDefined,
+    RefundChanged,
     RefundIssued,
     SubscriptionChanged,
     SubscriptionCreated,
@@ -32,6 +34,7 @@ from ..domain.events import (
 )
 from ..domain.model import (
     PAYMENT_STATUSES,
+    REFUND_STATUSES,
     SUBSCRIPTION_STATUSES,
     WEB_ORDER_STATUSES,
     OrderLine,
@@ -39,6 +42,7 @@ from ..domain.model import (
     WebOrder,
 )
 from ..engine.sink import TableSpec
+from ..models.pricing import split_gross
 from . import keys
 from .base import Writer
 
@@ -66,6 +70,7 @@ ORDER_STATUS_TIMESTAMPS: dict[str, str] = {
     "delivered": "delivered_at",
     "return_requested": "return_requested_at",
     "returned": "returned_at",
+    "return_rejected": "return_rejected_at",
     "partially_refunded": "refunded_at",
     "refunded": "refunded_at",
 }
@@ -113,10 +118,15 @@ def rate(x: float) -> Decimal:
 
 
 def included_tax(gross: Decimal, tax_rate: Decimal) -> Decimal:
-    """VAT contained in a gross amount: ``gross - gross / (1 + rate)``, rounded to cents."""
+    """VAT contained in a gross amount: ``gross - net``, net rounded half-up to cents.
+
+    Uses the domain's ``models.pricing.split_gross``, the same split the ERP
+    sales items carry, so shop and ERP agree on net and tax to the cent.
+    """
     if gross == 0 or tax_rate == 0:
         return ZERO
-    return money(gross - gross / (1 + tax_rate))
+    _, tax = split_gross(float(gross), float(tax_rate))
+    return money(tax)
 
 
 def _check(value: str, allowed: tuple[str, ...], what: str) -> str:
@@ -143,12 +153,14 @@ class ShopWriter(Writer):
             CustomerRegistered: self.on_customer_registered,
             CustomerAnonymised: self.on_customer_anonymised,
             PromotionDefined: self.on_promotion_defined,
+            PromotionChanged: self.on_promotion_changed,
             WebOrderPlaced: self.on_order_placed,
             WebOrderStatusChanged: self.on_order_status_changed,
             WebOrderLinesChanged: self.on_order_lines_changed,
             PaymentRecorded: self.on_payment_recorded,
             PaymentStatusChanged: self.on_payment_status_changed,
             RefundIssued: self.on_refund_issued,
+            RefundChanged: self.on_refund_changed,
             SubscriptionCreated: self.on_subscription_created,
             SubscriptionChanged: self.on_subscription_changed,
         }
@@ -252,6 +264,17 @@ class ShopWriter(Writer):
             },
             e.at,
         )
+
+    def on_promotion_changed(self, e: PromotionChanged) -> None:
+        """End moved (e.g. ``sim scenario disable``): update ``ends_at``; withdrawn -> soft delete."""
+        p = e.promotion
+        if p.channel != "web":
+            return
+        pk = keys.shop_promotion_id(self.seed, p.promo_id)
+        buf = self.t(PROMOTIONS)
+        buf.update(pk, {"ends_at": p.end}, e.at)
+        if e.withdrawn:
+            buf.soft_delete(pk, e.at)
 
     # -- orders ------------------------------------------------------------
     def on_order_placed(self, e: WebOrderPlaced) -> None:
@@ -361,7 +384,9 @@ class ShopWriter(Writer):
         changes: dict[str, Any] = {"status": status}
         col = ORDER_STATUS_TIMESTAMPS.get(status)
         if col is not None:
-            changes[col] = e.at
+            # A transition recognised late carries its business time; updated_at stays e.at.
+            eff = getattr(e, "effective_at", None)
+            changes[col] = eff if eff is not None else e.at
         if status == "cancelled":
             changes["cancel_reason"] = e.reason
         self.t(ORDERS).update(keys.shop_order_id(self.seed, e.order_id), changes, e.at)
@@ -449,11 +474,19 @@ class ShopWriter(Writer):
                 "amount": money(r.amount),
                 "currency": r.currency,
                 "reason": r.reason,
-                "status": r.status,
+                "status": _check(r.status, REFUND_STATUSES, "refund status"),
                 "issued_at": r.created_at,
+                "completed_at": r.created_at if r.status == "completed" else None,
             },
             e.at,
         )
+
+    def on_refund_changed(self, e: RefundChanged) -> None:
+        status = _check(e.status, REFUND_STATUSES, "refund status")
+        changes: dict[str, Any] = {"status": status}
+        if status == "completed":
+            changes["completed_at"] = e.at
+        self.t(REFUNDS).update(keys.shop_refund_id(self.seed, e.refund_id), changes, e.at)
 
     # -- subscriptions -------------------------------------------------------
     def on_subscription_created(self, e: SubscriptionCreated) -> None:

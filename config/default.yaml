@@ -103,7 +103,7 @@ payments:
 
 fulfilment:
   cancel_before_pick: 0.015
-  delivered_first_time: 0.96
+  # First-time delivery is the residual: 1 - lost_rate - exception_rate (x carrier multipliers).
   exception_rate: 0.03
   lost_rate: 0.004
   return_rate: 0.03
@@ -149,7 +149,10 @@ scenarios:
   - id: promo_margin_trap   # a promotion grows volume but loses money
     brand: Velmora
     discount_pct: 0.25
-    free_shipping: true
+    free_shipping: true           # no minimum order value
+    deal_seeker_share: 1.0        # deal-site orders per day, share of base_orders_per_day
+    deal_seeker_return_rate: 0.15
+    cherry_pick_share: 0.8        # mixed baskets cut down to the promoted brand
     start: 2026-03-02
     end: 2026-03-29
 

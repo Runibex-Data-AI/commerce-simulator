@@ -40,7 +40,10 @@ ALTER ROLE bi_reader NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
 -- sim_writer creates its own schemas in this database.
 DO $$
 BEGIN
-    EXECUTE format('GRANT CONNECT, CREATE ON DATABASE %I TO sim_writer', current_database());
+    -- Nothing by default (PUBLIC gets CONNECT and TEMP otherwise).
+    EXECUTE format('REVOKE ALL ON DATABASE %I FROM PUBLIC', current_database());
+    -- TEMPORARY: the generator's sink and entity loaders use CREATE TEMP TABLE.
+    EXECUTE format('GRANT CONNECT, CREATE, TEMPORARY ON DATABASE %I TO sim_writer', current_database());
     EXECUTE format('GRANT CONNECT ON DATABASE %I TO bi_reader', current_database());
 END
 $$;

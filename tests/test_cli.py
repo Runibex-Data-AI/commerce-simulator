@@ -22,7 +22,7 @@ import pytest
 import yaml
 
 from cpgsim import cli, db
-from cpgsim.config import DEFAULT_CONFIG, ScenarioCfg, load_config
+from cpgsim.config import DEFAULT_CONFIG, ScenarioCfg, is_reserved_domain, load_config
 
 REPO = Path(__file__).resolve().parents[1]
 UTC = timezone.utc
@@ -148,12 +148,15 @@ def test_default_config_values():
     }
     pm = sc["promo_margin_trap"]
     assert (pm.start, pm.end) == (date(2026, 3, 2), date(2026, 3, 29))
-    assert pm.params() == {"brand": "Velmora", "discount_pct": 0.25, "free_shipping": True}
+    assert pm.params() == {
+        "brand": "Velmora", "discount_pct": 0.25, "free_shipping": True,
+        "deal_seeker_share": 1.0, "deal_seeker_return_rate": 0.15, "cherry_pick_share": 0.8,
+    }
     assert cfg.chaos["duplicate_customer_rate"] == 0.02
     assert cfg.chaos["sellout_restatement_rate"] == 0.10
     # The emails used by default are on reserved/example domains only.
     for domains in cfg.customers.email_domains.values():
-        assert all(d.endswith((".example", "example.de", "example.at", "example.ch")) for d in domains)
+        assert all(is_reserved_domain(d) for d in domains)
 
 
 def test_generic_scenario_definitions():
@@ -509,7 +512,10 @@ def test_cli_scenarios_status_truth(scratch, monkeypatch, capsys):
         sid, action, at, params = rows[0]
         assert (sid, action) == ("promo_margin_trap", "enable")
         assert at >= before - timedelta(seconds=1)
-        assert params == {"brand": "Velmora", "discount_pct": 0.4, "free_shipping": True}
+        assert params == {
+            "brand": "Velmora", "discount_pct": 0.4, "free_shipping": True,
+            "deal_seeker_share": 1.0, "deal_seeker_return_rate": 0.15, "cherry_pick_share": 0.8,
+        }
         # a simulation clock ahead of the switch; a seed override
         clock = datetime.now(UTC) + timedelta(hours=1)
         conn.execute(
@@ -545,13 +551,17 @@ def test_cli_scenarios_status_truth(scratch, monkeypatch, capsys):
     assert "promo_margin_trap" in out and "carrier_decay" in out
     assert "last run" in out
 
-    # disable: at = max(wall now, sim clock) = clock, so the scenario is off at the clock
+    # disable: at = max(database clock, sim clock + 1 us) = clock + 1 us: strictly after
+    # everything the engine has committed, so its window end can never be skipped
     assert cli.main(base + ["scenario", "disable", "promo_margin_trap"]) == 0
     with db.connect(scratch.dsn) as conn:
         at = conn.execute(
             "SELECT at FROM sim.scenario_overrides WHERE action = 'disable'"
         ).fetchone()[0]
-        assert abs((at - clock).total_seconds()) < 1
+        assert at == clock + timedelta(microseconds=1)
+        # one microsecond later the scenario is off
+        conn.execute("UPDATE sim.clock SET sim_time = %s", (at,))
+        conn.commit()
     capsys.readouterr()
     cli.main(base + ["scenario", "list"])
     line = next(l for l in capsys.readouterr().out.splitlines() if l.startswith("promo_margin_trap"))
@@ -693,11 +703,12 @@ def test_start_command_backfills_only_when_new(fake_engine):
     made, state = fake_engine
     assert cli.main(["--dsn", "x", "start"]) == 0
     assert state["init"] == 1
-    assert made[0].calls == [("open", {"months": 24}), ("backfill", None), ("run_live", None)]
+    lock = {"lock_wait": cli.START_LOCK_WAIT_SECONDS}  # waits for a previous container's session
+    assert made[0].calls == [("open", {"months": 24, **lock}), ("backfill", None), ("run_live", None)]
     state["clock"] = (datetime(2026, 1, 1, tzinfo=UTC),)
     assert cli.main(["--dsn", "x", "start"]) == 0
     assert state["init"] == 2
-    assert made[1].calls == [("open", {"months": 24}), ("run_live", None)]
+    assert made[1].calls == [("open", {"months": 24, **lock}), ("run_live", None)]
 
 
 def test_reset_requires_confirmation_without_tty(monkeypatch, capsys):
@@ -717,4 +728,4 @@ def test_reset_requires_confirmation_without_tty(monkeypatch, capsys):
     assert cli.main(["--dsn", "x", "reset"]) == 1
     assert "pass --yes" in capsys.readouterr().err and not called
     assert cli.main(["--dsn", "x", "reset", "--yes", "--seed", "3"]) == 0
-    assert called == [{"seed": 3, "clear_seed": False}]
+    assert called == [{"seed": 3, "clear_seed": False, "force": False}]

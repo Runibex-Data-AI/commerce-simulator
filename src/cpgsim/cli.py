@@ -48,6 +48,9 @@ ENV_READER_PASSWORD = "CPGSIM_READER_PASSWORD"
 
 BACKFILL_PROGRESS_SECONDS = 5.0
 LIVE_PROGRESS_SECONDS = 300.0
+#: ``sim start`` waits this long for the writer lock (a previous container's
+#: session may take a moment to disappear after a restart).
+START_LOCK_WAIT_SECONDS = 120.0
 
 
 class CliError(RuntimeError):
@@ -406,7 +409,10 @@ def cmd_reset(args: argparse.Namespace) -> int:
             if answer.strip().lower() != "yes":
                 print("aborted")
                 return 1
-        tables = db.reset_data(conn, seed=args.seed, clear_seed=args.clear_seed)
+        try:
+            tables = db.reset_data(conn, seed=args.seed, clear_seed=args.clear_seed, force=args.force)
+        except db.WriterLockHeld as e:
+            raise CliError(str(e)) from None
     print(f"reset {len(tables)} tables in {target}")
     if args.seed is not None:
         print(f"seed {args.seed} stored in sim.settings; it overrides the config seed")
@@ -455,7 +461,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         cfg = _cfg_for_db(args, conn)
         sim = _new_simulation(cfg, conn)
         clock_missing = _read_clock(conn) is None
-        _open(sim, months=cfg.history_months)
+        _open(sim, months=cfg.history_months, lock_wait=START_LOCK_WAIT_SECONDS)
         if clock_missing:
             log.info("new simulation: backfilling %d months", cfg.history_months)
             if not _backfill(sim, cfg, None):
@@ -503,8 +509,16 @@ def cmd_status(args: argparse.Namespace, out: TextIO | None = None) -> int:
         p(f"sim clock       {loc(sim_time)}  (lag vs wall {_fmt_td(wall - sim_time)})")
         p(f"history start   {loc(hist)}")
         p(f"last commit     {loc(updated_wall)} (wall), started {loc(started_wall)}")
-        fp_note = "matches config" if fp == cfg.fingerprint() else "DIFFERS from current config"
+        same = fp in (cfg.fingerprint(), cfg.legacy_fingerprint())
+        fp_note = "matches config" if same else "DIFFERS from current config"
         p(f"seed            {seed}  (config fingerprint {fp_note})")
+        changes = _config_history(conn)
+        if changes:
+            n, last_sim, last_fp = changes
+            p(
+                f"config changes  {n} recorded since the start (last at sim {loc(last_sim)},"
+                f" fingerprint {last_fp}); history mixes configs"
+            )
         p(f"queue depth     {depth:,}")
         if per_schema:
             parts = ", ".join(f"{k} {v:,}" for k, v in sorted(per_schema.items()))
@@ -518,7 +532,7 @@ def cmd_status(args: argparse.Namespace, out: TextIO | None = None) -> int:
             for w in active:
                 since = loc(w.start) if w.start else "history start"
                 until = loc(w.end) if w.end else "open"
-                p(f"  {w.scenario_id:<22} {w.source:<6} {since} -> {until}  {_short(w.params)}")
+                p(f"  {w.scenario_id:<22} {w.source:<6} {since} -> {until}  {_short(w.params, 160)}")
         else:
             p("active scenarios at sim time: none")
         if last:
@@ -583,7 +597,7 @@ def cmd_scenario_list(args: argparse.Namespace, out: TextIO | None = None) -> in
         else:
             st = "ACTIVE" if any(w.contains(clock) for w in ws) else "inactive"
         params = ws[-1].params if ws else (defs[sid].params if sid in defs else {})
-        rows.append((sid, ",".join(sources), st, wtxt, _short(params, 70)))
+        rows.append((sid, ",".join(sources), st, wtxt, _short(params, 160)))
     _table(rows, ("ID", "SOURCE", "STATE", "WINDOWS (local, end exclusive)", "PARAMS"), out)
     if clock is not None:
         print(f"\nstate at sim time {fmt(clock)}", file=out)
@@ -604,15 +618,41 @@ def _scenario_params(args: argparse.Namespace, cfg: Config, sid: str) -> dict[st
     return base
 
 
+#: Smallest time step (Postgres timestamptz resolution).
+_EPS = timedelta(microseconds=1)
+
+
+def _config_history(conn) -> tuple[int, datetime, str] | None:
+    """(number of recorded config changes, sim time and fingerprint of the last) or None."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) OVER (), sim_time, new_fingerprint FROM sim.config_history"
+                " ORDER BY id DESC LIMIT 1"
+            )
+            row = cur.fetchone()
+        conn.commit()
+    except psycopg.errors.UndefinedTable:
+        conn.rollback()
+        return None
+    return (int(row[0]), row[1], row[2]) if row else None
+
+
 def _switch_at(conn) -> datetime:
-    """max(wall now, sim clock): never in the simulation's past.
+    """``max(database clock, committed sim clock + 1 us)``: strictly after the simulation's past.
 
     Call it inside the transaction that inserts the override, after taking
-    ``db.SCENARIO_LOCK`` (see ``Simulation.refresh_scenarios``).
+    ``db.SCENARIO_LOCK``. The engine takes the time it advances to from the
+    same database clock under the same lock (``Simulation.refresh_scenarios``),
+    so the switch always lies after every slice the engine computed without
+    the new row, whatever the clocks of the hosts running the CLI and engine.
     """
-    now = datetime.now(UTC)
-    clock = _read_clock(conn)
-    return max(now, clock[0].astimezone(UTC)) if clock else now
+    with conn.cursor() as cur:
+        cur.execute("SELECT clock_timestamp()")
+        now = cur.fetchone()[0].astimezone(UTC)
+        cur.execute("SELECT sim_time FROM sim.clock WHERE id = 1")
+        clock = cur.fetchone()
+    return max(now, clock[0].astimezone(UTC) + _EPS) if clock else now
 
 
 def cmd_scenario_switch(args: argparse.Namespace) -> int:
@@ -740,6 +780,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, help="store a new seed (overrides the config seed)")
     p.add_argument("--clear-seed", action="store_true", help="remove a stored seed override")
     p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    p.add_argument(
+        "--force", action="store_true",
+        help="reset even while a generator is running (terminates its database session)",
+    )
     p.set_defaults(func=cmd_reset)
 
     p = sub.add_parser("backfill", parents=[common], help="simulate history up to now (or --until)")
@@ -794,7 +838,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _setup_logging(getattr(args, "verbose", 0) or 0)
     try:
         return int(args.func(args) or 0)
-    except (CliError, db.DsnError, db.InitError, FileNotFoundError) as e:
+    except (CliError, db.DsnError, db.InitError, db.WriterLockHeld, FileNotFoundError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     except ValidationError as e:

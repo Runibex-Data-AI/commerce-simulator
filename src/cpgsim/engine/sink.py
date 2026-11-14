@@ -8,7 +8,9 @@ transaction.
 The sink also enforces the loading contract centrally:
 
 * ``created_at`` and ``updated_at`` are set from the simulation time passed in
-  ``at``; every update moves ``updated_at``.
+  ``at``; every update moves ``updated_at``. A commit may instead pass a
+  ``stamp`` (live mode: the commit time) that replaces both on new rows and
+  ``updated_at`` on changed rows; business columns keep their event times.
 * No deletes: ``soft_delete`` sets ``is_deleted``/``deleted_at``.
 * Snapshot tables are insert-only.
 
@@ -89,6 +91,14 @@ class TableBuffer:
         return len(self.inserts) + len(self.updates)
 
     # -- flush -----------------------------------------------------------
+    def apply_stamp(self, stamp: datetime) -> None:
+        """Contract columns of this commit = ``stamp`` (new rows: both; changes: ``updated_at``)."""
+        for row in self.inserts.values():
+            row["created_at"] = stamp
+            row["updated_at"] = stamp
+        for ch in self.updates.values():
+            ch["updated_at"] = stamp
+
     def flush(self, cur, tmp_counter: list[int]) -> int:
         n = 0
         if self.inserts:
@@ -156,13 +166,19 @@ class WriteBatch:
     def __len__(self) -> int:
         return sum(len(b) for b in self.buffers.values())
 
-    def flush(self, cur) -> dict[str, int]:
-        """Write everything; returns rows touched per schema."""
+    def flush(self, cur, stamp: datetime | None = None) -> dict[str, int]:
+        """Write everything; returns rows touched per schema.
+
+        ``stamp`` (live mode) replaces ``created_at`` of new rows and
+        ``updated_at`` of every row written by this commit.
+        """
         per_schema: dict[str, int] = defaultdict(int)
         tmp_counter = [0]
         # Flush in registration order: writers register parents before children.
         for name, buf in self.buffers.items():
             if len(buf):
+                if stamp is not None:
+                    buf.apply_stamp(stamp)
                 per_schema[buf.spec.schema] += buf.flush(cur, tmp_counter)
         return dict(per_schema)
 

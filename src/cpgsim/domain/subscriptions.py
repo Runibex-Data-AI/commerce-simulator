@@ -6,6 +6,10 @@ Public API (wave 2 contract)::
 
 A customer decides once, at the delivery of their first repeat order, whether
 to subscribe (``subscription_rate``, i.e. "about 8 % of repeat customers").
+Strongly seasonal products (season profiles ``gift``, ``sun``, ``after_sun``)
+never go on a subscription; a customer who decides to subscribe but whose
+order holds only such products subscribes at a later repeat order instead.
+The warm start skips them too.
 Subscribers get no repurchase intents while the subscription is active or
 paused; a cancelled subscription ends the relationship (the calibration in
 ``customers.repeat_calibration`` counts it that way).
@@ -40,6 +44,14 @@ customers = lazy("customers")
 
 MAX_SUB_LINES = 3
 PREFERRED_INTERVAL_PROB = 0.7
+# Strongly seasonal products are never put on a subscription: nobody has gift
+# sets or sun lotion delivered every few weeks all year round.
+NO_SUBSCRIPTION_PROFILES = frozenset({"gift", "sun", "after_sun"})
+
+
+def subscribable(world, sku_id: int) -> bool:
+    """True if the SKU may be part of a subscription (not strongly seasonal)."""
+    return world.ref.catalogue.get(sku_id).season_profile not in NO_SUBSCRIPTION_PROFILES
 
 
 def _next_order_time(world, after: datetime, weeks: int, rng: Rng) -> datetime:
@@ -95,13 +107,18 @@ def maybe_start_subscription(world, customer: Customer, order: WebOrder) -> None
     c = world.store.mut("customer", customer.customer_id)
     if c.meta.get("sub_decided") or c.subscription_id is not None:
         return
-    c.meta["sub_decided"] = True
     rng = world.rng("sub.decide", c.customer_id)
     if rng.random() >= world.cfg.customers.subscription_rate:
+        c.meta["sub_decided"] = True
         return
-    lines = [(ln.sku_id, ln.qty) for ln in order.lines if ln.qty - ln.cancelled_qty > 0]
+    lines = [
+        (ln.sku_id, ln.qty) for ln in order.lines if ln.qty - ln.cancelled_qty > 0 and subscribable(world, ln.sku_id)
+    ]
     if not lines:
+        # Only seasonal products in this order: the customer who wants a
+        # subscription takes it at a later repeat order (same decision draw).
         return
+    c.meta["sub_decided"] = True
     lines = sorted(lines, key=lambda x: (-world.ref.catalogue.get(x[0]).popularity, x[0]))[:MAX_SUB_LINES]
     sku_ids = [s for s, _ in lines]
     qtys = [q for _, q in lines]
@@ -205,7 +222,7 @@ def warm_start_subscriptions(world) -> None:
     while rate < target and i < 1_000_000:
         i += 1
         rng = world.rng("sub.warm", i)
-        lines = web.draw_lines(world, rng, d0)[:MAX_SUB_LINES]
+        lines = [ln for ln in web.draw_lines(world, rng, d0) if subscribable(world, ln[0])][:MAX_SUB_LINES]
         if not lines:
             continue
         sku_ids = [s for s, _ in lines]

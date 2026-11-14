@@ -385,6 +385,31 @@ def test_master_bootstrap():
     assert [(f.from_currency, f.valid_from) for f in fx] == [("CHF", date(2025, 3, 1))]
 
 
+def test_master_records_back_dated_plausibly():
+    from cpgsim.domain.events import ServiceMaterialListed
+
+    world, ev = make_world()
+    masterdata.bootstrap_master_data(world)
+    # accounts opened years before history start, before any back-dated web customer (<= 1,760 days)
+    opened = [e.opened_on for e in ev if isinstance(e, B2BAccountCreated)]
+    assert opened and all(d <= HIST - timedelta(days=1800) for d in opened)
+    assert opened == [masterdata.account_opened_on(world, e.account.account_id)
+                      for e in ev if isinstance(e, B2BAccountCreated)]  # deterministic
+    assert len(set(opened)) > 1
+    (srv,) = [e for e in ev if isinstance(e, ServiceMaterialListed)]
+    assert srv.service == "shipping" and srv.listed_on == min(opened)
+    # materials carry their listing date; a delisting never precedes it
+    listed = [e for e in ev if isinstance(e, SkuListed)]
+    assert listed
+    for e in listed:
+        assert e.listed_on == e.sku.launch_date - timedelta(days=60) <= HIST
+        if e.sku.delist_date is not None:
+            assert e.sku.delist_date >= e.listed_on
+    for s in world.ref.catalogue.skus:  # whole catalogue, also SKUs listed later
+        if s.delist_date is not None:
+            assert s.delist_date > masterdata.listing_date(s), s.sku_id
+
+
 def test_master_arrivals_and_handlers():
     world, ev = make_world()
     masterdata.bootstrap_master_data(world)
@@ -399,7 +424,7 @@ def test_master_arrivals_and_handlers():
     assert listings, "launches inside the year are listed 60 days ahead"
     for e in listings:
         s = world.ref.catalogue.get(e.sku.sku_id)
-        assert world.local_date(e.at) == s.launch_date - timedelta(days=60)
+        assert world.local_date(e.at) == s.launch_date - timedelta(days=60) == e.listed_on
         assert e.sku.sku_id not in boot_listed
         assert e.sku.std_cost_eur == masterdata.std_cost(world, s.sku_id, world.local_date(e.at))
     revs = [e for e in ev if isinstance(e, StandardCostRevised)]

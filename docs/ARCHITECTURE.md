@@ -41,6 +41,10 @@ config ──► engine (clock, queue, entity store, rng, tick loop)
 6. Call `world.store.mut(kind, id)` before changing an entity.
 7. Timestamps: `world.now` is the event's due time (aware UTC). Business
    time-of-day logic uses local time (`world.local()`, `world.at_local()`).
+   Nothing may depend on the Postgres session time zone: `db.connect` pins
+   `TimeZone=UTC`, and the engine normalises every `timestamptz` it reads
+   (queue `due`, clock, overrides) and every entity datetime to UTC, so a
+   restart on a session with a DST zone resumes with UTC arithmetic.
 8. Floating-point money is rounded to cents at creation (`round(x, 2)`).
 
 Consequence: the same seed, config and history start give the same rows,
@@ -89,15 +93,15 @@ Stateful business logic lives in `domain/`. Each module registers its handlers:
 | Module | Owns | Public API used by other modules |
 | --- | --- | --- |
 | `masterdata` | Material/account master emission, monthly FX, annual cost revision | `fx_rate(world, currency, d) -> float` (EUR per unit), `std_cost(world, sku_id, d) -> float` |
-| `demandplan` | Expected consumer demand per SKU, channel and day | `sku_weights(world, channel, d) -> (sku_ids, cum_weights)`, `expected_daily_units(world, sku_id, d, channel=None)` |
+| `demandplan` | Expected consumer demand per SKU, channel and day; web demand windows (events, promotions) for repeat customers | `sku_weights(world, channel, d) -> (sku_ids, cum_weights)`, `expected_daily_units(world, sku_id, d, channel=None)`, `repeat_lift(world, sku_ids, d)`, `demand_windows(world, sku_ids, d0, d1) -> list[DemandWindow]` |
 | `promotions` | Web and retailer promotion calendar, lift and dip | `active_web_promos(world, t)`, `web_promo_for_basket(world, t, sku_ids, rng)`, `demand_factor(world, sku_id, channel, d)`, `retail_promos(world, channel, d)` |
 | `billing` | Invoices, credit memos, clearing (called by fulfilment, returns and retail) | `create_invoice(...)`, `create_credit_memo(...) -> BillingDoc \| None` (None when nothing is left to credit), `clear(world, billing_id, amount=None)` |
 | `warehouse` | Central stock, production replenishment, daily snapshots | `available`, `reserve`, `unreserve`, `issue`, `receive_return` |
-| `customers` | Web customer creation and repurchase intents | `new_customer(world, rng, acquisition=None) -> Customer`, `schedule_repurchase(world, customer, order)` |
+| `customers` | Web customer creation, repurchase intents (event/promotion conversion and pull-forward), deal seekers of `promo_margin_trap` | `new_customer(world, rng, acquisition=None) -> Customer`, `schedule_repurchase(world, customer, order)`, `cherry_pick(world, rng, lines)`, `deal_return_rate(world, order)` |
 | `web` | Web arrivals, basket, pricing, payment, release, cancellation, backorders | `place_order(world, customer, lines, source, subscription_id=None) -> WebOrder` |
 | `fulfilment` | Deliveries for web and retail: pick, ship, carrier scans, outcomes, web invoicing at shipment | `create_delivery(world, kind, sales_doc, lines, ship_to_account, ship_to, carrier, planned_ship_date, order_id, seq_in_order=1) -> Delivery`, `cancel_delivery(world, delivery_id, reason)` |
 | `returns` | Web returns, refunds, credit memos | `maybe_schedule_return(world, order, delivery)`, `refund(world, order, amount, reason, return_id=None, credit_items=None, include_shipping=False, delivery_id=None) -> refund_id \| None` |
-| `subscriptions` | Subscription lifecycle and recurring orders | `maybe_start_subscription(world, customer, order)` |
+| `subscriptions` | Subscription lifecycle and recurring orders (never gift, sun or after-sun products) | `maybe_start_subscription(world, customer, order)` |
 | `retail` | Hidden retailer demand and inventory, retailer POs, confirmation, delivery planning, invoicing after proof of delivery, payment | none |
 | `scenarios/manager` | Scenario windows from config and CLI, truth recording | `world.scenarios.active(scenario_id, t) -> list[ScenarioWindow]`, `factor(name, t, **ctx) -> float`, `record_effect(...)` |
 
@@ -110,12 +114,85 @@ fulfilment does not import `web` or `retail`. Their data: `web.shipped`
 `{delivery_id, order_id}`.
 
 Scenario switches: the engine reads `sim.scenario_overrides` at a fresh start,
-on resume and before every live tick, under a Postgres advisory lock
-(`db.SCENARIO_LOCK`) that `sim scenario enable/disable` also takes while it
-picks the switch time and inserts the row. The engine takes the wall time it
-advances to while holding the lock, so a switch it did not see always lies
-after that slice and its window start (truth row, live scenario promotion) is
-never skipped.
+on resume, before every live tick and at the start of every backfill pass,
+under a Postgres advisory lock (`db.SCENARIO_LOCK`) that `sim scenario
+enable/disable` also takes while it picks the switch time and inserts the row.
+
+* **One clock.** Both sides take the time from the database clock
+  (`clock_timestamp()`) under the lock: the CLI uses
+  `at = max(database clock, committed sim clock + 1 us)`, the engine advances
+  to the database clock (capped at its own wall clock). A switch the engine did
+  not see therefore lies after every slice it computed, whatever the clocks of
+  the hosts running the CLI and the generator.
+* **Causal visibility.** A row applies exactly from its `at`:
+  `ScenarioManager.advance_to(slice start)` hides rows whose `at` has not been
+  reached (from `factor()`, `active()`, `scenario_promotions()`, `version`
+  and look-ahead consumers such as demand forecasts), and the runner splits
+  slices at `next_switch()` so no slice straddles a switch. An engine that
+  knew a switch hours early (down, then catching up) writes the same rows as
+  one that saw it a second before (`tests/e2e/test_live.py`).
+* **Late windows are reconciled.** A row first read with `at` at or behind the
+  clock (manual SQL, a clock step) gets `at = clock + 1 us`, written back to
+  `sim.scenario_overrides` in the locked transaction; a config window added to
+  the config after the start (it is not in the `scenario_ledger` entity) gets
+  `known_at = clock`, persisted in the ledger, and starts no earlier than
+  `known_at + 1 us`, with its promotion announced no earlier than that. Window
+  starts and announcements are emitted for `(slice start, slice end]` only, so
+  without this they would be lost and redemptions would point at a promotion
+  that was never written.
+* **Early end.** A disable closes the window (`ScenarioWindowClosed`, truth)
+  and, in the same `scen.close` handler, ends an announced scenario promotion:
+  the stored `Promotion` gets the new end and `PromotionChanged` updates
+  `shop.promotions.ends_at` (and `updated_at`; withdrawn at its start: soft
+  deleted).
+
+## Operations
+
+**Single writer.** `Simulation.open` takes the session-level advisory lock
+`db.WRITER_LOCK` and holds it for the life of the engine (it survives the
+per-tick commits and goes with the connection). A second engine refuses to
+start (`sim start` waits up to two minutes for a previous container's session
+to go away). `sim reset` takes the same lock for its transaction and refuses
+while a generator holds it; `--force` terminates the generator's session
+first. As defence in depth every commit is fenced:
+`UPDATE sim.clock ... WHERE seed = ? AND sim_time = <last committed>` must hit
+one row, or the whole commit rolls back, so a writer whose database was reset
+underneath it stops instead of writing into the new timeline. A fresh start
+refuses leftover `sim.entity_state` / `sim.event_queue` rows without a clock.
+
+**Config changes.** `Config.fingerprint()` hashes the business-relevant
+config only (not `database`, `tick_seconds`, `history_months` or `backfill`).
+`sim.clock.config_fingerprint` keeps the fingerprint the simulation started
+with; resuming with a different one logs a warning and adds one row per new
+fingerprint to `sim.config_history` (old, new, sim time), which `sim status`
+reports. A fingerprint written by an older version (which also hashed the
+tick and backfill settings) is recognised (`legacy_fingerprint`) and upgraded.
+
+**Contract timestamps in live mode.** The backfill stamps `created_at` /
+`updated_at` with the event time (deterministic, realistic history). In
+`Simulation.run_live`, including the catch-up after downtime, the sink stamps
+them with the commit time instead (`WriteBatch.flush(stamp=...)`, taken just
+before the business rows are written, never earlier than the slice end);
+business timestamp columns (`placed_at`, `shipped_at`, `*_local`, ...) keep the
+event time. Guarantee: every row committed live has `updated_at` later than
+the commit that preceded it and at most the commit duration (milliseconds for
+a tick, up to seconds for a large catch-up commit) before it became visible.
+A watermark on `max(updated_at)` of the loaded rows is therefore exact; a
+watermark taken from the loader's clock (last load start) needs an overlap of a
+few seconds plus clock skew, with an upsert on the primary key. `sim backfill`
+on an existing simulation keeps event-time stamping: catch up with `sim run`
+once a BI tool loads.
+
+**Memory.** Resume streams `sim.entity_state` and `sim.event_queue` through
+server-side cursors (JSON text decoded row by row). Customers who can never
+act again (no open web order, no subscription, no live repurchase intent) are
+evicted from the store (`customers.maybe_evict`, on lapse and when their last
+order is cleaned up; a one-off `on_load` pass counts open orders for states
+written before). Their shop rows stay; ids are never reused. New code must not
+look customers up in the store by id unless an open order, intent or
+subscription guarantees they are there. Measured on a 24-month state: resident
+memory after resume 880 MB before, 415 MB on the first resume (eviction pass),
+250 MB afterwards.
 
 ## Source system conventions
 
@@ -134,6 +211,22 @@ tables also have `is_deleted boolean NOT NULL DEFAULT false` and
 UUID primary keys (`writers/keys.py`), English snake_case, `timestamptz` in
 UTC, statuses as lower-case words (the neutral vocabulary), money as
 `numeric(12,2)` with an ISO currency column.
+
+* Net/tax split: one rule for every system, `models.pricing.split_gross`
+  (net rounded half-up, tax the remainder). The shop writer's `included_tax`
+  uses it, so shop line/order tax equals the ERP `vbap.mwsbp` to the cent.
+* A status recognised later than it happened (the order becomes `shipped` /
+  `delivered` when its backordered remainder is cancelled) carries
+  `WebOrderStatusChanged.effective_at`: the status timestamp column gets the
+  business time (last goods issue / delivery scan), `updated_at` the change time.
+* A parcel returned to sender or lost (and its refund) does not end the order
+  when a backordered remainder ships later: that shipment moves the order on to
+  `shipped` and `delivered` (`web._only_parcels_failed`); a customer return
+  keeps its status.
+* A rejected return reduces `order_lines.qty_returned` again and moves a
+  `returned` order to `return_rejected` (no refund). Refunds are `issued`, then
+  `completed` (`RefundChanged`) when the payment provider has paid out, by
+  payment method hours to a week later (`returns.REFUND_COMPLETION_DAYS`).
 
 ### `wms` (warehouse and shipping)
 
@@ -176,6 +269,30 @@ currency (`waerk`) plus EUR (`netwr_eur`, at the month's rate `kurrf`).
 
 Status fields follow the S/4HANA style on the header and item tables
 (`gbstk`, `lfstk`, `fkstk`, `wbstk`, `kostk`; values blank / A / B / C).
+Every step that can complete a document (delivery, goods issue, billing,
+cancelling a web order's backordered remainder) refreshes the header with
+`billing.refresh_header` in the same `SalesDocChanged`, and an item cut after
+delivery carries its delivered/billed quantities with the new confirmed
+quantity, so header and item statuses never disagree.
+
+The web shipping charge is a freight item of its own: item `000900`
+(`SalesItem.item_type = "freight"`, `sku_id` 0) with the service material
+`SHIPPING` (`mara.mtart = 'DIEN'`, unit `LE`, item category `TAD`, seeded by
+`masterdata` through `ServiceMaterialListed`), its own `HD00` and `MWST`
+conditions, and billed once as invoice item `000900` (`aupos` `000900`). It is
+never reserved, picked or delivered and counts for the billing status only.
+So `vbak.netwr + sum(vbap.mwsbp)` equals the shop order total, the non-tax
+`konv` conditions of an item add up to `vbap.netwr`, and invoices minus
+credit memos equal the shop total for a fully shipped, non-returned order
+(`tests/e2e/test_reconciliation.py`). `ZPRO` carries the promotion's nominal
+rate in `kbetr`, the cent-rounded amount in `kwert`.
+
+Master data seeded at history start is back-dated: `mara.ersda` is the
+listing date (launch - 60 days, `SkuListed.listed_on`) so a delisting date
+never precedes it, and `kna1.erdat` is a deterministic account-opening date
+5-13 years earlier (`B2BAccountCreated.opened_on`), before any back-dated web
+customer. An unknown catalogue category has no material group and fails
+loudly (`MATKL`).
 
 ### `truth`
 

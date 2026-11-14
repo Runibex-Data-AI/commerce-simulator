@@ -3,9 +3,11 @@
 Invoices bill delivery lines (or explicit sales items) at the sales document's
 net prices, pro rata per unit. The last invoice of an item bills the
 remainder, so the billed totals of an item add up to its net value exactly.
-The web shipping charge goes on the first invoice of an order as item 900
-(``sku_id`` 0). Credit memos reference an earlier invoice and are priced like
-it. ``clear`` records the incoming payment.
+The web shipping charge is the sales document's freight item (item 900,
+``sku_id`` 0, see ``SalesItem.item_type``); it goes on the first invoice of the
+order as item 900 with ``sales_item_no`` 900. The freight item is never
+delivered: it counts for the billing status only. Credit memos reference an
+earlier invoice and are priced like it. ``clear`` records the incoming payment.
 
 Billing documents are entities of kind ``billing``. They are removed
 ``RETENTION_DAYS`` after their billing date (``ful.billing_purge``), long after
@@ -21,9 +23,9 @@ from datetime import date, timedelta
 
 from ..engine.registry import handler
 from .events import BillingDocChanged, BillingDocCreated, SalesDocChanged
-from .model import BillingDoc, BillingItem, Delivery, SalesDoc
+from .model import FREIGHT_ITEM_NO, BillingDoc, BillingItem, Delivery, SalesDoc, SalesItem
 
-SHIPPING_ITEM_NO = 900
+SHIPPING_ITEM_NO = FREIGHT_ITEM_NO
 RETENTION_DAYS = 100
 PURGE_HOUR = 3
 
@@ -33,6 +35,8 @@ PURGE_HOUR = 3
 
 def _target(item, kind: str) -> int:
     """Quantity an item is expected to reach for delivery / billing."""
+    if kind == "delivery" and item.item_type == "freight":
+        return 0  # non-stock service item: never delivered
     if item.rejection_reason:
         return item.delivered_qty if kind == "billing" else 0
     return item.confirmed_qty
@@ -79,6 +83,14 @@ def refresh_header(doc: SalesDoc) -> dict:
             doc.status = status
             changes["status"] = status
     return changes
+
+
+def freight_item(doc: SalesDoc) -> SalesItem | None:
+    """The document's freight (shipping charge) item, if it has one."""
+    for it in doc.items:
+        if it.item_type == "freight":
+            return it
+    return None
 
 
 def sales_doc_for_update(world, doc: SalesDoc) -> SalesDoc:
@@ -176,7 +188,29 @@ def create_invoice(
                 delivery_line_no=dl_no,
             )
         )
-    if include_shipping and not doc.meta.get("shipping_billed") and (doc.shipping_net or doc.shipping_tax):
+    fi = freight_item(doc)
+    if fi is not None:
+        # The freight item is billed once, in full, on the first invoice.
+        if include_shipping and fi.billed_qty < fi.confirmed_qty and not fi.rejection_reason:
+            out.append(
+                BillingItem(
+                    item_no=SHIPPING_ITEM_NO,
+                    sku_id=0,
+                    qty=fi.confirmed_qty,
+                    net_value=round(fi.net_value, 2),
+                    tax=round(fi.tax, 2),
+                    cost=round(fi.cost, 2),
+                    sales_item_no=fi.item_no,
+                    delivery_id=delivery_id,
+                    delivery_line_no=None,
+                )
+            )
+            fi.billed_qty = fi.confirmed_qty
+            billed_meta[str(fi.item_no)] = [round(fi.net_value, 2), round(fi.tax, 2)]
+            item_changes[fi.item_no] = {"billed_qty": fi.billed_qty, "confirmed_qty": fi.confirmed_qty}
+            doc.meta["shipping_billed"] = True
+    elif include_shipping and not doc.meta.get("shipping_billed") and (doc.shipping_net or doc.shipping_tax):
+        # Documents without a freight item (state from before the freight item existed).
         out.append(
             BillingItem(
                 item_no=SHIPPING_ITEM_NO,

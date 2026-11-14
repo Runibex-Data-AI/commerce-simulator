@@ -40,6 +40,16 @@ CREATE TABLE IF NOT EXISTS sim.run_log (
 );
 CREATE INDEX IF NOT EXISTS run_log_wall_idx ON sim.run_log (wall_time);
 
+-- Config changes on a running simulation (sim.clock keeps the fingerprint the
+-- simulation started with; each change to a new fingerprint is recorded once).
+CREATE TABLE IF NOT EXISTS sim.config_history (
+    id               bigserial   PRIMARY KEY,
+    wall_time        timestamptz NOT NULL DEFAULT now(),
+    sim_time         timestamptz NOT NULL,         -- clock when the changed config was first used
+    old_fingerprint  text        NOT NULL,
+    new_fingerprint  text        NOT NULL
+);
+
 -- Live switches from `sim scenario enable|disable`.
 CREATE TABLE IF NOT EXISTS sim.scenario_overrides (
     id           serial      PRIMARY KEY,

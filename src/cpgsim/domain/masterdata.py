@@ -11,11 +11,14 @@ Public API (pure functions of seed, config and history start):
 
 Emission:
 
-* bootstrap (order 10): ``B2BAccountCreated`` for every account, ``SkuListed``
-  for SKUs listed by history start (listing date = launch date - 60 days; SKUs
-  delisted more than a year before history start are skipped),
-  ``CustomerMaterialListed`` for each retailer's eligible assortment among them,
-  ``FxRatePublished`` for the start month.
+* bootstrap (order 10): ``B2BAccountCreated`` for every account (with a
+  deterministic account-opening date ``opened_on`` 5-13 years before history
+  start, earlier than any back-dated web customer), ``ServiceMaterialListed``
+  for the shipping service material (the web freight item), ``SkuListed`` for
+  SKUs listed by history start (listing date = launch date - 60 days, carried
+  as ``listed_on``; SKUs delisted more than a year before history start are
+  skipped), ``CustomerMaterialListed`` for each retailer's eligible
+  assortment among them, ``FxRatePublished`` for the start month.
 * arrival ``master.fx``: 1st of every month 00:05 local -> ``FxRatePublished``.
 * arrival ``master.cost``: 1 January 00:10 local -> ``StandardCostRevised`` per
   listed SKU.
@@ -40,6 +43,7 @@ from .events import (
     B2BAccountCreated,
     CustomerMaterialListed,
     FxRatePublished,
+    ServiceMaterialListed,
     SkuListed,
     StandardCostRevised,
 )
@@ -58,6 +62,14 @@ FX_SIGMA = 0.013
 FX_EPOCH = (2015, 1)
 
 COST_REVISION_RANGE = (0.01, 0.04)
+
+# Account opening dates of the seeded B2B accounts, in days before history
+# start. The minimum lies before every back-dated web customer (warm-start
+# customers reach back at most ~1,760 days: subscription age <= 1,400 days plus
+# up to 360 days before the subscription) so the collective web accounts exist
+# before the first customer who bought through them.
+ACCOUNT_OPENED_DAYS = (1830, 4750)
+SERVICE_MATERIALS = ("shipping",)
 
 _fx_cache: dict[tuple[int, str], list[float]] = {}
 _rev_cache: dict[tuple[int, int, int], float] = {}
@@ -151,6 +163,14 @@ def _listings_by_date(world) -> dict[date, list[int]]:
     return hit[1]
 
 
+def account_opened_on(world, account_id: str) -> date:
+    """Deterministic account-opening date of a seeded account (before history start)."""
+    lo, hi = ACCOUNT_OPENED_DAYS
+    rng = Rng(world.seed, "master.account_opened", account_id)
+    days = lo + int(rng.random() * (hi - lo))
+    return world.local(world.history_start).date() - timedelta(days=days)
+
+
 def _listing_moment(world, sku: Sku) -> datetime:
     return world.at_local(listing_date(sku), LISTING_HOUR)
 
@@ -229,15 +249,22 @@ def _local_dates(world, start: datetime, end: datetime) -> list[date]:
 def bootstrap_master_data(world) -> None:
     hs = world.history_start
     hs_date = world.local(hs).date()
+    opened: list[date] = []
     for acc in world.ref.accounts.all:
-        world.emit(B2BAccountCreated(at=world.now, account=acc))
+        d = account_opened_on(world, acc.account_id)
+        opened.append(d)
+        world.emit(B2BAccountCreated(at=world.now, account=acc, opened_on=d))
+    # Service materials were created together with the first sales accounts.
+    since = min(opened) if opened else hs_date
+    for service in SERVICE_MATERIALS:
+        world.emit(ServiceMaterialListed(at=world.now, service=service, listed_on=since))
     skip_before = hs_date - timedelta(days=DELISTED_SKIP_DAYS)
     for sku in world.ref.catalogue.skus:
         if _listing_moment(world, sku) > hs:
             continue  # listed later by master.listing
         if sku.delist_date is not None and sku.delist_date < skip_before:
             continue
-        world.emit(SkuListed(at=world.now, sku=_listed_sku(world, sku, hs_date)))
+        world.emit(SkuListed(at=world.now, sku=_listed_sku(world, sku, hs_date), listed_on=listing_date(sku)))
         _emit_customer_materials(world, sku)
     month_start = hs_date.replace(day=1)
     if world.at_local(month_start, FX_HOUR, FX_MINUTE) <= hs:
@@ -327,5 +354,5 @@ def on_cost(world, ev) -> None:
 @handler("master.listing")
 def on_listing(world, ev) -> None:
     sku = world.ref.catalogue.get(int(ev.data["sku_id"]))
-    world.emit(SkuListed(at=world.now, sku=_listed_sku(world, sku, world.local_date())))
+    world.emit(SkuListed(at=world.now, sku=_listed_sku(world, sku, world.local_date()), listed_on=listing_date(sku)))
     _emit_customer_materials(world, sku)

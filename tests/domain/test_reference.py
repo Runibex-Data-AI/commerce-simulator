@@ -395,3 +395,34 @@ def test_build_reference(cfg):
     assert r1.accounts.numbers == r2.accounts.numbers
     assert r1.catalogue is not r2.catalogue  # cache-free
     assert isinstance(r1.calendar, Calendar) and isinstance(r1.geo, Geography)
+
+
+def test_default_email_domains_are_reserved():
+    from cpgsim.config import is_reserved_domain
+
+    for domains in people.DEFAULT_EMAIL_DOMAINS.values():
+        assert all(is_reserved_domain(d) for d in domains)
+    for domains in Config().customers.email_domains.values():
+        assert all(is_reserved_domain(d) for d in domains)
+    assert not is_reserved_domain("example.de")
+    assert not is_reserved_domain("notexample.com")
+    assert is_reserved_domain("mail.example.org")
+
+
+def test_email_domains_validator_rejects_real_domains():
+    with pytest.raises(ValueError, match="not a reserved domain"):
+        Config.model_validate({"customers": {"email_domains": {"DE": ["gmail.com"]}}})
+    Config.model_validate({"customers": {"email_domains": {"DE": ["foo.test"]}}})
+
+
+def test_overlay_directory_or_missing_file_fails_clearly(tmp_path):
+    from cpgsim.config import load_config_dict
+
+    with pytest.raises(FileNotFoundError, match="is a directory"):
+        load_config_dict(None, tmp_path)
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        load_config_dict(None, tmp_path / "nope.yaml")
+
+
+def test_fulfilment_has_no_dead_first_time_knob():
+    assert "delivered_first_time" not in Config().fulfilment.model_dump()

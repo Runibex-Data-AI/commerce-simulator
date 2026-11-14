@@ -17,8 +17,10 @@ from __future__ import annotations
 import heapq
 import json
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Iterable
+
+UTC = timezone.utc
 
 
 @dataclass(slots=True)
@@ -73,7 +75,13 @@ class EventQueue:
 
     # -- persistence -----------------------------------------------------
     def load(self, rows: Iterable[tuple[str, datetime, int, str, Any]]) -> None:
-        """Rebuild from ``(key, due, priority, kind, data)`` rows."""
+        """Rebuild from ``(key, due, priority, kind, data)`` rows (any iterable,
+        e.g. a server-side cursor; ``data`` may be JSON text).
+
+        ``due`` is normalised to UTC: psycopg returns ``timestamptz`` in the
+        session time zone, and ``world.now + timedelta(...)`` on a DST zone
+        would be wall-clock arithmetic (an hour off across a DST change).
+        """
         self._heap.clear()
         self._pending.clear()
         self._persisted.clear()
@@ -82,7 +90,9 @@ class EventQueue:
         for key, due, priority, kind, data in rows:
             if isinstance(data, str):
                 data = json.loads(data)
-            ev = Event(due=due, kind=kind, key=key, data=data or {}, priority=priority)
+            if due.tzinfo is None:
+                raise ValueError(f"naive due time for queued event {key}")
+            ev = Event(due=due.astimezone(UTC), kind=kind, key=key, data=data or {}, priority=priority)
             self._heap.append((ev.due, ev.priority, ev.key, ev))
             self._pending.add(key)
             self._persisted.add(key)

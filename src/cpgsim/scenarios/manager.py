@@ -50,9 +50,33 @@ Factor                 Asked by                                Provided by
 ``scenario_promotions()`` lists promotion specs (``promo_margin_trap``), which
 the promotions calendar turns into ordinary promotions.
 
-Determinism: windows are a pure function of config and the override rows, so
-caches keyed by ``version`` (which changes only when the windows change) stay
-valid, and the ``scen.window`` arrival source reads nothing but the windows.
+Determinism: windows are a pure function of config, the override rows and
+the simulation time, so caches keyed by ``version`` (which changes only when
+the windows change) stay valid, and the ``scen.window`` arrival source reads
+nothing but the windows.
+
+Causality of live switches
+--------------------------
+
+An override row takes effect at its ``at`` and is invisible before: the
+engine calls :meth:`ScenarioManager.advance_to` with the start ``s`` of every
+slice ``(s, e]`` and splits slices at :meth:`ScenarioManager.next_switch`, so
+a row is applied exactly to the times ``t >= at`` (``factor()``,
+``active()``, ``scenario_promotions()``, look-ahead consumers and ``version``
+alike). An engine that saw a row long before its ``at`` (it was down and
+caught up) therefore produces the same business as one that saw it a moment
+before. Without ``advance_to`` (unit tests, tools) every row is visible.
+
+The CLI picks ``at`` strictly after the committed clock under
+``db.SCENARIO_LOCK``. A row or config window that nevertheless becomes known
+with its start at or behind the clock (clock skew, manual SQL, an overlay
+changed between restarts) would never be recorded in truth nor announced,
+because window starts and announcements are emitted for ``(s, e]`` only. The
+runner reconciles that: a late override's ``at`` is moved to just after the
+clock in ``sim.scenario_overrides``; a late config window gets
+``known_at = clock`` (:meth:`ScenarioManager.set_known_at`, persisted in the
+``scenario_ledger`` entity), so it starts at ``max(start, known_at + 1 us)``
+and its promotion is announced no earlier than that.
 
 Ground truth
 ------------
@@ -99,6 +123,9 @@ _EFFECT_MEMORY = 200_000
 
 RECORD_KIND = "scen.window"
 CLOSE_KIND = "scen.close"
+#: Smallest time step (Postgres timestamptz resolution).
+EPS = timedelta(microseconds=1)
+LEDGER_KIND = "scenario_ledger"
 
 
 class UnknownScenarioError(ValueError):
@@ -134,6 +161,21 @@ class ScenarioWindow:
         return self.start == EPOCH
 
 
+@dataclass
+class ScenarioLedger:
+    """What the engine has seen of the scenario sources (``sim.entity_state``).
+
+    ``overrides``: ids of ``sim.scenario_overrides`` rows already read (a row
+    not in it whose ``at`` is at or behind the clock is late and gets clamped).
+    ``config``: config window id -> ``[configured start ("" = from history
+    start), known_at]``; ``known_at`` is ``None`` for windows known since the
+    fresh start, else the clock at which a later config change introduced it.
+    """
+
+    overrides: list[int] = field(default_factory=list)
+    config: dict[str, list] = field(default_factory=dict)
+
+
 class ScenarioManager:
     """All scenario windows of a simulation; attached as ``world.scenarios``.
 
@@ -147,6 +189,10 @@ class ScenarioManager:
         self.version = 0
         self.history_start: datetime | None = None
         self._rows: list[tuple] = []
+        self._through: datetime | None = None  # None: every override row is visible
+        self._visible: tuple[int, ...] = ()
+        self._switches: list[datetime] = []  # sorted (at - EPS) of all rows
+        self._known_at: dict[str, datetime] = {}
         self._warned: set[str] = set()
         self._effects_seen: OrderedDict[str, None] = OrderedDict()
         self._promos: list[dict[str, Any]] | None = None
@@ -230,22 +276,86 @@ class ScenarioManager:
 
     # -- CLI overrides ---------------------------------------------------------
     def load_overrides(self, rows: Iterable[tuple] | None) -> None:
-        """Apply ``sim.scenario_overrides`` rows ``(id, scenario_id, action, at, params)``.
+        """Know ``sim.scenario_overrides`` rows ``(id, scenario_id, action, at, params)``.
 
         Called every live tick with the full table; returns immediately when
-        the rows are unchanged. ``version`` increases only when the resulting
-        windows differ. Rows naming unknown scenarios or carrying invalid
-        parameters are skipped with a warning (the live loop keeps running).
+        the rows are unchanged. Only rows whose ``at`` has been reached (see
+        :meth:`advance_to`) shape the windows. ``version`` increases only when
+        the resulting windows differ. Rows naming unknown scenarios or
+        carrying invalid parameters are skipped with a warning (the live loop
+        keeps running).
         """
         new_rows = [tuple(r) for r in rows] if rows else []
         if new_rows == self._rows:
             return
         self._rows = new_rows
-        windows = [replace(w) for w in self._config_windows]
+        self._switches = sorted({_aware_utc(r[3]) - EPS for r in new_rows})
+        self._rebuild(force=True)
+
+    def advance_to(self, t: datetime) -> None:
+        """Make visible the override rows that apply to every time after ``t``.
+
+        The engine calls this with the start ``s`` of each slice ``(s, e]``; a
+        row is visible iff ``at <= s + 1 us``, i.e. it applies to all of the
+        slice, and :meth:`next_switch` keeps slices from straddling a row's
+        ``at``.
+        """
+        self._through = t
+        self._rebuild()
+
+    def next_switch(self, after: datetime) -> datetime | None:
+        """Earliest slice boundary ``> after`` at which an override row becomes visible."""
+        i = bisect.bisect_right(self._switches, after)
+        return self._switches[i] if i < len(self._switches) else None
+
+    def set_known_at(self, known_at: dict[str, datetime]) -> None:
+        """Config windows introduced after the fresh start: id -> clock when first seen.
+
+        Such a window starts no earlier than ``known_at + 1 us`` and its scenario
+        promotion is announced no earlier than that (nothing before the clock
+        can be written any more). The runner persists the map in the ledger.
+        """
+        self._known_at = {k: _aware_utc(v) for k, v in known_at.items()}
+        self._rebuild(force=True)
+
+    def config_window_starts(self) -> list[tuple[str, str]]:
+        """``(window_id, configured start iso or "")`` of the config windows (ledger signature)."""
+        return [(w.window_id, "" if w.from_history_start else w.start.isoformat()) for w in self._config_windows]
+
+    def _effective_config_windows(self) -> list[ScenarioWindow]:
+        out = []
+        for w in self._config_windows:
+            w = replace(w)
+            k = self._known_at.get(w.window_id)
+            if k is not None and w.start <= k:
+                w.start = k + EPS
+                if w.end is not None and w.end <= w.start:
+                    self._warn_once(
+                        f"late:{w.window_id}",
+                        "config scenario window %s ended before it became known at %s; ignored",
+                        w.window_id, k.isoformat(),
+                    )
+                    continue
+            out.append(w)
+        return out
+
+    def _rebuild(self, force: bool = False) -> None:
+        if self._through is None:
+            visible = tuple(int(r[0]) for r in self._rows)
+        else:
+            lim = self._through + EPS
+            visible = tuple(int(r[0]) for r in self._rows if _aware_utc(r[3]) <= lim)
+        if not force and visible == self._visible:
+            return
+        self._visible = visible
+        vis = set(visible)
+        windows = self._effective_config_windows()
         closes: list[tuple[datetime, str, int]] = []
-        for row in sorted(new_rows, key=lambda r: int(r[0])):
+        for row in sorted(self._rows, key=lambda r: int(r[0])):
             oid, sid, action, at, params = row[:5]
             oid = int(oid)
+            if oid not in vis:
+                continue
             at = _aware_utc(at)
             if action == "enable":
                 impl = base.get(sid)
@@ -402,6 +512,9 @@ class ScenarioManager:
                         window_id=w.window_id, scenario_id=w.scenario_id, index=w.index,
                         live=w.source == "cli",
                     )
+                    k = self._known_at.get(w.window_id)
+                    if k is not None:
+                        spec["announce_not_before"] = k + EPS
                     out.append(spec)
             out.sort(key=lambda s: (s["start"], s["index"]))
             self._promos = out
@@ -533,10 +646,13 @@ def on_window_start(world, ev) -> None:
 
 @handler(CLOSE_KIND)
 def on_window_close(world, ev) -> None:
-    """A CLI disable closes a window: update its recorded end."""
+    """A CLI disable closes a window: update its recorded end and end its promotion."""
+    from ..domain import promotions  # lazy: promotions reads the manager
+
     world.emit(
         ScenarioWindowClosed(at=world.now, window_id=ev.data["window_id"], end=_aware_utc(ev.data["end"]))
     )
+    promotions.scenario_window_closed(world, ev.data["window_id"])
 
 
 @bootstrap(order=0)

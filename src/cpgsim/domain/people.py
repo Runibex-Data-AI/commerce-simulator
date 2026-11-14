@@ -29,9 +29,10 @@ from faker import Faker
 LOCALES: dict[str, str] = {"DE": "de_DE", "AT": "de_AT", "CH": "de_CH"}
 
 DEFAULT_EMAIL_DOMAINS: dict[str, tuple[str, ...]] = {
-    "DE": ("example.de", "mail.example", "post.example", "web.example"),
-    "AT": ("example.at", "mail.example", "web.example"),
-    "CH": ("example.ch", "mail.example", "web.example"),
+    # Reserved TLD only (RFC 2606): never a real, registrable domain.
+    "DE": ("mail.de.example", "post.de.example", "web.de.example", "mail.example"),
+    "AT": ("mail.at.example", "web.at.example", "mail.example"),
+    "CH": ("mail.ch.example", "web.ch.example", "mail.example"),
 }
 
 #: Share of web shop customers who are women (skincare skews female).

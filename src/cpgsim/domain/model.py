@@ -38,6 +38,7 @@ WEB_ORDER_STATUSES = (
     "lost",
     "return_requested",
     "returned",
+    "return_rejected",  # returned goods failed inspection: no refund, goods go back to the customer
     "partially_refunded",
     "refunded",
 )
@@ -66,6 +67,7 @@ CARRIER_SCAN_CODES = (
 )
 
 RETURN_STATUSES = ("requested", "label_issued", "received", "inspected", "refunded", "rejected")
+REFUND_STATUSES = ("issued", "completed")  # completed: the provider has paid the money out
 RETURN_REASONS = ("damaged_in_transit", "wrong_item", "did_not_like", "allergic_reaction")
 
 RETAIL_PO_STATUSES = (
@@ -148,7 +150,7 @@ class Customer:
     country: str
     address: Address
     created_at: datetime
-    acquisition: str  # organic_search | paid_search | social | influencer | marketplace_spillover | direct
+    acquisition: str  # organic_search | paid_search | social | influencer | marketplace_spillover | direct | deal_site
     influencer_code: str | None = None
     orders: int = 0
     missed_intents: int = 0
@@ -172,6 +174,7 @@ class OrderLine:
     shipped_qty: int = 0
     cancelled_qty: int = 0
     returned_qty: int = 0
+    discount_pct: float = 0.0  # nominal promotion rate behind ``discount`` (0.25 = 25 % off), 0 if none
 
     @property
     def gross(self) -> float:
@@ -238,9 +241,14 @@ class Condition:
     amount: float  # signed value for the item in document currency (discounts negative)
 
 
+#: Item number of the freight (shipping charge) item on web sales documents and
+#: their invoices / credit memos.
+FREIGHT_ITEM_NO = 900
+
+
 @dataclass(slots=True)
 class SalesItem:
-    item_no: int  # 10, 20, 30 ... (SAP style numbering is neutral enough)
+    item_no: int  # 10, 20, 30 ... (SAP style numbering is neutral enough); freight: FREIGHT_ITEM_NO
     sku_id: int
     qty: int  # ordered quantity
     confirmed_qty: int  # after stock check / cuts
@@ -252,6 +260,14 @@ class SalesItem:
     rejection_reason: str | None = None  # None | customer_cancelled | out_of_stock | payment_failed
     delivered_qty: int = 0
     billed_qty: int = 0
+    # goods | freight. A freight item (sku_id 0, qty 1) carries the web shipping
+    # charge: it is never reserved, picked or delivered, only billed (once, on
+    # the first invoice of the order).
+    item_type: str = "goods"
+
+    @property
+    def is_freight(self) -> bool:
+        return self.item_type == "freight"
 
 
 @dataclass(slots=True)
@@ -273,7 +289,7 @@ class SalesDoc:
     status: str = "open"  # open | in_process | completed | rejected
     delivery_status: str = "none"  # none | partial | full
     billing_status: str = "none"  # none | partial | full
-    shipping_net: float = 0.0  # web: net shipping charge (doc currency), billed on the first invoice
+    shipping_net: float = 0.0  # web: net shipping charge (doc currency) = the freight item's net_value
     shipping_tax: float = 0.0
     meta: dict = field(default_factory=dict)  # module scratch space, JSON values only
 

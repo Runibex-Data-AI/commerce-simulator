@@ -19,7 +19,6 @@ Business dates and times (``erdat``/``erzet``, ``audat``, ``fkdat``,
 from __future__ import annotations
 
 import re
-import zlib
 from datetime import date, datetime, time
 from typing import Any, Callable, Mapping
 
@@ -33,6 +32,7 @@ from ..domain.events import (
     FxRatePublished,
     SalesDocChanged,
     SalesDocCreated,
+    ServiceMaterialListed,
     SkuListed,
     StandardCostRevised,
 )
@@ -71,6 +71,7 @@ SPART = "00"  # division (cross-division)
 VTWEG_TRADE = "10"
 VTWEG_ECOM = "20"
 UNIT = "ST"  # piece
+SERVICE_UNIT = "LE"  # activity unit (Leistungseinheit) of service materials
 WEIGHT_UNIT = "KG"
 NET_WEIGHT_SHARE = 0.9  # net weight = 90% of gross (assumed packaging share)
 
@@ -88,8 +89,8 @@ VSBED = {"web": "01", "retail": "02"}  # parcel / pallet freight
 KTOKD = {"retailer": "Z001", "retailer_dc": "Z002", "web_collective": "Z010"}
 
 # Material group per catalogue category. The catalogue's category keys are
-# normalised (lower case, non-alphanumerics -> "_") before lookup; a category
-# not listed here gets a stable derived code (``_matkl``).
+# normalised (lower case, non-alphanumerics -> "_") before lookup; an unknown
+# category is an error (``_matkl``), so a new category needs a code here.
 MATKL: dict[str, str] = {
     "body_care": "KP1010",
     "body_lotion": "KP1010",
@@ -108,8 +109,21 @@ MATKL: dict[str, str] = {
     "after_sun": "KP4020",
     "lip_care": "KP5010",
     "hair_care": "KP6010",
+    "gift_set": "KP9010",
     "gift_sets": "KP9010",
 }
+
+#: Non-stock service materials (ServiceMaterialListed.service) ->
+#: (matnr, matkl, German text, English text). The web freight item uses "shipping".
+SERVICE_MATERIALS: dict[str, tuple[str, str, str, str]] = {
+    "shipping": ("SHIPPING", "KP9910", "Versandkosten", "Shipping charge"),
+}
+#: Service material of the shipping charge (freight item 900 on web orders,
+#: invoices and credit memos).
+SHIPPING_MATNR = SERVICE_MATERIALS["shipping"][0]
+SHIPPING_TEXT = SERVICE_MATERIALS["shipping"][2]
+PSTYV_GOODS = "TAN"
+PSTYV_SERVICE = "TAD"  # service item: not delivery-relevant, billed from the order
 
 # Neutral status -> S/4HANA style status code (header vbak).
 GBSTK = {"open": "A", "in_process": "B", "completed": "C", "rejected": "C"}
@@ -186,10 +200,10 @@ def _code(s: str, n: int) -> str:
 
 def _matkl(category: str) -> str:
     key = _norm(category)
-    if key in MATKL:
+    try:
         return MATKL[key]
-    # stable across runs and platforms (unlike hash())
-    return f"KP8{zlib.crc32(key.encode()) % 1000:03d}"
+    except KeyError:
+        raise ValueError(f"erp writer: no material group (MATKL) for category {category!r}") from None
 
 
 def _prdha(sku: Sku) -> str:
@@ -302,6 +316,7 @@ class ErpWriter(Writer):
     def handlers(self) -> dict[type, Callable[[Any], None]]:
         return {
             SkuListed: self.on_sku_listed,
+            ServiceMaterialListed: self.on_service_material_listed,
             StandardCostRevised: self.on_standard_cost_revised,
             B2BAccountCreated: self.on_account_created,
             CustomerMaterialListed: self.on_customer_material_listed,
@@ -343,6 +358,8 @@ class ErpWriter(Writer):
         s = e.sku
         matnr = keys.matnr(s.sku_id)
         d = self._date(e.at)
+        # Materials seeded at history start were created on their listing date.
+        ersda = min(e.listed_on, d) if e.listed_on is not None else d
         gross = round(s.weight_g / 1000.0, 3)
         self.t(MARA).insert(
             {
@@ -359,7 +376,7 @@ class ErpWriter(Writer):
                 "brgew": gross,
                 "ntgew": round(gross * NET_WEIGHT_SHARE, 3),
                 "gewei": WEIGHT_UNIT,
-                "ersda": d,
+                "ersda": ersda,
                 "ernam": ERNAM_MD,
                 "laeda": d,
                 "mstae": "Z1" if s.delist_date else "",
@@ -382,6 +399,37 @@ class ErpWriter(Writer):
             },
             e.at,
         )
+
+    def on_service_material_listed(self, e: ServiceMaterialListed) -> None:
+        matnr, matkl, text_de, text_en = _lookup(SERVICE_MATERIALS, e.service, "service material")
+        d = self._date(e.at)
+        ersda = min(e.listed_on, d) if e.listed_on is not None else d
+        self.t(MARA).insert(
+            {
+                "matnr": matnr,
+                "mtart": "DIEN",  # service: no stock, no valuation (no mbew row)
+                "mbrsh": "C",
+                "matkl": matkl,
+                "meins": SERVICE_UNIT,
+                "ean11": None,
+                "numtp": None,
+                "prdha": "",
+                "brand_id": "",
+                "groes": None,
+                "brgew": 0.0,
+                "ntgew": 0.0,
+                "gewei": WEIGHT_UNIT,
+                "ersda": ersda,
+                "ernam": ERNAM_MD,
+                "laeda": d,
+                "mstae": "",
+                "mstde": None,
+            },
+            e.at,
+        )
+        makt = self.t(MAKT)
+        makt.insert({"matnr": matnr, "spras": "D", "maktx": text_de[:40]}, e.at)
+        makt.insert({"matnr": matnr, "spras": "E", "maktx": text_en[:40]}, e.at)
 
     def on_standard_cost_revised(self, e: StandardCostRevised) -> None:
         self.t(MBEW).update(
@@ -408,7 +456,7 @@ class ErpWriter(Writer):
                 "stras": stras[:60] or None,
                 "spras": "D",
                 "stceg": fictional_vat_id(self.seed, a.account_id, addr.country),
-                "erdat": self._date(e.at),
+                "erdat": e.opened_on if e.opened_on is not None else self._date(e.at),
                 "ernam": ERNAM_MD,
             },
             e.at,
@@ -488,26 +536,28 @@ class ErpWriter(Writer):
         vbap, konv = self.t(VBAP), self.t(KONV)
         for item in doc.items:
             posnr = keys.item_posnr(item.item_no)
-            sku = self._sku(item.sku_id)
+            freight = item.item_type == "freight"
+            unit = SERVICE_UNIT if freight else UNIT
             vbap.insert(
                 {
                     "vbeln": vbeln,
                     "posnr": posnr,
-                    "matnr": keys.matnr(item.sku_id),
-                    "arktx": material_description(sku),
-                    "pstyv": "TAN",
+                    "matnr": SHIPPING_MATNR if freight else keys.matnr(item.sku_id),
+                    "arktx": self._arktx(0 if freight else item.sku_id),
+                    "pstyv": PSTYV_SERVICE if freight else PSTYV_GOODS,
                     "kwmeng": item.qty,
                     "kbmeng": item.confirmed_qty,
-                    "vrkme": UNIT,
-                    "meins": UNIT,
+                    "vrkme": unit,
+                    "meins": unit,
                     "kdmat": item.customer_article,
                     "netwr": _r2(item.net_value),
                     "mwsbp": _r2(item.tax),
                     "wavwr": self._to_doc_currency(item.cost, doc.fx_rate_eur),
                     "waerk": doc.currency,
                     "werks": WERKS,
-                    "lgort": LGORT,
-                    "vstel": VSTEL,
+                    # a service item has no storage location and no shipping point
+                    "lgort": "" if freight else LGORT,
+                    "vstel": "" if freight else VSTEL,
                     "zzlfimg": item.delivered_qty,
                     "zzfkimg": item.billed_qty,
                     "erdat": erdat,
@@ -529,7 +579,8 @@ class ErpWriter(Writer):
                 "lfsta": "C" if item.delivered_qty > 0 else "",
                 "fksta": "C" if item.billed_qty > 0 else "",
             }
-        lfsta = _qty_status(item.delivered_qty, item.confirmed_qty)
+        # A freight (service) item is not delivery-relevant: lfsta stays blank.
+        lfsta = "" if item.item_type == "freight" else _qty_status(item.delivered_qty, item.confirmed_qty)
         fksta = _qty_status(item.billed_qty, item.confirmed_qty)
         if fksta == "C" or item.confirmed_qty <= 0:
             gbsta = "C"
@@ -821,6 +872,7 @@ class ErpWriter(Writer):
                 vgbel, vgtyp = keys.vbeln_delivery(item.delivery_id), "J"
             else:
                 vgbel, vgtyp = None, None
+            unit = UNIT if item.sku_id else SERVICE_UNIT
             vbrp.insert(
                 {
                     "vbeln": vbeln,
@@ -828,8 +880,8 @@ class ErpWriter(Writer):
                     "matnr": keys.matnr(item.sku_id) if item.sku_id else SHIPPING_MATNR,
                     "arktx": self._arktx(item.sku_id),
                     "fkimg": item.qty,
-                    "vrkme": UNIT,
-                    "meins": UNIT,
+                    "vrkme": unit,
+                    "meins": unit,
                     "netwr": _r2(item.net_value),
                     "mwsbp": _r2(item.tax),
                     "wavwr": self._to_doc_currency(item.cost, b.fx_rate_eur),
@@ -864,11 +916,6 @@ class ErpWriter(Writer):
             ch["zzpay_status"] = _lookup(PAY_STATUS, f["status"], "payment status")
         if ch:
             self.t(VBRK).update(keys.vbeln_billing(e.billing_id), ch, e.at)
-
-
-#: Service material for the shipping charge item on web invoices (not in mara).
-SHIPPING_MATNR = "SHIPPING"
-SHIPPING_TEXT = "Versandkosten"
 
 
 def _ref_pos(item, is_cm: bool) -> str | None:

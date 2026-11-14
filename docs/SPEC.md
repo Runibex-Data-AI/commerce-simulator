@@ -126,6 +126,7 @@ stateDiagram-v2
     InTransit --> Lost: under 0.5%
     Delivered --> Returned: within 14 days, 3%
     Returned --> Refunded: full or partial
+    Returned --> ReturnRejected: fails inspection, goods sent back
 ```
 
 Every transition is an update to the same order row, which is what an incremental load has to catch.
@@ -209,10 +210,10 @@ Every noise event is also written to `truth.planted_effects`, so data quality fi
 Any tool with a Postgres connector and a query-based incremental strategy can load every business table without custom logic. The contract below is what the generator guarantees.
 
 1. **Keys.** Every table has a primary key. Composite keys are allowed for item tables (header id plus line number).
-2. **Change tracking.** Every table has `created_at` and `updated_at`. The generator sets both from the simulation clock, and `updated_at` changes on every update to the row. In live mode the clock equals wall time, so a watermark on `updated_at` catches every change. Each `updated_at` column is indexed.
+2. **Change tracking.** Every table has `created_at` and `updated_at`, and `updated_at` changes on every update to the row. The backfill sets both from the simulation clock; in live mode (including the catch-up after downtime) they carry the commit time, so a watermark on `max(updated_at)` catches every change. Each `updated_at` column is indexed.
 3. **No hard deletes.** Business rows are never deleted. Cancellations are states, erasures are anonymisation updates, and anything withdrawn carries `is_deleted` and `deleted_at`. Query-based incremental loads cannot see deletes, so none happen.
 4. **Snapshots are insert-only.** Daily snapshot tables (`wms.stock_levels_daily`, `shelf.digital_shelf_daily`, the marketplace reports) only receive new rows. A restatement arrives as a new row with a new load id, never an update.
-5. **Roles.** `sim_writer` owns all schemas and is used only by the generator over localhost. `bi_reader` has `SELECT` on the six business schemas and nothing else: No access to `sim` or `truth`, no write rights.
+5. **Roles.** `sim_writer` owns all schemas and is used only by the generator, over the Compose network (SSL). `bi_reader` has `SELECT` on the six business schemas and nothing else: No access to `sim` or `truth`, no write rights.
 6. **Transport.** Postgres listens with SSL required for remote connections. Only the BI tool's outbound IPs should be allowed in.
 7. **Freshness.** A change committed in a tick is visible to `bi_reader` at the end of that tick, so the lag a BI tool sees is the tick length plus its own load schedule. A five- to fifteen-minute incremental schedule is the recommended setting.
 

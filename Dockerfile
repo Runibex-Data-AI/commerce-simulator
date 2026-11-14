@@ -10,10 +10,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Install the package (dependencies first, so source edits keep the layer cache).
-COPY pyproject.toml README.m[d] ./
+# Dependencies first (cached until pyproject.toml changes): install the
+# declared dependencies from a stub package, then add the real sources.
+COPY pyproject.toml README.md ./
+RUN mkdir -p src/cpgsim && touch src/cpgsim/__init__.py \
+    && pip install . && pip uninstall -y cpgsim && rm -rf build src
 COPY src ./src
-RUN pip install . && rm -rf build src/*.egg-info
+RUN pip install --no-deps . && rm -rf build src/*.egg-info
 
 # SQL and the default config live outside the installed package.
 COPY sql ./sql

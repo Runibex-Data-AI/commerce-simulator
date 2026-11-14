@@ -11,10 +11,11 @@ from __future__ import annotations
 import dataclasses
 import types
 import typing
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from functools import lru_cache
 from typing import Any
 
+_UTC = timezone.utc
 
 def to_jsonable(obj: Any) -> Any:
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
@@ -43,7 +44,10 @@ def _decode(tp: Any, value: Any) -> Any:
         args = [a for a in typing.get_args(tp) if a is not type(None)]
         return _decode(args[0], value) if len(args) == 1 else value
     if tp is datetime:
-        return datetime.fromisoformat(value)
+        dt = datetime.fromisoformat(value)
+        # Aware values are kept in UTC (world.now is UTC; arithmetic on a DST
+        # zone would be wall-clock arithmetic).
+        return dt.astimezone(_UTC) if dt.tzinfo is not None else dt
     if tp is date:
         return date.fromisoformat(value)
     if dataclasses.is_dataclass(tp):

@@ -53,9 +53,11 @@ CREATE TABLE IF NOT EXISTS erp.mara (
     deleted_at  timestamptz
 );
 CREATE INDEX IF NOT EXISTS mara_updated_at_idx ON erp.mara (updated_at);
-COMMENT ON TABLE  erp.mara IS 'Material master, general data (SAP MARA). One row per SKU.';
-COMMENT ON COLUMN erp.mara.matnr IS 'Material number, 18 characters, zero-padded numeric.';
-COMMENT ON COLUMN erp.mara.matkl IS 'Material group per product category (see ErpWriter MATKL).';
+COMMENT ON TABLE  erp.mara IS 'Material master, general data (SAP MARA). One row per SKU (mtart FERT) plus the service material SHIPPING (mtart DIEN, no stock, no mbew row) used by the freight item 000900 of web orders and invoices.';
+COMMENT ON COLUMN erp.mara.matnr IS 'Material number, 18 characters, zero-padded numeric; service materials use a text key (SHIPPING).';
+COMMENT ON COLUMN erp.mara.matkl IS 'Material group per product category (see ErpWriter MATKL); KP9910 freight and services.';
+COMMENT ON COLUMN erp.mara.ersda IS 'Created on: the listing date (launch date - 60 days), also for materials already listed before the simulated history starts.';
+COMMENT ON COLUMN erp.mara.laeda IS 'Date of last change (the replication into this system).';
 COMMENT ON COLUMN erp.mara.prdha IS 'Product hierarchy, 18 characters: brand (5) + category (5) + line (8) codes.';
 COMMENT ON COLUMN erp.mara.brand_id IS 'Brand code (S/4HANA BRAND_ID).';
 COMMENT ON COLUMN erp.mara.mstae IS 'Material status: Z1 = to be delisted from mstde. Blank = active.';
@@ -123,6 +125,7 @@ COMMENT ON COLUMN erp.kna1.ktokd IS 'Account group: Z001 retailer sold-to, Z002 
 COMMENT ON COLUMN erp.kna1.sortl IS 'Search term: the account short name used across the business.';
 COMMENT ON COLUMN erp.kna1.konzs IS 'Group key linking a retailer and its distribution centres.';
 COMMENT ON COLUMN erp.kna1.regio IS 'Region code within land1 (ISO 3166-2 subdivision part, numeric codes zero-padded to two digits).';
+COMMENT ON COLUMN erp.kna1.erdat IS 'Account opened on; accounts that existed before the simulated history starts carry their (earlier) opening date.';
 COMMENT ON COLUMN erp.kna1.stceg IS 'Fictional VAT id with a deliberately invalid check digit, so it never matches a real registration.';
 
 CREATE TABLE IF NOT EXISTS erp.knmt (
@@ -204,7 +207,7 @@ COMMENT ON COLUMN erp.vbak.auart IS 'Sales document type: ZWEB web shop order, Z
 COMMENT ON COLUMN erp.vbak.vtweg IS 'Distribution channel: 10 trade, 20 e-commerce.';
 COMMENT ON COLUMN erp.vbak.zzkunwe IS 'Ship-to party (SAP keeps partners in VBPA, which is not modelled).';
 COMMENT ON COLUMN erp.vbak.bstnk IS 'Customer reference: the shop order UUID for web orders, the retailer PO number for EDI orders. Free text, not a key.';
-COMMENT ON COLUMN erp.vbak.netwr IS 'Net value in document currency waerk (excl. tax).';
+COMMENT ON COLUMN erp.vbak.netwr IS 'Net value in document currency waerk (excl. tax): sum of vbap.netwr, including the freight item 000900 of web orders. netwr + sum(vbap.mwsbp) equals the shop order total.';
 COMMENT ON COLUMN erp.vbak.kurrf IS 'Exchange rate to EUR: EUR per one unit of waerk (the month''s rate).';
 COMMENT ON COLUMN erp.vbak.netwr_eur IS 'Net value converted to EUR at kurrf.';
 COMMENT ON COLUMN erp.vbak.gbstk IS 'Overall processing status: A open, B in process, C completed (also for fully rejected documents, see vbap.abgru).';
@@ -246,7 +249,8 @@ CREATE TABLE IF NOT EXISTS erp.vbap (
 );
 CREATE INDEX IF NOT EXISTS vbap_updated_at_idx ON erp.vbap (updated_at);
 CREATE INDEX IF NOT EXISTS vbap_matnr_idx ON erp.vbap (matnr);
-COMMENT ON TABLE  erp.vbap IS 'Sales document items (SAP VBAP).';
+COMMENT ON TABLE  erp.vbap IS 'Sales document items (SAP VBAP). Web orders with a shipping charge carry it as freight item 000900 (matnr SHIPPING, pstyv TAD, unit LE): not delivery-relevant (lfsta blank, blank lgort/vstel), billed once on the first invoice.';
+COMMENT ON COLUMN erp.vbap.pstyv IS 'Item category: TAN standard item, TAD service item (freight).';
 COMMENT ON COLUMN erp.vbap.kbmeng IS 'Confirmed quantity after the stock check (retailer orders may be cut).';
 COMMENT ON COLUMN erp.vbap.wavwr IS 'Cost (standard cost x quantity) in document currency.';
 COMMENT ON COLUMN erp.vbap.abgru IS 'Reason for rejection: Z1 cancelled by customer, Z2 out of stock, Z3 payment failed, ZZ other. Blank = not rejected.';
@@ -279,7 +283,7 @@ CREATE INDEX IF NOT EXISTS konv_updated_at_idx ON erp.konv (updated_at);
 COMMENT ON TABLE  erp.konv IS 'Pricing conditions of sales documents (SAP KONV; PRCD_ELEMENTS in S/4HANA). Join on vbak.knumv.';
 COMMENT ON COLUMN erp.konv.kschl IS 'Condition type: PR00 list price, K007 customer discount, ZPRO promotion discount, HD00 freight, MWST output tax.';
 COMMENT ON COLUMN erp.konv.krech IS 'Calculation type: C quantity-based (kbetr per kpein kmein), A percentage (kbetr in %), B fixed amount.';
-COMMENT ON COLUMN erp.konv.kbetr IS 'Rate: unit price for PR00, percent for discounts and tax (negative for discounts), amount for freight.';
+COMMENT ON COLUMN erp.konv.kbetr IS 'Rate: unit price for PR00, percent for discounts and tax (negative for discounts; ZPRO carries the promotion''s nominal rate, kwert the cent-rounded amount), amount for freight (HD00 on the freight item 000900).';
 COMMENT ON COLUMN erp.konv.kwert IS 'Condition value for the item in document currency waers (discounts negative).';
 
 -- ---------------------------------------------------------------------------
@@ -443,3 +447,4 @@ COMMENT ON TABLE  erp.vbrp IS 'Billing document items (SAP VBRP).';
 COMMENT ON COLUMN erp.vbrp.vgbel IS 'Reference document: the delivery (vgtyp J) for invoices, the original invoice (vgtyp M) for credit memos.';
 COMMENT ON COLUMN erp.vbrp.vgpos IS 'Reference item. Not populated in phase 1: to find the delivery item of an invoice item join erp.lips on lips.vbeln = vbrp.vgbel AND lips.vgpos = vbrp.aupos.';
 COMMENT ON COLUMN erp.vbrp.wavwr IS 'Cost (standard cost x quantity) in document currency.';
+COMMENT ON COLUMN erp.vbrp.aupos IS 'Sales document item billed; 000900 (matnr SHIPPING) is the web shipping charge, billed on the first invoice of the order.';

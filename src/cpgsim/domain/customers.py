@@ -13,6 +13,31 @@ Event kinds owned here:
   cumulative missed intents); a miss schedules a retry after
   ``missed_retry_factor`` of the usage time; ``max_missed_intents`` misses lapse
   the customer. Only the latest intent of a customer is live (``intent_seq``).
+* ``cust.deal_order:{bucket}:{i}`` (arrival source ``cust.deal_seekers``):
+  first-time deal-site customers while a ``promo_margin_trap`` promotion with
+  ``deal_seeker_share`` runs (see ``deal_basket``, ``deal_return_rate``,
+  ``cherry_pick`` and the scenario module).
+
+Existing customers respond to events and promotions (Black Friday week
+``black_friday_lift``, Christmas run-up ``christmas_lift``, web promotions on
+their products), so total web orders, not only first orders, carry the lifts:
+
+* **Conversion**: the intent's conversion probability is multiplied by
+  ``1 + EVENT_CONVERSION_ELASTICITY * (lift - 1)`` (at most
+  ``EVENT_CONVERSION_CAP``), ``lift = demandplan.repeat_lift`` on the day the
+  intent fires (``event_conversion_multiplier``).
+* **Pull-forward**: when an intent is planned, every demand window that
+  starts after today and at most ``PULL_FORWARD_DAYS`` before the intent date
+  may move it into the window (``_pull_forward``, probability
+  ``PULL_FORWARD_SHARE * (1 - 1 / lift)``). Decided from the pure window
+  calendar at planning time, so it is restart-safe. A customer who buys early
+  still has stock: the next intent is pushed back by the days bought early
+  (``carry_days``), which, with the intents taken out of the following
+  weeks, makes the post-event dip.
+
+Calibrated on the default config and the reduced e2e config: Black Friday week
+about 2.4-2.5x the three weeks before, 1-20 December about 1.55x
+(``tests/e2e/test_statistics.py``). Subscriptions keep their fixed intervals.
 
 Calibration (see ``repeat_calibration``): the repeat stream is a branching
 process seeded by new customers. With the default intent parameters a customer
@@ -38,9 +63,10 @@ import re
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from ..engine.registry import bootstrap, handler
+from ..engine.queue import Event
+from ..engine.registry import arrival_source, bootstrap, handler, on_load
 from ..engine.rng import Rng
-from ..models import repurchase, seasonality
+from ..models import arrivals, repurchase, seasonality
 from . import people
 from .events import CustomerRegistered
 from .model import Address, Customer, WebOrder
@@ -77,6 +103,12 @@ PHONE_SHARE = 0.78
 BIRTH_YEAR_SHARE = 0.62
 WARM_HISTORY_DAYS = 730
 WARM_SPREAD = 1.12  # stretch of the warm cohort's first intents (empirical: flat volume from day one)
+# Response of existing customers to events and promotions (calibrated so total
+# web orders hit black_friday_lift / christmas_lift; see on_intent, _pull_forward).
+EVENT_CONVERSION_ELASTICITY = 1.2
+EVENT_CONVERSION_CAP = 2.5
+PULL_FORWARD_SHARE = 0.45
+PULL_FORWARD_DAYS = 35
 
 
 # ---------------------------------------------------------------------------
@@ -318,24 +350,71 @@ def schedule_repurchase(world, customer: Customer, order: WebOrder) -> None:
     earliest = min(d for d, _, _ in delays)
     lines = [[s, q] for d, s, q in delays if d <= earliest + INTENT_GROUP_DAYS]
     base = order.delivered_at or world.now
-    _schedule_intent(world, c, base + timedelta(days=earliest), lines, rng)
+    carry = int(c.meta.pop("carry_days", 0) or 0)
+    _schedule_intent(world, c, base + timedelta(days=earliest + carry), lines, rng)
+
+
+def _pull_forward(world, rng: Rng, due_d: date, skus: list[int]) -> date:
+    """Move a planned intent into an earlier demand window, or keep its date.
+
+    Every web demand window (Black Friday week through Cyber Monday, the
+    Christmas run-up, an already announced web promotion covering one of the
+    intent's SKUs) that starts after today and at most ``PULL_FORWARD_DAYS``
+    before the intent's date gets one draw, earliest first: with probability
+    ``PULL_FORWARD_SHARE * (1 - 1 / lift)`` the customer stocks up early and
+    the intent moves to a day of that window (weighted by the day's event
+    factor). The window calendar is a pure function of config, calendar and
+    the promotion calendar, so this is decided when the intent is planned and
+    the result is in the queue (restart-safe). The intents taken out of the
+    following weeks are the post-event dip.
+    """
+    today = world.local_date()
+    lo = today + timedelta(days=1)
+    hi = due_d - timedelta(days=1)
+    if hi < lo:
+        return due_d
+    first = max(lo, due_d - timedelta(days=PULL_FORWARD_DAYS))
+    for w in demandplan.demand_windows(world, skus, first, hi, known_at=world.now):
+        if not rng.random() < PULL_FORWARD_SHARE * (1.0 - 1.0 / max(1.0, w.lift)):
+            continue
+        last = min(w.last, hi)
+        days = [w.first + timedelta(days=i) for i in range((last - w.first).days + 1)]
+        weights, acc = [], 0.0
+        for x in days:
+            acc += max(1.0, demandplan.web_event_factor(world, x))
+            weights.append(acc)
+        return days[min(rng.weighted_index(weights), len(days) - 1)]
+    return due_d
 
 
 def _schedule_intent(world, c: Customer, approx: datetime, lines: list[list[int]], rng: Rng) -> None:
     c.intent_seq += 1
-    due = at_time_of_day(world, rng, world.local_date(approx))
+    planned = world.local_date(approx)
+    due_d = _pull_forward(world, rng, planned, [s for s, _ in lines])
+    due = at_time_of_day(world, rng, due_d)
     due = not_before_now(world, due, rng)
-    world.schedule(
-        "cust.intent",
-        due,
-        f"cust.intent:{c.customer_id}:{c.intent_seq}",
-        {
-            "customer_id": c.customer_id,
-            "seq": c.intent_seq,
-            "skus": [s for s, _ in lines],
-            "qtys": [q for _, q in lines],
-        },
-    )
+    data = {
+        "customer_id": c.customer_id,
+        "seq": c.intent_seq,
+        "skus": [s for s, _ in lines],
+        "qtys": [q for _, q in lines],
+    }
+    if due_d < planned:
+        data["early_days"] = (planned - due_d).days  # stock still left when buying early
+    world.schedule("cust.intent", due, f"cust.intent:{c.customer_id}:{c.intent_seq}", data)
+
+
+def event_conversion_multiplier(world, skus: list[int]) -> float:
+    """Multiplier on an intent's conversion probability from today's events and promotions.
+
+    ``1 + EVENT_CONVERSION_ELASTICITY * (lift - 1)``, capped at
+    ``EVENT_CONVERSION_CAP``, where ``lift = demandplan.repeat_lift`` (web event
+    factor times the mean promotion lift of the intent's SKUs).
+    """
+    lift = demandplan.repeat_lift(world, skus, world.local_date())
+    if lift <= 1.0:
+        return 1.0
+    return min(EVENT_CONVERSION_CAP, 1.0 + EVENT_CONVERSION_ELASTICITY * (lift - 1.0))
 
 
 REPEAT_SOURCES = {
@@ -354,23 +433,253 @@ def on_intent(world, ev) -> None:
     mult = world.scenarios.factor(
         "repurchase", world.now, customer_id=cid, acquisition=c.acquisition, influencer_code=c.influencer_code
     )
+    lines = [[int(s), int(q)] for s, q in zip(ev.data.get("skus", []), ev.data.get("qtys", []))]
+    mult *= event_conversion_multiplier(world, [s for s, _ in lines])
     p = repurchase.conversion_probability(ccfg.repurchase_prob, ccfg.repurchase_decay, c.missed_intents, mult)
     rng = world.rng("cust.intent", cid, seq)
-    lines = [[int(s), int(q)] for s, q in zip(ev.data.get("skus", []), ev.data.get("qtys", []))]
     if rng.random() < p:
-        basket = web.repeat_basket(world, rng, c.country, lines)
+        basket = cherry_pick(world, rng, web.repeat_basket(world, rng, c.country, lines))
         if basket:
+            early = int(ev.data.get("early_days", 0))
+            if early > 0:
+                # Bought ahead of running out: the stock left over pushes the
+                # next intent back by the same number of days.
+                world.store.mut("customer", cid).meta["carry_days"] = early
             web.place_order(world, c, basket, source=pick(rng, REPEAT_SOURCES))
             return
     c = world.store.mut("customer", cid)
     c.missed_intents += 1
     if c.missed_intents >= ccfg.max_missed_intents:
         c.lapsed = True
+        maybe_evict(world, c)
         return
     cat = world.ref.catalogue
     usage = [cat.get(s).usage_days * max(1, q) for s, q in lines] or [45.0]
     delay = ccfg.missed_retry_factor * (sum(usage) / len(usage)) * rng.lognormal_median(1.0, 0.3)
     _schedule_intent(world, c, world.now + timedelta(days=max(repurchase.MIN_INTENT_DAYS, delay)), lines, rng)
+
+
+# ---------------------------------------------------------------------------
+# Eviction: customers who can never act again leave the entity store
+# ---------------------------------------------------------------------------
+#
+# A customer acts only through an open web order (deliveries, returns), a
+# pending repurchase intent or a subscription. New business never comes from a
+# customer without them: first-time buyers are new customers (new ids from
+# ``world.next_id``, so an evicted id is never re-created), repeat orders come
+# from intents and subscriptions. Such a customer is removed from
+# ``world.store`` (``sim.entity_state``); the shop rows stay. Every handler
+# that reads a customer tolerates a missing one or only runs while one of
+# those three exists. New code (e.g. phase-2 GDPR erasure or duplicate
+# customers) must not look customers up in the store by id: pick them from
+# open orders, intents or subscriptions, or keep its own state.
+
+OPEN_ORDERS = "open_orders"  # meta: web orders of this customer still in the store
+EVICTION_FLAG = "customer_eviction_v1"  # counters: open-order counts are maintained
+
+
+def order_opened(c: Customer) -> None:
+    """``place_order`` (customer already marked mutated): one more open order."""
+    c.meta[OPEN_ORDERS] = int(c.meta.get(OPEN_ORDERS, 0)) + 1
+
+
+def order_closed(world, customer_id: int | None) -> None:
+    """The web order left the store (``web.cleanup``): one fewer; evict if terminal."""
+    if customer_id is None or not world.store.has("customer", customer_id):
+        return
+    c = world.store.mut("customer", customer_id)
+    n = int(c.meta.get(OPEN_ORDERS, 0)) - 1
+    if n > 0:
+        c.meta[OPEN_ORDERS] = n
+    else:
+        c.meta.pop(OPEN_ORDERS, None)
+    maybe_evict(world, c)
+
+
+def can_act_again(world, c: Customer) -> bool:
+    if int(c.meta.get(OPEN_ORDERS, 0)) > 0:
+        return True
+    if c.subscription_id is not None:
+        return True
+    # A pending intent of a lapsed customer is a no-op (on_intent returns early).
+    return (
+        not c.lapsed
+        and c.intent_seq > 0
+        and world.is_scheduled(f"cust.intent:{c.customer_id}:{c.intent_seq}")
+    )
+
+
+def maybe_evict(world, c: Customer) -> None:
+    """Remove ``c`` from the store if it can never act again (deterministic: pure in state)."""
+    if not can_act_again(world, c):
+        world.store.remove("customer", c.customer_id)
+
+
+@on_load(order=60)
+def track_open_orders(world) -> None:
+    """Once per simulation: count open orders per customer and evict terminal customers.
+
+    Runs at the fresh start (nothing to count) and on the first resume of a
+    state written before customers were evicted.
+    """
+    cnt = world.store.get("counters", "all")
+    if cnt is None or cnt.values.get(EVICTION_FLAG):
+        return
+    counts: dict[int, int] = {}
+    for _, o in world.store.items("web_order"):
+        if o.customer_id is not None:
+            counts[o.customer_id] = counts.get(o.customer_id, 0) + 1
+    for _, c in list(world.store.items("customer")):
+        n = counts.get(c.customer_id, 0)
+        if int(c.meta.get(OPEN_ORDERS, 0)) != n:
+            c = world.store.mut("customer", c.customer_id)
+            if n:
+                c.meta[OPEN_ORDERS] = n
+            else:
+                c.meta.pop(OPEN_ORDERS, None)
+        maybe_evict(world, c)
+    world.store.mut("counters", "all").values[EVICTION_FLAG] = 1
+
+
+# ---------------------------------------------------------------------------
+# Deal seekers (promo_margin_trap)
+# ---------------------------------------------------------------------------
+
+DEAL_SOURCE = "deal_site"
+DEAL_SECOND_LINE_PROB = 0.15
+DEAL_QTY_TWO_PROB = 0.1
+DEAL_LAM_HEADROOM = 2.5  # intraday peak (hour x day-of-week) is about 2.36x the daily mean
+DEAL_MAX_SHARE = 3.0  # = promo_margin_trap.MAX_DEAL_SEEKER_SHARE (more in overlapping windows is clipped)
+DEAL_PRICE_SENSITIVITY = 2.0  # deal SKU weight = web weight / price ** this
+
+
+def deal_windows(world) -> list[dict[str, Any]]:
+    """Scenario promotions that bring deal seekers: ``{start, end, share, brand, return_rate, window_id}``.
+
+    Pure in the scenario windows (cached per ``world.scenarios.version``).
+    ``end`` is exclusive.
+    """
+    sc = world.scenarios
+    if sc is None or not hasattr(sc, "scenario_promotions"):
+        return []
+    c = cache(world, "deal_windows")
+    ver = (getattr(sc, "version", 0), getattr(sc, "history_start", None))
+    if c.get("ver") != ver:
+        out = []
+        for spec in sc.scenario_promotions() or []:
+            share = float(spec.get("deal_seeker_share") or 0.0)
+            cherry = float(spec.get("cherry_pick_share") or 0.0)
+            if (share <= 0 and cherry <= 0) or not spec.get("brand"):
+                continue
+            out.append({
+                "start": spec["start"], "end": spec["end"], "share": share, "brand": spec["brand"],
+                "return_rate": float(spec.get("deal_seeker_return_rate") or 0.0),
+                "cherry_pick": cherry, "window_id": spec.get("window_id"),
+            })
+        c["ver"], c["v"] = ver, out
+    return c["v"]
+
+
+def deal_seeker_rate_per_hour(world, t: datetime) -> float:
+    share = sum(w["share"] for w in deal_windows(world) if w["start"] <= t < w["end"])
+    if share <= 0:
+        return 0.0
+    w = world.cfg.channels.web
+    return w.base_orders_per_day * share / 24.0 * seasonality.intraday_factor(world.cfg.seasonality, world.local(t))
+
+
+@arrival_source("cust.deal_seekers")
+def deal_seeker_arrivals(world, start: datetime, end: datetime):
+    """First-time deal-site customers while a promotion with ``deal_seeker_share`` runs (NHPP)."""
+    wins = [w for w in deal_windows(world) if w["start"] < end and w["end"] > start]
+    if not wins:
+        return []
+    # Constant bound (config only), so the candidates never depend on which
+    # windows exist: switching a window on live cannot change other windows' arrivals.
+    lam_max = world.cfg.channels.web.base_orders_per_day * DEAL_MAX_SHARE / 24.0 * DEAL_LAM_HEADROOM
+    out = []
+    for t, i, bucket in arrivals.thinned_arrivals(
+        world.seed, "cust.deal", start, end, lambda x: deal_seeker_rate_per_hour(world, x), lam_max
+    ):
+        brand = next((w["brand"] for w in wins if w["start"] <= t < w["end"]), None)
+        if brand is not None:
+            out.append(Event(due=t, kind="cust.deal_order", key=f"cust.deal_order:{bucket}:{i}",
+                             data={"brand": brand}))
+    return out
+
+
+def deal_basket(world, rng: Rng, brand: str) -> list[list[int]]:
+    """One line of ``brand`` (sometimes two), quantity 1 (sometimes 2), no top-up.
+
+    SKUs are drawn by today's web weight divided by the squared unit price: deal
+    seekers go for the cheap bestsellers that deal posts feature.
+    """
+    d = world.local_date()
+    cat = world.ref.catalogue
+    sku_ids, cum = demandplan.sku_weights(world, "web", d)
+    pool, weights, prev = [], [], 0.0
+    for s, cw in zip(sku_ids, cum):
+        wt, prev = cw - prev, cw
+        sku = cat.get(s)
+        if sku.brand == brand and wt > 0:
+            pool.append(s)
+            weights.append(wt / max(sku.rrp_eur, 0.5) ** DEAL_PRICE_SENSITIVITY)
+    lines: list[list[int]] = []
+    n = 2 if rng.random() < DEAL_SECOND_LINE_PROB else 1
+    for _ in range(min(n, len(pool))):
+        acc, cum_w = 0.0, []
+        for wt in weights:
+            acc += wt
+            cum_w.append(acc)
+        i = min(rng.weighted_index(cum_w), len(pool) - 1)
+        lines.append([pool.pop(i), 2 if rng.random() < DEAL_QTY_TWO_PROB else 1])
+        weights.pop(i)
+    return lines
+
+
+@handler("cust.deal_order")
+def on_deal_order(world, ev) -> None:
+    rng = world.rng("cust.deal_order", ev.key)
+    lines = deal_basket(world, rng, str(ev.data["brand"]))
+    if not lines:
+        return
+    c = new_customer(world, rng, acquisition=DEAL_SOURCE)
+    c.meta["one_time"] = True  # came for the deal, never enters the repurchase chain
+    c.meta["deal"] = True
+    o = web.place_order(world, c, lines, source=DEAL_SOURCE)
+    world.store.mut("web_order", o.order_id).meta["deal"] = True
+
+
+def deal_return_rate(world, order: WebOrder) -> float | None:
+    """Return probability of a deal seeker's parcel, or None for every other order."""
+    if not order.meta.get("deal"):
+        return None
+    for w in deal_windows(world):
+        if w["start"] <= order.placed_at < w["end"]:
+            return w["return_rate"]
+    return None
+
+
+def cherry_pick(world, rng: Rng, lines: list[list[int]]) -> list[list[int]]:
+    """Free shipping with no minimum: some shoppers buy only the promoted brand.
+
+    While a scenario promotion with ``cherry_pick_share`` runs, a basket that
+    mixes lines of the promoted brand with other lines is cut down to the
+    promoted lines with that probability (the rest is bought later or
+    elsewhere). Outside such a window the basket is returned unchanged and no
+    random draw is made.
+    """
+    if not lines:
+        return lines
+    wins = [w for w in deal_windows(world) if w["cherry_pick"] > 0 and w["start"] <= world.now < w["end"]]
+    if not wins:
+        return lines
+    cat = world.ref.catalogue
+    for w in wins:
+        keep = [ln for ln in lines if cat.get(int(ln[0])).brand == w["brand"]]
+        if keep and len(keep) < len(lines):
+            return keep if rng.random() < w["cherry_pick"] else lines
+    return lines
 
 
 # ---------------------------------------------------------------------------

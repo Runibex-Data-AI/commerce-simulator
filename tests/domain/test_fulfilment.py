@@ -140,7 +140,7 @@ def put_stock(w, sku_id: int, on_hand: int) -> None:
     w.store.put("stock", sku_id, StockPosition(sku_id=sku_id, on_hand=on_hand))
 
 
-def web_sales_doc(w, lines: list[tuple[int, int]], shipping_net=4.16, shipping_tax=0.79) -> SalesDoc:
+def web_sales_doc(w, lines: list[tuple[int, int]], shipping_net=4.16, shipping_tax=0.79, freight=True) -> SalesDoc:
     sid = w.next_id("sales_doc")
     items = []
     for i, (sku_id, qty) in enumerate(lines):
@@ -151,6 +151,13 @@ def web_sales_doc(w, lines: list[tuple[int, int]], shipping_net=4.16, shipping_t
                 item_no=10 * (i + 1), sku_id=sku_id, qty=qty, confirmed_qty=qty, net_value=net,
                 tax=round(net * 0.19, 2), cost=round(sku.std_cost_eur * qty, 2),
                 conditions=[Condition("list_price", sku.rrp_eur / 1.19, net)],
+            )
+        )
+    if freight and shipping_net > 0:  # like web.on_release: the shipping charge is item 900
+        items.append(
+            SalesItem(
+                item_no=900, sku_id=0, qty=1, confirmed_qty=1, net_value=shipping_net, tax=shipping_tax,
+                cost=0.0, conditions=[Condition("shipping", shipping_net, shipping_net)], item_type="freight",
             )
         )
     doc = SalesDoc(
@@ -375,6 +382,7 @@ def test_invoice_pro_rata_shipping_and_sales_doc_status():
     assert inv1.items[0].net_value == round(it.net_value / 3 * 2, 2)
     ship = inv1.items[1]
     assert (ship.sku_id, ship.net_value, ship.tax, ship.qty) == (0, 4.16, 0.79, 1)
+    assert ship.sales_item_no == 900  # bills the order's freight item
     assert doc.billing_status == "partial"
     inv2 = billing.create_invoice(w, doc, None, [(10, 1), (20, 1)], START, START, include_shipping=True)
     assert [i.item_no for i in inv2.items] == [10, 20]  # shipping billed only once
@@ -383,13 +391,40 @@ def test_invoice_pro_rata_shipping_and_sales_doc_status():
     assert doc.billing_status == "full"
     sdc = of(events, SalesDocChanged)
     assert sdc[0].header == {"billing_status": "partial", "status": "in_process"}
-    assert sdc[0].items == {10: {"billed_qty": 2, "confirmed_qty": 3}}
+    assert sdc[0].items == {10: {"billed_qty": 2, "confirmed_qty": 3}, 900: {"billed_qty": 1, "confirmed_qty": 1}}
     assert sdc[1].header["billing_status"] == "full"
     assert sdc[1].items[20] == {"billed_qty": 1, "confirmed_qty": 1}
     assert len(of(events, BillingDocCreated)) == 2
     assert w.store.get("billing", inv1.billing_id) is inv1
     assert inv1.items[0].cost == round(REF.catalogue.get(1).std_cost_eur * 2, 2)
     assert w.queue.contains(f"ful.billing_purge:{inv1.billing_id}")
+
+
+def test_freight_item_billed_once_and_completes_document():
+    w, events = make_world()
+    doc = web_sales_doc(w, [(1, 1)])
+    fr = doc.items[-1]
+    assert billing.flow_status(doc, "delivery") == "none"
+    doc.items[0].delivered_qty = 1
+    assert billing.flow_status(doc, "delivery") == "full"  # freight never needs delivering
+    inv = billing.create_invoice(w, doc, None, [(10, 1)], START, START, include_shipping=True)
+    assert fr.billed_qty == 1 and [(i.item_no, i.sales_item_no) for i in inv.items] == [(10, 10), (900, 900)]
+    assert (doc.status, doc.delivery_status, doc.billing_status) == ("completed", "full", "full")
+    # invoice value = order value: net and tax of all items, freight included
+    assert inv.net_value == doc.net_value and inv.tax == round(sum(i.tax for i in doc.items), 2)
+    # a rejected freight item is never billed
+    doc2 = web_sales_doc(w, [(1, 1)])
+    doc2.items[-1].rejection_reason = "customer_cancelled"
+    inv2 = billing.create_invoice(w, doc2, None, [(10, 1)], START, START, include_shipping=True)
+    assert [i.item_no for i in inv2.items] == [10]
+
+
+def test_legacy_doc_without_freight_item_still_bills_shipping():
+    w, _ = make_world()
+    doc = web_sales_doc(w, [(1, 1)], freight=False)
+    inv = billing.create_invoice(w, doc, None, [(10, 1)], START, START, include_shipping=True)
+    assert [(i.item_no, i.sales_item_no, i.net_value) for i in inv.items] == [(10, 10, doc.items[0].net_value),
+                                                                              (900, 10, 4.16)]
 
 
 def test_credit_memo_and_clearing():
@@ -433,7 +468,8 @@ def test_web_delivery_full_lifecycle():
     created = of(events, DeliveryCreated)[0]
     assert created.delivery is d
     doc = w.store.get("sales_doc", d.sales_doc_id)
-    assert doc.delivery_status == "full" and [i.delivered_qty for i in doc.items] == [2, 1]
+    # the freight item is not delivery-relevant: delivering the goods is a full delivery
+    assert doc.delivery_status == "full" and [i.delivered_qty for i in doc.items] == [2, 1, 0]
     sdc = of(events, SalesDocChanged)[0]
     assert sdc.items[10] == {"delivered_qty": 2, "confirmed_qty": 2}
     # Released after 08:00: picked the next working day.
@@ -506,7 +542,7 @@ def test_cancel_delivery_before_and_after_pick():
     assert ev.fields["line_nos"] == [1, 2] and ev.fields["kind"] == "web"
     assert w.store.get("stock", 1).reserved == 0
     doc = w.store.get("sales_doc", d.sales_doc_id)
-    assert [i.delivered_qty for i in doc.items] == [0, 0] and doc.delivery_status == "none"
+    assert [i.delivered_qty for i in doc.items] == [0, 0, 0] and doc.delivery_status == "none"
     drain(w, w.now + timedelta(days=5))
     assert d.status == "cancelled" and not of(events, CarrierScan)
     assert fulfilment.cancel_delivery(w, d.delivery_id, "again") is False

@@ -19,7 +19,7 @@ defaults, not market data.
 ## Quick start (Docker)
 
 ```bash
-cp .env.example .env        # set the three passwords
+cp .env.example .env        # fill in the three passwords (>= 16 chars, all different; openssl rand -base64 24)
 docker compose up -d
 docker compose logs -f generator
 ```
@@ -65,6 +65,13 @@ without custom logic:
 Load incrementally with `WHERE updated_at > :last_watermark` on a 5 to 15 minute schedule.
 A change committed by the generator is visible at the end of its 30-second tick.
 
+Use the **largest `updated_at` already loaded** (per table) as the watermark. In live mode,
+including the catch-up after the generator was down, `created_at` and `updated_at` carry the
+time of the commit that wrote the row (business columns such as `placed_at` keep the simulated
+event time), so that watermark never misses a row. If your tool can only use the time its last
+load started, subtract an overlap of a minute and upsert on the primary key. The history
+written by the initial backfill is stamped with simulated event times.
+
 ## Planted scenarios
 
 Scenarios are time-bounded business stories that a platform should be able to surface by
@@ -88,11 +95,11 @@ docker compose exec generator sim truth promo_margin_trap
 | Command | What it does |
 | --- | --- |
 | `sim init` | Creates schemas, tables, indexes and grants |
-| `sim reset --seed N` | Drops all simulated data and the clock, keeps the structure |
+| `sim reset --seed N` | Drops all simulated data and the clock, keeps the structure (refuses while a generator is running; `--force` stops it) |
 | `sim backfill --months 24` | Runs backfill mode up to now (`--start`, `--until` for fixed windows) |
 | `sim run` | Runs live mode until stopped; catches up first if behind |
 | `sim start` | Container entrypoint: init, backfill if new, then run |
-| `sim status` | Clock, queue depth, rows written in the last hour, active scenarios |
+| `sim status` | Clock, queue depth, rows written in the last hour, active scenarios, config changes |
 | `sim scenario list / enable <id> / disable <id>` | Lists scenarios or switches one on or off from now |
 | `sim truth <scenario id>` | Prints what a scenario planted |
 
@@ -104,7 +111,17 @@ validated at start-up. Pass a private overlay with `--overlay /path/to/private.y
 and scenarios belong. Keep overlays outside this repository.
 
 The same seed, config and history start produce the same business, whatever the tick length,
-batching or restarts. A demo can therefore be reset and replayed exactly.
+batching or restarts. A demo can therefore be reset and replayed exactly:
+
+```bash
+docker compose stop generator
+docker compose run --rm generator reset --yes      # add --seed N for another business
+docker compose up -d generator                     # backfills again, then runs live
+```
+
+Only one generator may write to a database; a second one (or `sim backfill` next to a running
+container) refuses to start. Changing the business config of a running simulation is logged and
+recorded (`sim status`); tick and backfill settings may change freely.
 
 ## Running without Docker
 

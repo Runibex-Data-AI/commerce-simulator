@@ -32,7 +32,7 @@ CREATE INDEX IF NOT EXISTS customers_updated_at_idx ON shop.customers (updated_a
 CREATE INDEX IF NOT EXISTS customers_email_idx ON shop.customers (email);
 
 COMMENT ON TABLE shop.customers IS 'Registered web shop customers. A GDPR erasure anonymises personal data in place (status anonymised); the row and its orders are kept.';
-COMMENT ON COLUMN shop.customers.signup_source IS 'Acquisition channel at registration: organic_search, paid_search, social, influencer, marketplace_spillover or direct.';
+COMMENT ON COLUMN shop.customers.signup_source IS 'Acquisition channel at registration: organic_search, paid_search, social, influencer, marketplace_spillover, direct, or deal_site (deal-site shoppers during a promo_margin_trap promotion).';
 COMMENT ON COLUMN shop.customers.influencer_code IS 'Influencer code used at sign-up, if any.';
 COMMENT ON COLUMN shop.customers.status IS 'active or anonymised (personal data erased on request).';
 COMMENT ON COLUMN shop.customers.anonymised_at IS 'When personal data was erased; NULL for active customers.';
@@ -112,7 +112,7 @@ CREATE INDEX IF NOT EXISTS subscriptions_customer_idx ON shop.subscriptions (cus
 COMMENT ON TABLE shop.subscriptions IS 'Repeat-delivery subscriptions; each cycle places a regular order carrying subscription_id.';
 COMMENT ON COLUMN shop.subscriptions.skus IS 'Shop SKU codes in the subscription, parallel to quantities.';
 COMMENT ON COLUMN shop.subscriptions.quantities IS 'Units per delivery for each entry of skus (same position).';
-COMMENT ON COLUMN shop.subscriptions.next_order_at IS 'When the next subscription order is due; NULL when paused or cancelled.';
+COMMENT ON COLUMN shop.subscriptions.next_order_at IS 'When the next subscription order is due; for a paused subscription the date it resumes; NULL when cancelled.';
 COMMENT ON COLUMN shop.subscriptions.paused_at IS 'Most recent pause.';
 
 -- -- orders -----------------------------------------------------------------------
@@ -149,12 +149,15 @@ CREATE TABLE IF NOT EXISTS shop.orders (
     delivered_at          timestamptz,
     return_requested_at   timestamptz,
     returned_at           timestamptz,
+    return_rejected_at    timestamptz,
     refunded_at           timestamptz,
     created_at            timestamptz   NOT NULL,
     updated_at            timestamptz   NOT NULL,
     is_deleted            boolean       NOT NULL DEFAULT false,
     deleted_at            timestamptz
 );
+-- Columns added after the first release (CREATE TABLE IF NOT EXISTS does not add them).
+ALTER TABLE shop.orders ADD COLUMN IF NOT EXISTS return_rejected_at timestamptz;
 CREATE INDEX IF NOT EXISTS orders_updated_at_idx ON shop.orders (updated_at);
 CREATE UNIQUE INDEX IF NOT EXISTS orders_order_number_idx ON shop.orders (order_number);
 CREATE INDEX IF NOT EXISTS orders_customer_idx ON shop.orders (customer_id);
@@ -162,7 +165,7 @@ CREATE INDEX IF NOT EXISTS orders_placed_at_idx ON shop.orders (placed_at);
 
 COMMENT ON TABLE shop.orders IS 'Web orders. Every lifecycle step updates this row (status, timestamp columns, updated_at).';
 COMMENT ON COLUMN shop.orders.order_number IS 'Human-facing order number shown to the customer, e.g. NV-10004711.';
-COMMENT ON COLUMN shop.orders.status IS 'created, payment_failed, authorised, released, cancelled, partially_shipped, shipped, delivered, delivery_exception, returned_to_sender, lost, return_requested, returned, partially_refunded or refunded.';
+COMMENT ON COLUMN shop.orders.status IS 'created, payment_failed, authorised, released, cancelled, partially_shipped, shipped, delivered, delivery_exception, returned_to_sender, lost, return_requested, returned, return_rejected, partially_refunded or refunded. return_rejected: the returned goods failed inspection, nothing is refunded and the goods go back to the customer.';
 COMMENT ON COLUMN shop.orders.items_subtotal IS 'Sum of quantity x unit_price over all lines, gross, before discounts.';
 COMMENT ON COLUMN shop.orders.discount_total IS 'Sum of line discounts (gross).';
 COMMENT ON COLUMN shop.orders.shipping_fee IS 'Shipping fee charged, gross; 0 above the free-shipping threshold or with a free-shipping promotion.';
@@ -177,7 +180,9 @@ COMMENT ON COLUMN shop.orders.item_count IS 'Total units ordered (sum of order_l
 COMMENT ON COLUMN shop.orders.paid_at IS 'Payment authorised.';
 COMMENT ON COLUMN shop.orders.released_at IS 'Released to the warehouse.';
 COMMENT ON COLUMN shop.orders.partially_shipped_at IS 'First shipment of an order that shipped in parts.';
-COMMENT ON COLUMN shop.orders.shipped_at IS 'All shippable items have left the warehouse.';
+COMMENT ON COLUMN shop.orders.shipped_at IS 'All shippable items have left the warehouse (for an order whose backordered remainder was cancelled: the last shipment).';
+COMMENT ON COLUMN shop.orders.delivered_at IS 'The last parcel was delivered (carrier delivery time).';
+COMMENT ON COLUMN shop.orders.return_rejected_at IS 'Returned goods failed inspection (no refund).';
 COMMENT ON COLUMN shop.orders.refunded_at IS 'Most recent (partial or full) refund.';
 
 CREATE TABLE IF NOT EXISTS shop.order_lines (
@@ -208,7 +213,8 @@ COMMENT ON COLUMN shop.order_lines.sku IS 'Shop SKU code, e.g. VEL-BOD-HYB-400.'
 COMMENT ON COLUMN shop.order_lines.unit_price IS 'Gross list price per unit at order time.';
 COMMENT ON COLUMN shop.order_lines.discount_amount IS 'Total gross discount on the line (not per unit).';
 COMMENT ON COLUMN shop.order_lines.tax_rate IS 'VAT rate as a fraction: 0.1900 (DE), 0.2000 (AT), 0.0810 (CH).';
-COMMENT ON COLUMN shop.order_lines.tax_amount IS 'VAT contained in line_total: line_total - line_total / (1 + tax_rate), rounded to cents.';
+COMMENT ON COLUMN shop.order_lines.tax_amount IS 'VAT contained in line_total: line_total minus the net amount line_total / (1 + tax_rate) rounded half-up to cents (the same split as the ERP item netwr / mwsbp).';
+COMMENT ON COLUMN shop.order_lines.qty_returned IS 'Units returned and accepted; units of a rejected return are deducted again (they go back to the customer).';
 COMMENT ON COLUMN shop.order_lines.line_total IS 'quantity x unit_price - discount_amount, gross.';
 
 -- -- payments and refunds ---------------------------------------------------------------
@@ -256,16 +262,20 @@ CREATE TABLE IF NOT EXISTS shop.refunds (
     reason      text          NOT NULL,              -- return | lost | returned_to_sender | cancelled_after_capture
     status      text          NOT NULL,              -- issued | completed
     issued_at   timestamptz   NOT NULL,
+    completed_at timestamptz,
     created_at  timestamptz   NOT NULL,
     updated_at  timestamptz   NOT NULL,
     is_deleted  boolean       NOT NULL DEFAULT false,
     deleted_at  timestamptz
 );
+ALTER TABLE shop.refunds ADD COLUMN IF NOT EXISTS completed_at timestamptz;
 CREATE INDEX IF NOT EXISTS refunds_updated_at_idx ON shop.refunds (updated_at);
 CREATE INDEX IF NOT EXISTS refunds_order_idx ON shop.refunds (order_id);
 
 COMMENT ON COLUMN shop.refunds.amount IS 'Gross amount refunded to the customer, order currency.';
 COMMENT ON COLUMN shop.refunds.payment_id IS 'Payment the refund was paid back on; NULL if refunded outside the original payment.';
+COMMENT ON COLUMN shop.refunds.status IS 'issued (refund instructed), then completed once the payment provider has paid it out (hours to a week later, by payment method).';
+COMMENT ON COLUMN shop.refunds.completed_at IS 'Payment provider paid the refund out.';
 
 CREATE TABLE IF NOT EXISTS shop.promo_redemptions (
     promotion_id     uuid          NOT NULL,

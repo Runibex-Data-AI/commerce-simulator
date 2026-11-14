@@ -45,7 +45,7 @@ def test_header() -> None:
 
 
 def test_row_count(rows) -> None:
-    assert 500 <= len(rows) <= 800
+    assert 1000 <= len(rows) <= 2500
 
 
 def test_postcode_format(rows) -> None:
@@ -104,7 +104,8 @@ def test_coverage(rows) -> None:
 def test_bavaria(rows) -> None:
     by = [r for r in rows if r["region"] == "DE-BY"]
     assert len(by) >= 40
-    assert all(r["postcode"][0] in "89" for r in by)
+    # Bavaria is 8xxxx/9xxxx, except the Aschaffenburg area (63xxx)
+    assert all(r["postcode"][0] in "89" or r["postcode"].startswith("63") for r in by)
 
 
 def test_leading_zero_postcodes_only_in_east(rows) -> None:
@@ -112,3 +113,54 @@ def test_leading_zero_postcodes_only_in_east(rows) -> None:
         if r["country"] == "DE" and r["postcode"].startswith("0"):
             assert r["region"] in {"DE-SN", "DE-ST", "DE-TH", "DE-BB"}, r
     assert any(r["postcode"] == "01067" and r["city"] == "Dresden" for r in rows)
+
+
+DE_METROS = {"Berlin", "Hamburg", "München", "Köln", "Frankfurt am Main", "Stuttgart", "Düsseldorf"}
+DE_TOP_15 = DE_METROS | {
+    "Leipzig", "Dortmund", "Essen", "Bremen", "Dresden", "Hannover", "Nürnberg", "Duisburg",
+}
+
+
+def _city_weights(rows, country: str) -> dict[str, int]:
+    out: dict[str, int] = defaultdict(int)
+    for r in rows:
+        if r["country"] == country:
+            out[r["city"]] += int(r["population_weight"])
+    return out
+
+
+def test_de_top_cities_are_real_metros(rows) -> None:
+    cities = _city_weights(rows, "DE")
+    ranked = sorted(cities, key=cities.get, reverse=True)
+    assert set(ranked[:5]) <= DE_METROS, ranked[:5]
+    assert ranked[0] == "Berlin"
+
+
+def test_de_non_metro_towns_stay_small(rows) -> None:
+    cities = _city_weights(rows, "DE")
+    total = sum(cities.values())
+    for city, w in cities.items():
+        if city not in DE_TOP_15:
+            assert w <= 0.006 * total, (city, w / total)
+    # no small town may outweigh Munich
+    assert max(w for c, w in cities.items() if c not in DE_TOP_15) < cities["München"] / 3
+
+
+def test_at_ch_top_city(rows) -> None:
+    at = _city_weights(rows, "AT")
+    assert max(at, key=at.get) == "Wien"
+    ch = _city_weights(rows, "CH")
+    assert max(ch, key=ch.get) == "Zürich"
+    assert set(sorted(ch, key=ch.get, reverse=True)[:5]) <= {
+        "Zürich", "Genève", "Basel", "Lausanne", "Bern", "Winterthur"}
+    assert set(sorted(at, key=at.get, reverse=True)[:5]) <= {
+        "Wien", "Graz", "Linz", "Salzburg", "Innsbruck", "Klagenfurt am Wörthersee"}
+
+
+def test_no_small_town_row_dominates(rows) -> None:
+    big = DE_TOP_15 | {"Wien", "Zürich", "Mönchengladbach", "Gelsenkirchen", "Aachen", "Bochum",
+                       "Wuppertal", "Bielefeld", "Bonn", "Münster", "Mannheim", "Karlsruhe",
+                       "Augsburg", "Wiesbaden", "Graz", "Linz", "Genève", "Basel", "Bern"}
+    for r in rows:
+        if r["city"] not in big:
+            assert int(r["population_weight"]) <= 250_000, r

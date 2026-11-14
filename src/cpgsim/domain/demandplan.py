@@ -38,11 +38,15 @@ _CACHE_LIMIT = 6000
 # Retail sizing is calibrated against the web value the simulation actually
 # realises, so the channel value shares in the generated data match the config
 # (share_r / share_web). Realised web goods net value per year divided by the
-# analytic ``annual_web_net_eur`` on the default config (24-month backfill):
-# web orders run ~11 % above base_orders_per_day (promotion, event and launch
-# lifts) while repeat and subscription baskets are ~15 % smaller than the
-# new-customer basket model, net 0.94.
-WEB_VALUE_REALISATION = 0.94
+# analytic ``annual_web_net_eur`` on the default config (24-month backfill,
+# web goods billed net of credit memos, shipping charges excluded): web orders
+# run above base_orders_per_day (promotion, event and launch lifts, repeat
+# customers' response to Black Friday / Christmas, the promo_margin_trap deal
+# seekers) while repeat and subscription baskets are ~15 % smaller than the
+# new-customer basket model, net 0.97 (recalibrated after existing customers
+# started responding to events: 0.94 gave a 14.7 % web goods share instead of
+# 10 / 70 = 14.3 %).
+WEB_VALUE_REALISATION = 0.97
 _DC_WEIGHT_SPREAD = 0.5  # DC weights are 0.75 + 0.5 * u before normalising
 
 
@@ -60,6 +64,7 @@ class _State:
         self.cfg = world.cfg
         self.weights: dict[tuple, _Weights] = {}
         self.web_rate: dict[tuple, float] = {}
+        self.events: dict[tuple, object] = {}  # web event factors and event windows (pure in config/calendar)
         self.expected: dict[tuple, dict[int, float]] = {}
         self.retail_week: dict[tuple, dict[int, float]] = {}
         self.brand_event: dict[tuple, dict[str, float]] = {}
@@ -184,6 +189,102 @@ def web_order_rate_per_day(world, t: datetime) -> float:
         )
         _put(st.web_rate, key, base)
     return base * _scen_factor(world, "web_orders", t)
+
+
+def web_event_factor(world, d: date) -> float:
+    """Calendar event factor of the web channel on local date ``d`` (Black Friday, Christmas, ...)."""
+    st = _state(world)
+    key = ("ev", d)
+    hit = st.events.get(key)
+    if hit is None:
+        hit = _put(st.events, key, event_factor(st.cfg.seasonality, d, "web", None, world.ref.calendar))
+    return hit
+
+
+def repeat_lift(world, sku_ids, d: date) -> float:
+    """How strongly an existing customer is drawn to rebuy ``sku_ids`` on local date ``d``.
+
+    Web event factor times the mean promotion lift of the SKUs; only lifts
+    count (factors below 1, such as the Christmas Eve lull or a post-promo dip,
+    are read as 1: the repeat stream gets its post-event dip from pull-forward,
+    see ``customers``). Pure in config, calendar and the promotion calendar.
+    """
+    ev = max(1.0, web_event_factor(world, d))
+    ids = list(sku_ids)
+    if not ids:
+        return ev
+    f = promotions.day_factors(world, "web", d)
+    promo = sum(max(1.0, f.get(int(s), 1.0)) for s in ids) / len(ids)
+    return ev * promo
+
+
+@dataclass(frozen=True, slots=True)
+class DemandWindow:
+    """A stretch of local days in which web demand is lifted (event or promotion)."""
+
+    first: date
+    last: date  # inclusive
+    lift: float  # mean demand multiplier over the window
+    kind: str  # "black_friday" | "christmas" | "promotion"
+
+
+CHRISTMAS_RUNUP = ((12, 1), (12, 20))
+
+
+def _event_windows(world, year: int) -> list[DemandWindow]:
+    st = _state(world)
+    key = ("evwin", year)
+    hit = st.events.get(key)
+    if hit is None:
+        cal = world.ref.calendar
+        bf = cal.black_friday(year)
+        mon = bf - timedelta(days=bf.weekday())
+        days = [mon + timedelta(days=i) for i in range(8)]  # Black Friday week through Cyber Monday
+        bf_lift = sum(web_event_factor(world, x) for x in days) / len(days)
+        (m0, d0), (m1, d1) = CHRISTMAS_RUNUP
+        first = max(date(year, m0, d0), days[-1] + timedelta(days=1))
+        last = date(year, m1, d1)
+        xmas = [first + timedelta(days=i) for i in range((last - first).days + 1)]
+        x_lift = sum(web_event_factor(world, x) for x in xmas) / len(xmas) if xmas else 1.0
+        hit = [DemandWindow(days[0], days[-1], bf_lift, "black_friday")]
+        if xmas and x_lift > 1.0:
+            hit.append(DemandWindow(first, last, x_lift, "christmas"))
+        _put(st.events, key, hit)
+    return hit
+
+
+def demand_windows(
+    world, sku_ids, d0: date, d1: date, known_at: datetime | None = None
+) -> list[DemandWindow]:
+    """Web demand windows relevant to ``sku_ids`` that start within [d0, d1], by start date.
+
+    Calendar events (Black Friday week through Cyber Monday, Christmas run-up)
+    apply to every SKU and are always known. Web promotions count when they
+    cover at least one of the SKUs, actually lift demand (the Black Week code
+    promotion does not: the event factor carries it) and, with ``known_at``,
+    have been announced by then (nobody stocks up for a promotion they have
+    not heard of; this also keeps the result causal for live scenario
+    promotions). A pure function of config, calendar and the promotion
+    calendar, so it may be evaluated when a future intent is planned.
+    """
+    out: list[DemandWindow] = []
+    for y in range(d0.year, d1.year + 1):
+        out.extend(w for w in _event_windows(world, y) if d0 <= w.first <= d1)
+    ids = [int(s) for s in sku_ids]
+    if ids:
+        cat = world.ref.catalogue
+        skus = [cat.get(s) for s in ids]
+        for p in promotions.promotions_between(world, d0, d1, "web"):
+            first = world.local_date(p.start)
+            if not d0 <= first <= d1 or (known_at is not None and p.announced_at > known_at):
+                continue
+            if not any(promotions.is_eligible(p, s) for s in skus):
+                continue
+            lift = promotions.promo_lift(world, p)
+            if lift > 1.0:
+                out.append(DemandWindow(first, world.local_date(p.end), lift, "promotion"))
+    out.sort(key=lambda w: (w.first, w.last, w.kind))
+    return out
 
 
 def basket_stats(world) -> dict:
@@ -369,4 +470,8 @@ __all__ = [
     "retail_weekly_demand",
     "basket_stats",
     "dc_weights",
+    "web_event_factor",
+    "repeat_lift",
+    "demand_windows",
+    "DemandWindow",
 ]

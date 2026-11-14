@@ -17,12 +17,14 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from cpgsim.config import load_config
+from cpgsim.domain import billing as real_billing
 from cpgsim.domain import customers, subscriptions, web
 from cpgsim.domain.events import (
     CustomerRegistered,
     DeliveryCreated,
     DeliveryChanged,
     PaymentStatusChanged,
+    RefundChanged,
     RefundIssued,
     ReturnChanged,
     ReturnCreated,
@@ -30,6 +32,7 @@ from cpgsim.domain.events import (
     SalesDocCreated,
     SubscriptionChanged,
     SubscriptionCreated,
+    WebOrderLinesChanged,
     WebOrderPlaced,
     WebOrderStatusChanged,
     BillingDocCreated,
@@ -81,6 +84,8 @@ class Stubs:
         self.promo_fn = lambda world, t, sku_ids, rng: None
         self.outcome_fn = lambda d: "delivered"
         self.weights_cache: dict = {}
+        self.lift_fn = lambda d: 1.0
+        self.windows: list = []
 
     # demandplan
     def sku_weights(self, world, channel, d):
@@ -98,9 +103,21 @@ class Stubs:
     def web_order_rate_per_day(self, world, t):
         return world.cfg.channels.web.base_orders_per_day
 
+    def web_event_factor(self, world, d):
+        return 1.0
+
+    def repeat_lift(self, world, sku_ids, d):
+        return self.lift_fn(d)
+
+    def demand_windows(self, world, sku_ids, d0, d1, known_at=None):
+        return [w for w in self.windows if d0 <= w.first <= d1]
+
     # promotions
     def web_promo_for_basket(self, world, t, sku_ids, rng):
         return self.promo_fn(world, t, sku_ids, rng)
+
+    def active_web_promos(self, world, t):
+        return list(getattr(self, "active_promos", []))
 
     @staticmethod
     def is_eligible(promo, sku):
@@ -172,6 +189,10 @@ class Stubs:
         d.tracking_no = f"PB{did:010d}"
         for dl in d.lines:
             self.issue(world, dl.sku_id, dl.qty, did)
+        sdoc = world.store.mut("sales_doc", d.sales_doc_id)
+        by_no = {it.item_no: it for it in sdoc.items}
+        for dl in d.lines:
+            by_no[dl.sales_item_no].delivered_qty += dl.qty
         world.emit(DeliveryChanged(at=world.now, delivery_id=did, status="shipped",
                                    fields={"kind": "web", "tracking_no": d.tracking_no, "freight_cost_eur": 4.1,
                                            "shipped_at": world.now}))
@@ -202,15 +223,18 @@ class Stubs:
         out = []
         for dl in delivery.lines:
             it = by_item[dl.sales_item_no]
+            it.billed_qty += dl.qty
             out.append(BillingItem(
                 item_no=10 * (len(out) + 1), sku_id=dl.sku_id, qty=dl.qty,
                 net_value=round(it.net_value / it.qty * dl.qty, 2), tax=round(it.tax / it.qty * dl.qty, 2),
                 cost=round(it.cost / it.qty * dl.qty, 2), sales_item_no=dl.sales_item_no,
                 delivery_id=delivery.delivery_id, delivery_line_no=dl.line_no,
             ))
-        if include_shipping and sales_doc.shipping_net > 0:
-            out.append(BillingItem(item_no=900, sku_id=0, qty=1, net_value=sales_doc.shipping_net,
-                                   tax=sales_doc.shipping_tax, cost=0.0, sales_item_no=10,
+        fi = by_item.get(900)
+        if include_shipping and fi is not None and not fi.billed_qty:
+            fi.billed_qty = 1
+            out.append(BillingItem(item_no=900, sku_id=0, qty=1, net_value=fi.net_value,
+                                   tax=fi.tax, cost=0.0, sales_item_no=900,
                                    delivery_id=delivery.delivery_id))
         doc = BillingDoc(
             billing_id=world.next_id("billing"), doc_kind="invoice", sales_doc_id=sales_doc.sales_doc_id,
@@ -249,6 +273,8 @@ class Stubs:
 
     def clear(self, world, billing_id, amount=None):
         self.cleared.append((billing_id, amount))
+
+    refresh_header = staticmethod(real_billing.refresh_header)
 
     # scenarios
     def record_effect(self, world, scenario_id, window_id, entity_type, entity_id, effect, magnitude, detail=None):
@@ -304,12 +330,13 @@ class Harness:
         self.world.history_start = START
         self.stub_handlers = {"stub.ship": self.s.on_ship, "stub.deliver": self.s.on_deliver}
         mods = {
-            "demandplan": ["sku_weights", "web_order_rate_per_day"],
-            "promotions": ["web_promo_for_basket", "is_eligible"],
+            "demandplan": ["sku_weights", "web_order_rate_per_day", "repeat_lift", "demand_windows",
+                           "web_event_factor"],
+            "promotions": ["web_promo_for_basket", "is_eligible", "active_web_promos"],
             "masterdata": ["fx_rate", "std_cost"],
             "warehouse": ["available", "reserve", "unreserve", "issue", "receive_return"],
             "fulfilment": ["create_delivery", "cancel_delivery"],
-            "billing": ["create_invoice", "create_credit_memo", "clear"],
+            "billing": ["create_invoice", "create_credit_memo", "clear", "refresh_header"],
         }
         for name, attrs in mods.items():
             monkeypatch.setitem(sys.modules, f"cpgsim.domain.{name}", _module(f"cpgsim.domain.{name}", self.s, attrs))
@@ -484,7 +511,18 @@ def test_small_basket_pays_shipping_and_chf(monkeypatch):
     assert sd.currency == "CHF" and sd.fx_rate_eur == 1.05
     net, tax = split_gross(o.shipping_fee, h.cfg.channels.web.vat["CH"])
     assert (sd.shipping_net, sd.shipping_tax) == (net, tax)
-    assert [cond.ctype for cond in sd.items[0].conditions] == ["list_price", "shipping", "tax"]
+    assert [cond.ctype for cond in sd.items[0].conditions] == ["list_price", "tax"]
+    # the shipping charge is a freight item of its own: net values add up
+    fr = sd.items[-1]
+    assert (fr.item_no, fr.sku_id, fr.qty, fr.confirmed_qty, fr.item_type) == (900, 0, 1, 1, "freight")
+    assert (fr.net_value, fr.tax) == (net, tax)
+    assert [(c.ctype, c.amount) for c in fr.conditions] == [("shipping", net), ("tax", tax)]
+    assert round(sd.net_value + sum(i.tax for i in sd.items), 2) == o.total
+    for it in sd.items:
+        assert round(sum(c.amount for c in it.conditions if c.ctype != "tax"), 2) == it.net_value
+    # only the goods line is reserved and delivered
+    dc = h.of(DeliveryCreated)[0].delivery
+    assert [dl.sales_item_no for dl in dc.lines] == [10]
 
 
 def test_payment_failure_without_retry(monkeypatch):
@@ -522,6 +560,8 @@ def test_customer_cancel_before_pick(monkeypatch):
     sdc = h.of(SalesDocChanged)[-1]
     assert sdc.header == {"status": "rejected"}
     assert sdc.items[10]["rejection_reason"] == "customer_cancelled"
+    if o.shipping_fee > 0:  # the freight item is rejected with the goods
+        assert sdc.items[900] == {"rejection_reason": "customer_cancelled"}
     order = h.world.store.get("web_order", o.order_id)
     assert order.lines[0].cancelled_qty == 2
     assert h.s.reserved.get(o.lines[0].sku_id, 0) == 0
@@ -560,7 +600,11 @@ def test_backorder_cancelled_after_max_days(monkeypatch):
     assert order.lines[1].cancelled_qty == 2 and not order.backorder
     sd_changes = [e for e in h.of(SalesDocChanged) if 20 in e.items]
     assert sd_changes[-1].items[20]["rejection_reason"] == "out_of_stock"
-    assert h.statuses(o.order_id)[-1] == "delivered"
+    # the shipped part is delivered and billed, so the header completes now
+    assert sd_changes[-1].header.get("status") == "completed"
+    assert sd_changes[-1].header.get("delivery_status") == "full"
+    assert sd_changes[-1].header.get("billing_status") == "full"
+    assert h.statuses(o.order_id)[-2:] == ["shipped", "delivered"]
 
 
 def test_everything_out_of_stock_cancels_order(monkeypatch):
@@ -613,6 +657,11 @@ def test_return_lifecycle(monkeypatch):
     assert r.reason != "allergic_reaction"  # no dermocosmetic line in the parcel
     statuses = [e.status for e in h.of(ReturnChanged)]
     assert statuses == ["label_issued", "received", "inspected", "refunded"]
+    # the payment provider completes the refund a few days later
+    (done,) = h.of(RefundChanged)
+    issued = h.of(RefundIssued)[0]
+    assert done.refund_id == issued.refund.refund_id and done.status == "completed"
+    assert timedelta(0) < done.at - issued.at <= timedelta(days=7)
     assert len(h.s.received) == len(r.lines)
     ref = h.of(RefundIssued)[0].refund
     assert ref.reason == "return" and ref.return_id == r.return_id
@@ -667,8 +716,10 @@ def test_scenario_promo_recorded_and_free_shipping(monkeypatch):
     assert eff[5] == o.lines[0].discount
     assert eff[6]["free_shipping_waived"] == h.cfg.channels.web.shipping_fee_eur
     h.run_until(START + timedelta(days=1))
-    conds = [cond.ctype for cond in h.of(SalesDocCreated)[0].doc.items[0].conditions]
-    assert conds == ["list_price", "promo_discount", "tax"]
+    conds = h.of(SalesDocCreated)[0].doc.items[0].conditions
+    assert [cond.ctype for cond in conds] == ["list_price", "promo_discount", "tax"]
+    # the condition rate is the promotion's nominal rate, not amount / base
+    assert conds[1].rate == 0.25 and o.lines[0].discount_pct == 0.25
 
 
 def test_promo_not_applied_without_eligible_line(monkeypatch):
@@ -708,7 +759,9 @@ def test_repurchase_misses_lapse(monkeypatch):
     c.meta["chain"] = True
     web.place_order(h.world, c, [(_sku(h).sku_id, 1)], source="direct")
     h.run_until(START + timedelta(days=400))
-    cust = h.world.store.get("customer", c.customer_id)
+    # lapsed with no open order, intent or subscription: evicted from the store
+    assert not h.world.store.has("customer", c.customer_id)
+    cust = c
     assert cust.lapsed and cust.missed_intents == h.cfg.customers.max_missed_intents
     assert cust.intent_seq == h.cfg.customers.max_missed_intents
     assert cust.orders == 1
@@ -745,7 +798,8 @@ def test_subscription_lifecycle(monkeypatch):
     assert changes[-1].status == "cancelled" and changes[-1].next_order_at is None
     for e in changes[:-1]:
         assert e.next_order_at is not None
-    cust = h.world.store.get("customer", c.customer_id)
+    assert not h.world.store.has("customer", c.customer_id)  # churned, orders cleaned up: evicted
+    cust = c
     assert cust.subscription_id is None and cust.lapsed
     # no intents fire while subscribed: no repeat order outside the subscription after it started
     after = [e for e in h.of(WebOrderPlaced)
@@ -850,3 +904,94 @@ def test_restart_roundtrip_is_deterministic(monkeypatch):
     _roundtrip_state(b.world)
     b.run_with_arrivals(START + timedelta(days=40))
     assert fp(a, cut) == fp(b, cut)
+
+
+def test_backorder_cancel_after_partial_shipment(monkeypatch):
+    """A cut item keeps its delivered part; ERP header completes; shop times are business times."""
+    h = Harness(monkeypatch, **_happy_cfg())
+    a, b = _sku(h, "mass"), _sku(h, "derma")
+    h.s.stock[b.sku_id] = 1  # one of three units available, never replenished
+    c = h.customer()
+    o = web.place_order(h.world, c, [(a.sku_id, 1), (b.sku_id, 3)], source="direct")
+    h.run_until(START + timedelta(days=20))
+    order = h.world.store.get("web_order", o.order_id)
+    assert order.lines[1].cancelled_qty == 2 and not order.backorder
+    cancel = [e for e in h.of(SalesDocChanged) if 20 in e.items][-1]
+    # the reduced item carries its delivered/billed quantities so its statuses are recomputed
+    assert cancel.items[20] == {"confirmed_qty": 1, "delivered_qty": 1, "billed_qty": 1}
+    assert cancel.header.get("status") == "completed"
+    doc = h.world.store.get("sales_doc", order.sales_doc_id)
+    assert (doc.status, doc.delivery_status, doc.billing_status) == ("completed", "full", "full")
+    # shop: shipped and delivered effective at the parcel's goods issue and delivery scan
+    (dlv,) = [h.world.store.get("delivery", d) for d in order.delivery_ids]
+    by_status = {e.status: e for e in h.of(WebOrderStatusChanged) if e.order_id == o.order_id}
+    assert h.statuses(o.order_id)[-2:] == ["shipped", "delivered"]
+    assert by_status["shipped"].effective_at == dlv.shipped_at
+    assert by_status["delivered"].effective_at == dlv.delivered_at
+    assert by_status["delivered"].at > dlv.delivered_at  # recognised at the cancel
+
+
+def test_everything_out_of_stock_rejects_freight_item(monkeypatch):
+    h = Harness(monkeypatch, **_happy_cfg())
+    a = _sku(h, "mass", max_price=8.0)
+    h.s.stock[a.sku_id] = 0
+    o = web.place_order(h.world, h.customer(country="DE"), [(a.sku_id, 1)], source="direct")
+    assert o.shipping_fee > 0
+    h.run_until(START + timedelta(days=20))
+    last = h.of(SalesDocChanged)[-1]
+    assert last.header == {"status": "rejected"}
+    assert last.items[900] == {"confirmed_qty": 0, "rejection_reason": "out_of_stock"}
+
+
+def test_rejected_return(monkeypatch):
+    h = Harness(monkeypatch, payments={"auth_rate": 1.0},
+                fulfilment={"cancel_before_pick": 0.0, "return_rate": 1.0, "return_reject_rate": 1.0})
+    c = h.customer()
+    o = web.place_order(h.world, c, [(_sku(h, "mass", min_price=6.0).sku_id, 2)], source="direct")
+    h.run_until(START + timedelta(days=40))
+    assert [e.status for e in h.of(ReturnChanged)] == ["label_issued", "received", "inspected", "rejected"]
+    st = h.statuses(o.order_id)
+    assert st[-3:] == ["return_requested", "returned", "return_rejected"]
+    assert not h.of(RefundIssued) and not h.s.received
+    returned = [e.lines[1]["returned_qty"] for e in h.of(WebOrderLinesChanged)
+                if e.order_id == o.order_id and 1 in e.lines and "returned_qty" in e.lines[1]]
+    assert returned[-1] == 0 and max(returned) > 0
+    order = h.world.store.get("web_order", o.order_id)
+    assert order is None or order.lines[0].returned_qty == 0
+
+
+def test_remainder_ships_after_first_parcel_returned_to_sender(monkeypatch):
+    """Split order: the first parcel goes back to the sender, the backordered rest ships later.
+
+    The order still passes 'shipped' (shop shipped_at) before 'delivered'.
+    """
+    h = Harness(monkeypatch, **_happy_cfg())
+    a, b = _sku(h, "mass"), _sku(h, "derma")
+    h.s.stock[b.sku_id] = 0
+    h.s.outcome_fn = lambda d: "returned_to_sender" if d.seq_in_order == 1 else "delivered"
+    c = h.customer()
+    o = web.place_order(h.world, c, [(a.sku_id, 1), (b.sku_id, 1)], source="direct")
+    t = START
+    while "returned_to_sender" not in h.statuses(o.order_id):
+        t += timedelta(minutes=30)
+        assert t < START + timedelta(days=6)
+        h.run_until(t)
+    h.s.stock[b.sku_id] = 100
+    h.run_until(START + timedelta(days=12))
+    st = h.statuses(o.order_id)
+    # the first parcel is refunded (all that was captured so far) before the rest ships
+    assert st[st.index("returned_to_sender"):] == ["returned_to_sender", "refunded", "shipped", "delivered"], st
+    order = h.world.store.get("web_order", o.order_id)
+    assert [ln.shipped_qty for ln in order.lines] == [1, 1]
+
+
+def test_customer_return_keeps_its_status_when_the_rest_ships():
+    """Only a failed parcel is superseded by a later shipment, not a customer return or its refund."""
+    o = types.SimpleNamespace(status="partially_refunded", return_ids=[], meta={"outcomes": {"7": "returned_to_sender"}})
+    assert web._only_parcels_failed(o)
+    o.return_ids = [3]
+    assert not web._only_parcels_failed(o)
+    o.status = "lost"
+    assert web._only_parcels_failed(o)
+    o.status, o.return_ids, o.meta["outcomes"] = "refunded", [], {"7": "delivered"}
+    assert not web._only_parcels_failed(o)

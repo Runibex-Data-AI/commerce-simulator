@@ -17,6 +17,7 @@ from cpgsim.domain.events import (
     FxRatePublished,
     SalesDocChanged,
     SalesDocCreated,
+    ServiceMaterialListed,
     SkuListed,
     StandardCostRevised,
 )
@@ -34,7 +35,7 @@ from cpgsim.domain.model import (
 )
 from cpgsim.writers import keys
 from cpgsim.writers.base import Dispatcher, WriterContext
-from cpgsim.writers.erp import ErpWriter, fictional_vat_id
+from cpgsim.writers.erp import ErpWriter, _matkl, fictional_vat_id
 
 SCHEMAS = Path(__file__).resolve().parents[2] / "sql" / "schemas"
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -101,14 +102,17 @@ def web_doc():
         sales_doc_id=6, doc_type="web", sold_to="WEB-AT", ship_to="WEB-AT", currency="EUR",
         fx_rate_eur=1.0, created_at=T0, requested_date=date(2025, 3, 2), external_ref="4711",
         channel="web", order_id=4711,
-        items=[SalesItem(10, 1, qty=2, confirmed_qty=2, net_value=8.33, tax=1.67, cost=2.47,
+        items=[SalesItem(10, 1, qty=2, confirmed_qty=2, net_value=6.94, tax=1.39, cost=2.47,
                          conditions=[
                              Condition("list_price", 4.96, 9.92),
                              Condition("promo_discount", 0.25, -2.48),
                              Condition("promo_discount", 0.05, -0.5),
-                             Condition("shipping", 3.95, 3.29),
-                             Condition("tax", 0.2, 1.67),
-                         ])],
+                             Condition("tax", 0.2, 1.39),
+                         ]),
+               # shipping charge: freight item of its own (gross 3.95 at 20 %)
+               SalesItem(900, 0, qty=1, confirmed_qty=1, net_value=3.29, tax=0.66, cost=0.0,
+                         conditions=[Condition("shipping", 3.29, 3.29), Condition("tax", 0.2, 0.66)],
+                         item_type="freight")],
     )
 
 
@@ -141,9 +145,10 @@ def credit_memo():
 
 def master_events():
     return [
-        SkuListed(at=T0, sku=SKUS[1]),
+        SkuListed(at=T0, sku=SKUS[1], listed_on=date(2019, 11, 2)),
         SkuListed(at=T0, sku=SKUS[2]),
-        B2BAccountCreated(at=T0, account=ACCOUNTS["KRANZ"]),
+        ServiceMaterialListed(at=T0, service="shipping", listed_on=date(2016, 5, 1)),
+        B2BAccountCreated(at=T0, account=ACCOUNTS["KRANZ"], opened_on=date(2014, 2, 3)),
         B2BAccountCreated(at=T0, account=ACCOUNTS["KRANZ-DC1"]),
         B2BAccountCreated(at=T0, account=ACCOUNTS["WEB-AT"]),
         CustomerMaterialListed(at=T0, account_id="KRANZ", sku_id=1, customer_article="KR-778812"),
@@ -198,7 +203,15 @@ def test_material_master_rows():
     assert mara["brgew"] == 0.45 and mara["ntgew"] == 0.405 and mara["gewei"] == "KG"
     assert mara["ersda"] == date(2025, 3, 1)  # 23:30 Berlin
     assert mara["mstae"] == "Z1" and mara["mstde"] == date(2026, 6, 30)
-    assert b.table("erp.mara").pending(keys.matnr(1))["mstae"] == ""
+    m1 = b.table("erp.mara").pending(keys.matnr(1))
+    assert m1["mstae"] == ""
+    # seeded at history start: created on its listing date, changed (replicated) today
+    assert m1["ersda"] == date(2019, 11, 2) and m1["laeda"] == date(2025, 3, 1)
+    # the shipping service material: no stock, no valuation
+    srv = b.table("erp.mara").pending("SHIPPING")
+    assert (srv["mtart"], srv["meins"], srv["matkl"], srv["ersda"]) == ("DIEN", "LE", "KP9910", date(2016, 5, 1))
+    assert b.table("erp.makt").pending(("SHIPPING", "D"))["maktx"] == "Versandkosten"
+    assert b.table("erp.mbew").pending(("SHIPPING", "1000")) is None
     makt = b.table("erp.makt")
     assert makt.pending((keys.matnr(1), "D"))["maktx"] == "Velmora Hydra Balance Körperlotion 400 m"
     assert makt.pending((keys.matnr(1), "E"))["maktx"] == "Velmora Hydra Balance Body Lotion 400 ml"
@@ -216,6 +229,8 @@ def test_customer_master_rows():
     kna1 = d.batch.table("erp.kna1")
     kranz = kna1.pending("0000100001")
     assert kranz["ktokd"] == "Z001" and kranz["regio"] == "BY" and kranz["konzs"] == "DROGERIE_K"
+    assert kranz["erdat"] == date(2014, 2, 3)  # account opened long before the event
+    assert kna1.pending("0000100002")["erdat"] == date(2025, 3, 1)  # no opening date: event date
     assert kranz["stras"] == "Handelsweg 5" and kranz["sortl"] == "KRANZ"
     assert kranz["stceg"].startswith("DE") and len(kranz["stceg"]) == 11
     assert kna1.pending("0000100002")["ktokd"] == "Z002"
@@ -266,10 +281,50 @@ def test_sales_doc_rows_and_conditions():
     p2 = konv.pending((knumv, "000010", "030", "02"))
     assert p1["kschl"] == "ZPRO" and p1["kbetr"] == -25.0 and p1["kwert"] == -2.48
     assert p2["kbetr"] == -5.0
-    hd = konv.pending((knumv, "000010", "050", "01"))
+    assert konv.pending((knumv, "000010", "050", "01")) is None  # freight is not on the goods item
+    hd = konv.pending((knumv, "000900", "050", "01"))
     assert hd["kschl"] == "HD00" and hd["krech"] == "B" and hd["kbetr"] == 3.29
     tax = konv.pending((knumv, "000010", "900", "01"))
     assert tax["kschl"] == "MWST" and tax["kbetr"] == 20.0 and tax["kpein"] is None
+
+
+def test_web_freight_item_reconciles():
+    d, _ = make_dispatcher()
+    doc = web_doc()
+    d.dispatch(SalesDocCreated(at=T0, doc=doc))
+    b = d.batch
+    vbak = b.table("erp.vbak").pending("0010000006")
+    fr = b.table("erp.vbap").pending(("0010000006", "000900"))
+    assert (fr["matnr"], fr["pstyv"], fr["vrkme"], fr["meins"]) == ("SHIPPING", "TAD", "LE", "LE")
+    assert (fr["lgort"], fr["vstel"], fr["arktx"]) == ("", "", "Versandkosten")
+    assert (fr["gbsta"], fr["lfsta"], fr["fksta"]) == ("A", "", "A")  # not delivery-relevant
+    items = {k[1]: r for k, r in b.table("erp.vbap").inserts.items() if k[0] == "0010000006"}
+    assert vbak["netwr"] == round(sum(r["netwr"] for r in items.values()), 2) == 10.23
+    # per item: non-tax conditions add up to the item net value, MWST to its tax
+    for posnr, row in items.items():
+        conds = [r for k, r in b.table("erp.konv").inserts.items() if k[0] == keys.knumv_sales(6) and k[1] == posnr]
+        assert round(sum(c["kwert"] for c in conds if c["kschl"] != "MWST"), 2) == row["netwr"]
+        assert round(sum(c["kwert"] for c in conds if c["kschl"] == "MWST"), 2) == row["mwsbp"]
+    # billed on the first invoice -> complete; never a delivery status
+    ch = ErpWriter._item_changes({"billed_qty": 1, "confirmed_qty": 1}, {"billing_status": "partial"})
+    assert ch == {"kbmeng": 1, "zzfkimg": 1, "fksta": "C", "gbsta": "C"}
+    inv = BillingDoc(
+        billing_id=13, doc_kind="invoice", sales_doc_id=6, payer="WEB-AT", currency="EUR", fx_rate_eur=1.0,
+        billing_date=date(2025, 3, 4), created_at=T1, due_date=date(2025, 3, 4),
+        items=[BillingItem(10, 1, 2, 6.94, 1.39, 2.47, 10, delivery_id=9, delivery_line_no=1),
+               BillingItem(900, 0, 1, 3.29, 0.66, 0.0, 900, delivery_id=9)],
+    )
+    d.dispatch(BillingDocCreated(at=T1, doc=inv))
+    ship = b.table("erp.vbrp").pending(("0090000013", "000900"))
+    assert (ship["matnr"], ship["aupos"], ship["meins"]) == ("SHIPPING", "000900", "LE")
+    vbrk = b.table("erp.vbrk").pending("0090000013")
+    assert vbrk["netwr"] == vbak["netwr"]
+
+
+def test_material_group_mapping():
+    assert _matkl("gift_set") == "KP9010" and _matkl("Gift Sets") == "KP9010"
+    with pytest.raises(ValueError, match="material group"):
+        _matkl("no_such_category")
 
 
 def test_item_change_rules():
@@ -281,6 +336,9 @@ def test_item_change_rules():
     assert f({"delivered_qty": 4}, {"delivery_status": "partial"})["lfsta"] == "B"
     billed = f({"confirmed_qty": 4, "billed_qty": 4}, {})
     assert billed["fksta"] == "C" and billed["gbsta"] == "C"
+    # backordered remainder cut: the new target travels with delivered/billed -> complete
+    cut = f({"confirmed_qty": 1, "delivered_qty": 1, "billed_qty": 1}, {"status": "completed"})
+    assert (cut["kbmeng"], cut["lfsta"], cut["fksta"], cut["gbsta"]) == (1, "C", "C", "C")
     rej = f({"rejection_reason": "out_of_stock"}, {})
     assert rej == {"abgru": "Z2", "gbsta": "C", "lfsta": "", "fksta": ""}
     assert f({"rejection_reason": "something_new"}, {})["abgru"] == "ZZ"
@@ -420,7 +478,11 @@ def test_roundtrip_against_postgres():
                         ("000020", Decimal("6.000"), Decimal("6.000"), Decimal("6.000"),
                          "C", "C", "C")]
         assert one("SELECT count(*), sum(kwert) FROM erp.konv WHERE knumv = %s",
-                   keys.knumv_sales(6)) == (5, Decimal("11.90"))
+                   keys.knumv_sales(6)) == (6, Decimal("12.28"))
+        assert one("SELECT mtart, ersda FROM erp.mara WHERE matnr = 'SHIPPING'") == ("DIEN", date(2016, 5, 1))
+        # every web item joins to the material master, the freight item included
+        assert one("SELECT count(*) FROM erp.vbap p LEFT JOIN erp.mara m USING (matnr)"
+                   " WHERE p.vbeln = '0010000006' AND m.matnr IS NULL") == (0,)
         likp = one("SELECT kostk, wbstk, pdstk, wadat_ist, podat, potim, bolnr, zzfreight_eur,"
                    " zzpod_signer, is_deleted, updated_at FROM erp.likp WHERE vbeln = '0080000008'")
         assert likp == ("C", "C", "C", date(2025, 4, 2), date(2025, 4, 2), time(11, 0), "TA123",

@@ -46,7 +46,7 @@ from ..engine.queue import Event
 from ..engine.registry import arrival_source, bootstrap, handler
 from ..models import pricing
 from ..models.seasonality import category_factor
-from .events import PromotionDefined
+from .events import PromotionChanged, PromotionDefined
 from .model import Promotion, Sku
 
 RETAIL_ID_BASE = 60_000_000
@@ -421,6 +421,11 @@ def _scenario_recs(st: _State, world) -> list[_Rec]:
         free_ship = bool(spec.get("free_shipping", False))
         live = bool(spec.get("live", False))
         announced = start if live else start - timedelta(days=SCENARIO_ANNOUNCE_DAYS)
+        floor = _to_dt(world, spec.get("announce_not_before"))
+        if floor is not None and announced < floor:
+            # Window introduced by a config change behind the clock: announce
+            # as soon as it is known (an announcement in the past would be lost).
+            announced = floor
         label = brand or "Everything"
         name = f"{label} {_pct(discount)}% off" + (" + free shipping" if free_ship else "")
         promo = Promotion(
@@ -568,6 +573,11 @@ def web_promo_for_basket(world, t: datetime, sku_ids: list[int], rng) -> Promoti
         if best is None or key < best:
             best, best_p = key, p
     return best_p
+
+
+def promo_lift(world, promo: Promotion) -> float:
+    """Demand multiplier on the covered SKUs while ``promo`` runs (1.0 for Black Week)."""
+    return _lift(world, promo)
 
 
 def _is_black_week(promo: Promotion) -> bool:
@@ -781,6 +791,37 @@ def on_announce(world, ev) -> None:
     world.emit(PromotionDefined(at=world.now, promotion=_copy(p)))
 
 
+def scenario_window_closed(world, window_id: str) -> None:
+    """A live scenario window was closed (``scen.close``): end its announced promotion.
+
+    Called from the scenario manager's close handler, so it runs once, at the
+    close instant, in event order (restart safe). The calendar record already
+    carries the new end (the close is visible to ``scenario_promotions()``);
+    the stored Promotion and ``shop.promotions`` (``PromotionChanged``) follow.
+    A promotion withdrawn at the instant it started is marked withdrawn.
+    Promotions not announced yet need nothing: the announcement uses the
+    rebuilt record.
+    """
+    sc = world.scenarios
+    w = sc.window(window_id) if sc is not None else None
+    if w is None:
+        return
+    pid = SCENARIO_ID_BASE + int(w.index)
+    if not world.store.has("promotion", pid):
+        return
+    st = _state(world)
+    _scenario_recs(st, world)
+    rec = st.scen_by_id.get(pid)
+    p = world.store.get("promotion", pid)
+    withdrawn = rec is None
+    new_end = p.start if withdrawn else rec.promo.end
+    if new_end == p.end and not withdrawn:
+        return
+    p = world.store.mut("promotion", pid)
+    p.end = new_end
+    world.emit(PromotionChanged(at=world.now, promotion=_copy(p), withdrawn=withdrawn))
+
+
 __all__ = [
     "calendar",
     "promotions_between",
@@ -788,6 +829,7 @@ __all__ = [
     "web_promo_for_basket",
     "is_eligible",
     "demand_factor",
+    "promo_lift",
     "day_factors",
     "retail_promos",
     "retail_promos_starting",

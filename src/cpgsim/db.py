@@ -33,6 +33,7 @@ from typing import Any
 
 import psycopg
 from psycopg import sql
+from psycopg.conninfo import conninfo_to_dict
 
 log = logging.getLogger("cpgsim.db")
 
@@ -56,6 +57,9 @@ ENV_SQL_DIR = "CPGSIM_SQL_DIR"
 SEED_KEY = "seed"
 # Advisory lock serialising `sim scenario enable/disable` with the engine's override refresh.
 SCENARIO_LOCK = 0x6370_6773_696D  # "cpgsim"
+# Session-level advisory lock held by the engine (one ``Simulation``) for its
+# whole lifetime: one writer per database. ``sim reset`` refuses while it is held.
+WRITER_LOCK = 0x6370_6773_696D_57  # "cpgsimW"
 
 
 class DsnError(RuntimeError):
@@ -64,6 +68,10 @@ class DsnError(RuntimeError):
 
 class InitError(RuntimeError):
     """The database cannot be initialised with the current role or files."""
+
+
+class WriterLockHeld(RuntimeError):
+    """Another session (a running generator) holds :data:`WRITER_LOCK`."""
 
 
 # -- locations ---------------------------------------------------------------
@@ -118,9 +126,29 @@ def resolve_dsn(cli_dsn: str | None, cfg: Any = None, env: Mapping[str, str] | N
 
 
 def connect(dsn: str, **kwargs: Any) -> psycopg.Connection:
-    """Open a psycopg 3 connection with explicit transactions (autocommit off)."""
+    """Open a psycopg 3 connection with explicit transactions (autocommit off).
+
+    The session time zone is pinned to UTC (``-c TimeZone=UTC``, appended to
+    any ``options`` from the DSN or the caller unless they set ``TimeZone``
+    themselves), so ``timestamptz`` values come back in UTC whatever the
+    server, database or role default is. The engine also normalises what it
+    reads; this is defence in depth.
+    """
     kwargs.setdefault("application_name", "cpgsim")
+    kwargs["options"] = session_options(dsn, kwargs.get("options"))
     return psycopg.connect(dsn, autocommit=False, **kwargs)
+
+
+def session_options(dsn: str, extra: str | None = None) -> str:
+    """libpq ``options`` for :func:`connect`: the DSN's and ``extra`` plus ``TimeZone=UTC``."""
+    try:
+        base = conninfo_to_dict(dsn).get("options") or ""
+    except psycopg.ProgrammingError:
+        base = ""
+    opts = " ".join(o for o in (str(base).strip(), (extra or "").strip()) if o)
+    if "timezone" not in opts.lower():
+        opts = f"{opts} -c TimeZone=UTC".strip()
+    return opts
 
 
 def wait_for_db(
@@ -363,8 +391,96 @@ def data_tables(conn: psycopg.Connection) -> list[str]:
     return [f"{s}.{t}" for s, t in rows if f"{s}.{t}" not in KEEP_ON_RESET]
 
 
+def writer_lock_holders(conn: psycopg.Connection) -> list[int]:
+    """Backend pids holding :data:`WRITER_LOCK` (other than this session)."""
+    key = WRITER_LOCK & 0xFFFF_FFFF_FFFF_FFFF
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted"
+            " AND classid = %s AND objid = %s AND objsubid = 1 AND pid <> pg_backend_pid()"
+            " AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+            " ORDER BY pid",
+            ((key >> 32) & 0xFFFF_FFFF, key & 0xFFFF_FFFF),
+        )
+        return [r[0] for r in cur.fetchall()]
+
+
+def acquire_writer_lock(conn: psycopg.Connection, wait: float = 0.0, poll: float = 1.0) -> None:
+    """Take the session-level writer lock, waiting up to ``wait`` seconds.
+
+    Session-level advisory locks survive commits and rollbacks and are released
+    when the session ends (process exit, crash, lost connection). Raises
+    :class:`WriterLockHeld` when another session keeps it.
+    """
+    deadline = time.monotonic() + max(0.0, wait)
+    while True:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s)", (WRITER_LOCK,))
+            ok = bool(cur.fetchone()[0])  # type: ignore[index]
+        conn.commit()
+        if ok:
+            return
+        if time.monotonic() >= deadline:
+            holders = writer_lock_holders(conn)
+            conn.commit()
+            who = f" (backend pid {', '.join(map(str, holders))})" if holders else ""
+            raise WriterLockHeld(
+                f"another generator is running against this database{who};"
+                " only one engine may write at a time (stop it first, e.g. `docker compose stop generator`)"
+            )
+        time.sleep(min(poll, max(0.05, deadline - time.monotonic())))
+
+
+def release_writer_lock(conn: psycopg.Connection) -> None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_unlock(%s)", (WRITER_LOCK,))
+    conn.commit()
+
+
+def _reset_lock(conn: psycopg.Connection, force: bool, wait: float) -> None:
+    """Take WRITER_LOCK for the reset transaction, or refuse (see :func:`reset_data`)."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_xact_lock(%s)", (WRITER_LOCK,))
+        if cur.fetchone()[0]:  # type: ignore[index]
+            return
+    holders = writer_lock_holders(conn)
+    if not force:
+        who = f" (backend pid {', '.join(map(str, holders))})" if holders else ""
+        raise WriterLockHeld(
+            f"a generator is running against this database{who}; stop it first"
+            " (`docker compose stop generator`, then `docker compose run --rm generator reset --yes`)"
+            " or pass --force to terminate its connection"
+        )
+    with conn.cursor() as cur:
+        for pid in holders:
+            try:
+                cur.execute("SAVEPOINT cpgsim_term")
+                cur.execute("SELECT pg_terminate_backend(%s)", (pid,))
+                cur.execute("RELEASE SAVEPOINT cpgsim_term")
+                log.warning("terminated the generator session (backend pid %s)", pid)
+            except psycopg.errors.InsufficientPrivilege:
+                cur.execute("ROLLBACK TO SAVEPOINT cpgsim_term")
+                log.warning("not allowed to terminate backend pid %s", pid)
+        deadline = time.monotonic() + wait
+        while True:
+            cur.execute("SELECT pg_try_advisory_xact_lock(%s)", (WRITER_LOCK,))
+            if cur.fetchone()[0]:  # type: ignore[index]
+                return
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.2)
+    # Still held: go ahead. The engine fences every commit on sim.clock, so a
+    # surviving writer fails at its next commit instead of writing into the
+    # emptied database.
+    log.warning("writer lock still held; resetting anyway (--force)")
+
+
 def reset_data(
-    conn: psycopg.Connection, seed: int | None = None, clear_seed: bool = False
+    conn: psycopg.Connection,
+    seed: int | None = None,
+    clear_seed: bool = False,
+    force: bool = False,
+    force_wait: float = 10.0,
 ) -> list[str]:
     """Empty every simulated table (business, sim, truth), keeping the structure.
 
@@ -372,8 +488,14 @@ def reset_data(
     next backfill starts a fresh simulation. ``sim.settings`` is kept; ``seed``
     stores a new seed there (``clear_seed`` removes it, so the config seed
     applies again). Returns the truncated tables. Commits.
+
+    Refuses with :class:`WriterLockHeld` while a generator holds
+    :data:`WRITER_LOCK` (a reset under a running engine would leave a hybrid of
+    two timelines). ``force`` terminates the generator's session first and
+    resets even if the lock cannot be taken.
     """
     try:
+        _reset_lock(conn, force, force_wait)
         tables = data_tables(conn)
         with conn.cursor() as cur:
             if tables:

@@ -5,10 +5,17 @@
 # the `scenarios:` list of the config.
 id: promo_margin_trap
 description: >
-  A web promotion grows volume but loses money: a deep discount plus free
-  shipping on one brand pushes baskets below break-even once shipping and
-  returns are costed. Orders up, contribution margin negative (shop, wms, erp, mkt).
+  A web promotion grows volume but loses money: 25 % off plus free shipping
+  with no minimum on one brand. Orders per day more than double (regular
+  customers buy more, deal-site shoppers arrive), baskets shrink (no threshold
+  top-ups, cherry-picking, single cheap deal items), and once freight, cost of
+  goods and returns are costed the promoted orders' contribution is negative
+  in aggregate: deal-seeker orders lose about EUR 2.7 each, regular promoted
+  orders barely break even (shop, wms, erp).
 params:
-  brand: Velmora             # brand on promotion
-  discount_pct: 0.25         # 0.25 = 25 % off
-  free_shipping: true        # free shipping on baskets with a promoted line
+  brand: Velmora                 # brand on promotion
+  discount_pct: 0.25             # 0.25 = 25 % off
+  free_shipping: true            # free shipping, no minimum, on baskets with a promoted line
+  deal_seeker_share: 1.0         # extra deal-site orders per day, share of base_orders_per_day
+  deal_seeker_return_rate: 0.15  # return probability of a deal seeker's parcel (normal: 0.03)
+  cherry_pick_share: 0.8         # share of mixed baskets cut down to the promoted brand's lines

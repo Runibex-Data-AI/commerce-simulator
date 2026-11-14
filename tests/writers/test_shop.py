@@ -13,6 +13,7 @@ from cpgsim.domain.events import (
     PaymentRecorded,
     PaymentStatusChanged,
     PromotionDefined,
+    RefundChanged,
     RefundIssued,
     SubscriptionChanged,
     SubscriptionCreated,
@@ -30,6 +31,7 @@ from cpgsim.domain.model import (
     Subscription,
     WebOrder,
 )
+from cpgsim.models.pricing import split_gross
 from cpgsim.writers import keys
 from cpgsim.writers.base import Dispatcher, WriterContext
 from cpgsim.writers.shop import ShopWriter, included_tax
@@ -125,6 +127,36 @@ def test_included_tax():
     assert included_tax(Decimal("119.00"), Decimal("0.19")) == Decimal("19.00")
     assert included_tax(Decimal("3.49"), Decimal("0.19")) == Decimal("0.56")
     assert included_tax(Decimal("0.00"), Decimal("0.19")) == Decimal("0.00")
+    # half-cent net amounts: net rounds half-up, tax is the remainder (like the ERP item)
+    assert included_tax(Decimal("3.45"), Decimal("0.20")) == Decimal("0.57")
+    assert included_tax(Decimal("4.95"), Decimal("0.20")) == Decimal("0.82")
+    assert included_tax(Decimal("34.95"), Decimal("0.20")) == Decimal("5.82")
+
+
+def test_included_tax_matches_domain_split():
+    """Shop and ERP use one net/tax split: no one-cent disagreements."""
+    for cents in range(1, 20001, 7):
+        gross = cents / 100
+        for vat in (0.19, 0.20, 0.081):
+            _, tax = split_gross(gross, vat)
+            assert included_tax(Decimal(str(gross)), Decimal(str(vat))) == Decimal(str(tax)).quantize(Decimal("0.01"))
+
+
+def test_late_status_uses_effective_time_and_refund_completion():
+    d, _ = make_dispatcher()
+    d.dispatch(WebOrderStatusChanged(at=T3, order_id=5, status="shipped", effective_at=T1))
+    d.dispatch(WebOrderStatusChanged(at=T3, order_id=5, status="delivered", effective_at=T2))
+    ch = d.batch.table("shop.orders").updates[(keys.shop_order_id(SEED, 5),)]
+    assert ch["shipped_at"] == T1 and ch["delivered_at"] == T2 and ch["status"] == "delivered"
+    assert ch["updated_at"] == T3
+    d.dispatch(WebOrderStatusChanged(at=T3, order_id=6, status="return_rejected"))
+    ch = d.batch.table("shop.orders").updates[(keys.shop_order_id(SEED, 6),)]
+    assert ch["return_rejected_at"] == T3
+    d.dispatch(RefundChanged(at=T3, refund_id=4, status="completed"))
+    rc = d.batch.table("shop.refunds").updates[(keys.shop_refund_id(SEED, 4),)]
+    assert rc["status"] == "completed" and rc["completed_at"] == T3 and rc["updated_at"] == T3
+    with pytest.raises(ValueError, match="refund status"):
+        d.dispatch(RefundChanged(at=T3, refund_id=4, status="bogus"))
 
 
 def test_customer_and_default_address():
@@ -325,6 +357,11 @@ def test_write_and_update_roundtrip(conn):
     with conn.transaction():
         d.batch.flush(conn.cursor())
     d.batch.clear()
+    T4 = T3 + timedelta(days=2)
+    d.dispatch(RefundChanged(at=T4, refund_id=4, status="completed"))
+    with conn.transaction():
+        d.batch.flush(conn.cursor())
+    d.batch.clear()
 
     cur = conn.cursor()
     oid = keys.shop_order_id(SEED, 5)
@@ -350,9 +387,10 @@ def test_write_and_update_roundtrip(conn):
     assert cur.fetchall() == [("partially_refunded", T1, T2, Decimal("15.98"), T3,
                                Decimal("7.99"), "Paylance", "PL-0001")]
 
-    cur.execute("SELECT payment_id::text, amount, reason, status FROM shop.refunds")
+    cur.execute("SELECT payment_id::text, amount, reason, status, issued_at, completed_at, updated_at"
+                " FROM shop.refunds")
     assert cur.fetchall() == [(keys.shop_payment_id(SEED, 9), Decimal("7.99"), "return",
-                               "issued")]
+                               "completed", T3, T3 + timedelta(days=2), T3 + timedelta(days=2))]
 
     cur.execute("SELECT status, skus, quantities, next_order_at, cancelled_at"
                 " FROM shop.subscriptions")

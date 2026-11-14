@@ -15,6 +15,7 @@ Which writer consumes what (phase 1):
 Event                          Rows
 =============================  ===============================================
 SkuListed                      erp.mara, erp.makt, erp.mbew
+ServiceMaterialListed          erp.mara, erp.makt (non-stock service material)
 StandardCostRevised            erp.mbew (update)
 B2BAccountCreated              erp.kna1
 CustomerMaterialListed         erp.knmt
@@ -22,12 +23,14 @@ FxRatePublished                erp.tcurr
 CustomerRegistered             shop.customers, shop.addresses
 CustomerAnonymised             shop.customers, shop.addresses (phase 2 chaos)
 PromotionDefined               shop.promotions (web promos only)
+PromotionChanged               shop.promotions (update of ends_at; soft delete if withdrawn)
 WebOrderPlaced                 shop.orders, shop.order_lines, shop.promo_redemptions
 WebOrderStatusChanged          shop.orders (update)
 WebOrderLinesChanged           shop.order_lines (update)
 PaymentRecorded                shop.payments
 PaymentStatusChanged           shop.payments (update)
 RefundIssued                   shop.refunds
+RefundChanged                  shop.refunds (update)
 SubscriptionCreated            shop.subscriptions
 SubscriptionChanged            shop.subscriptions (update)
 SalesDocCreated                erp.vbak, erp.vbap, erp.konv
@@ -81,6 +84,17 @@ class DomainEvent:
 @dataclass(slots=True)
 class SkuListed(DomainEvent):
     sku: Sku
+    # business creation date of the material record (listing date); can lie
+    # before ``at`` for materials seeded at history start
+    listed_on: date | None = None
+
+
+@dataclass(slots=True)
+class ServiceMaterialListed(DomainEvent):
+    """A non-stock service material (never reserved, picked or delivered)."""
+
+    service: str  # neutral service key: shipping
+    listed_on: date | None = None  # business creation date (before ``at`` when seeded)
 
 
 @dataclass(slots=True)
@@ -93,6 +107,8 @@ class StandardCostRevised(DomainEvent):
 @dataclass(slots=True)
 class B2BAccountCreated(DomainEvent):
     account: B2BAccount
+    # business account-opening date; before ``at`` for accounts seeded at history start
+    opened_on: date | None = None
 
 
 @dataclass(slots=True)
@@ -137,6 +153,14 @@ class PromotionDefined(DomainEvent):
 
 
 @dataclass(slots=True)
+class PromotionChanged(DomainEvent):
+    """An announced promotion changed (phase 1: a live scenario promotion ended early)."""
+
+    promotion: Promotion  # with its new end
+    withdrawn: bool = False  # ended at the instant it started: never ran
+
+
+@dataclass(slots=True)
 class WebOrderPlaced(DomainEvent):
     order: WebOrder
     customer: Customer
@@ -149,6 +173,11 @@ class WebOrderStatusChanged(DomainEvent):
     order_id: int
     status: str  # WEB_ORDER_STATUSES
     reason: str | None = None
+    # business time of the transition when it is recognised later than it
+    # happened (e.g. 'delivered' at the carrier's scan, recognised when the
+    # backordered remainder is cancelled). Writers use it for the status
+    # timestamp column; ``at`` stays the change time (updated_at).
+    effective_at: datetime | None = None
 
 
 @dataclass(slots=True)
@@ -175,6 +204,12 @@ class PaymentStatusChanged(DomainEvent):
 @dataclass(slots=True)
 class RefundIssued(DomainEvent):
     refund: Refund
+
+
+@dataclass(slots=True)
+class RefundChanged(DomainEvent):
+    refund_id: int
+    status: str  # REFUND_STATUSES (completed: paid out by the payment provider)
 
 
 @dataclass(slots=True)

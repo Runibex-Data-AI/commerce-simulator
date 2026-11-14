@@ -1,13 +1,14 @@
 # cpg-commerce-simulator: Postgres + generator.
 #
-#   cp .env.example .env     # set the passwords
+#   cp .env.example .env     # fill in the three passwords (>= 16 chars, all different)
 #   docker compose up -d
 #
 # On first start Postgres creates a self-signed certificate and the roles
 # sim_writer and bi_reader; the generator then runs `sim init`, backfills
 # history_months of data and keeps running live (`sim start`).
-# Only Postgres is published (5432, SSL required). Restrict access to it with
-# a firewall to the BI tool's outbound IPs.
+# Only Postgres is published (5432, SSL required; only bi_reader may connect
+# from outside the Compose network). Restrict access to it with a firewall to
+# the BI tool's outbound IPs, or bind it with CPGSIM_PG_BIND.
 
 name: cpgsim
 
@@ -43,7 +44,7 @@ services:
       - ./docker/postgres/initdb:/docker-entrypoint-initdb.d:ro
       - ./sql/roles.sql:/cpgsim/roles.sql:ro
     ports:
-      - "${CPGSIM_PG_PORT:-5432}:5432"
+      - "${CPGSIM_PG_BIND:-0.0.0.0}:${CPGSIM_PG_PORT:-5432}:5432"
     shm_size: 256mb
     healthcheck:
       # TCP on purpose: during first-start initialisation the server listens on
