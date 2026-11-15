@@ -156,7 +156,7 @@ Demand is generated bottom-up, from consumers and retailers behaving plausibly, 
 
 **Customers.** New web customers arrive by acquisition channel (organic search, paid search, social, influencer codes, marketplace spillover), with volume driven by `mkt` spend. Each purchase schedules a repurchase intent when the product would run out, drawn from a gamma distribution around the pack size's usage time (a 400 ml body lotion about 60 days). Each intent converts with a probability that decays with the number of intents missed, so customers lapse naturally. About 8% of repeat customers take a subscription.
 
-**Baskets.** Basket size is 1 plus a Poisson draw (mean 1.4). Lines are picked by SKU popularity, then adjusted by affinity pairs (cleanser with moisturiser, sun cream with after-sun). A free-shipping threshold (default EUR 29) makes basket values bunch just above it.
+**Baskets.** Basket size is 1 plus a Poisson draw (mean 1.4). Lines are picked by SKU popularity, then adjusted by affinity pairs (cleanser with moisturiser, sun cream with after-sun). A free-shipping threshold (default EUR 29, fee EUR 4.95 below it; Austria EUR 49 and EUR 6.95, because parcels from the German warehouse to Austria cost more; Switzerland CHF 35 and CHF 7.90) makes basket values bunch just above it.
 
 **Payments.** Defaults for Germany: PayPal 38%, invoice or buy-now-pay-later 27%, card 20%, direct debit 10%, other 5%. Austria and Switzerland shift somewhat towards card.
 
@@ -238,7 +238,7 @@ company:
   brands: [Velmora, Cutara, Sorell]
   catalogue_size: 180
 channels:
-  web:            { base_orders_per_day: 315, free_shipping_eur: 29 }
+  web:            { base_orders_per_day: 315, free_shipping_eur: 29, free_shipping_by_country: { AT: 49 } }
   drogerie_kranz: { share: 0.35, order_cycle_days: 7, dcs: 3 }
   mylo:           { share: 0.25, order_cycle_days: 7, dcs: 2 }
   shopnova:       { share: 0.20, model: 1p }

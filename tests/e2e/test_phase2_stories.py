@@ -95,7 +95,7 @@ def test_paid_channel_payback_measures_every_paid_channel(run):
     # rule itself is asserted at default volume in test_phase2_acceptance).
     conn, cfg = run
     freight = p2.outbound_freight_eur(cfg)
-    assert freight == pytest.approx({"DE": 4.055, "AT": 4.255, "CH": 9.68})
+    assert freight == pytest.approx({"DE": 4.055, "AT": 5.975, "CH": 9.68})
     pb = p2.paid_channel_payback(conn, cfg, START, UNTIL, horizon_days=60)
     assert set(pb) == set(p2.PAID_CHANNELS)
     for p in pb.values():

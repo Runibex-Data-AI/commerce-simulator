@@ -558,7 +558,7 @@ def is_eligible(promo: Promotion, sku: Sku) -> bool:
     return True
 
 
-def web_promo_for_basket(world, t: datetime, sku_ids: list[int], rng) -> Promotion | None:
+def web_promo_for_basket(world, t: datetime, sku_ids: list[int], rng, country: str | None = None) -> Promotion | None:
     """Best applicable web promotion for a basket, or None.
 
     Automatic promotions apply whenever at least one basket SKU is eligible.
@@ -566,7 +566,9 @@ def web_promo_for_basket(world, t: datetime, sku_ids: list[int], rng) -> Promoti
     draw from ``rng`` per applicable code promotion, in promo id order. Among
     usable promotions the one with the largest value wins (discount times the
     eligible SKUs' RRP plus the shipping fee if it waives shipping; ties to the
-    lower promo id).
+    lower promo id). Values are in EUR list terms: the waived fee is the
+    customer ``country``'s fee for a EUR country, else (CH, or no country)
+    ``shipping_fee_eur``.
     """
     promos = active_web_promos(world, t)
     if not promos or not sku_ids:
@@ -575,7 +577,8 @@ def web_promo_for_basket(world, t: datetime, sku_ids: list[int], rng) -> Promoti
     cat = world.ref.catalogue
     skus = [cat.get(s) for s in sku_ids]
     share = cfg.promotions.code_redemption_share
-    fee = cfg.channels.web.shipping_fee_eur
+    w = cfg.channels.web
+    fee = w.shipping_fee(country) if country is not None and country != "CH" else w.shipping_fee_eur
     best: tuple[float, int] | None = None
     best_p: Promotion | None = None
     for p in sorted(promos, key=lambda p: p.promo_id):

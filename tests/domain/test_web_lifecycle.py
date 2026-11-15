@@ -115,7 +115,7 @@ class Stubs:
         return [w for w in self.windows if d0 <= w.first <= d1]
 
     # promotions
-    def web_promo_for_basket(self, world, t, sku_ids, rng):
+    def web_promo_for_basket(self, world, t, sku_ids, rng, country=None):
         return self.promo_fn(world, t, sku_ids, rng)
 
     def active_web_promos(self, world, t):
@@ -503,6 +503,25 @@ def test_happy_path_order_lifecycle_and_cleanup(monkeypatch):
     assert h.world.store.count("billing") == 0
 
 
+def test_shipping_fee_and_threshold_per_country(monkeypatch):
+    """Austria pays its own fee and threshold (EUR); Germany and Switzerland their currency's."""
+    h = Harness(monkeypatch, **_happy_cfg())
+    w = h.cfg.channels.web
+    assert (w.shipping_fee("DE"), w.free_shipping_threshold("DE")) == (w.shipping_fee_eur, w.free_shipping_eur)
+    assert (w.shipping_fee("CH"), w.free_shipping_threshold("CH")) == (w.shipping_fee_chf, w.free_shipping_chf)
+    assert (w.shipping_fee("AT"), w.free_shipping_threshold("AT")) == (
+        w.shipping_fee_by_country["AT"], w.free_shipping_by_country["AT"])
+    assert w.shipping_fee("AT") > w.shipping_fee_eur and w.free_shipping_threshold("AT") > w.free_shipping_eur
+    # a basket between the German and the Austrian threshold ships free to Germany, not to Austria
+    lines, _ = _basket_between(h, w.free_shipping_eur, w.free_shipping_threshold("AT"), "EUR")
+    de = web.place_order(h.world, h.customer(country="DE", acquisition="direct"), lines, source="direct")
+    at = web.place_order(h.world, h.customer(country="AT", acquisition="direct"), lines, source="direct")
+    assert de.shipping_fee == 0.0 and at.currency == "EUR" and at.shipping_fee == w.shipping_fee("AT")
+    lines, _ = _basket_between(h, w.free_shipping_threshold("AT"), 1000.0, "EUR")
+    at = web.place_order(h.world, h.customer(country="AT", acquisition="direct"), lines, source="direct")
+    assert at.shipping_fee == 0.0
+
+
 def test_small_basket_pays_shipping_and_chf(monkeypatch):
     h = Harness(monkeypatch, **_happy_cfg())
     c = h.customer(country="CH")
@@ -866,7 +885,8 @@ def test_influencer_discount_never_costs_the_free_shipping(monkeypatch):
 
     h = Harness(monkeypatch, **_happy_cfg())
     w = h.cfg.channels.web
-    for country, threshold in (("DE", w.free_shipping_eur), ("CH", w.free_shipping_chf)):
+    for country in ("DE", "AT", "CH"):
+        threshold = w.free_shipping_threshold(country)
         currency = web.currency_of(country)
         lines, listed = _basket_between(h, threshold, round(threshold / 0.85, 2) - 0.01, currency)
         c = h.customer(country=country, acquisition="influencer")

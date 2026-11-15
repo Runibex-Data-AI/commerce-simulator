@@ -265,6 +265,13 @@ UTC, statuses as lower-case words (the neutral vocabulary), money as
   `returned` order to `return_rejected` (no refund). Refunds are `issued`, then
   `completed` (`RefundChanged`) when the payment provider has paid out, by
   payment method hours to a week later (`returns.REFUND_COMPLETION_DAYS`).
+* Shipping fee and free-shipping threshold are the customer country's
+  (`WebCfg.shipping_fee(country)` / `free_shipping_threshold(country)`): the
+  per-currency values (EUR 4.95 below EUR 29, CHF 7.90 below CHF 35) unless
+  `channels.web.shipping_fee_by_country` / `free_shipping_by_country` set the
+  country's own (Austria EUR 6.95 below EUR 49). The threshold top-up, the
+  free-shipping waiver and its value when promotions compete use the same
+  per-country terms.
 * Promotions: one per order (`orders.promotion_id`, `promo_code` for code
   promotions, one `promo_redemptions` row). The best calendar promotion for the
   basket wins (`promotions.web_promo_for_basket`). A customer acquired with an
@@ -478,25 +485,32 @@ follows from the configured spend response, not from a planted story, and
 truth does not record it.
 
 Paid media defaults (`marketing.paid`) are calibrated against the measured
-contribution per web order of paid-channel customers, about EUR 12.9 / 9.7 /
-9.0 for a customer's orders 1 / 2 / 3 (cumulative 12.9 / 22.7 / 31.7), and
-the 12-month value per customer over the acquisition period (about EUR 24.5
-paid search, 24.2 social, 21.8 influencer after the first-order discount,
+contribution per web order of paid-channel customers, about EUR 13.0 / 9.8 /
+8.9 for a customer's orders 1 / 2 / 3 (cumulative 13.0 / 22.9 / 31.8), and
+the 12-month value per customer over the acquisition period (about EUR 24.8
+paid search, 24.1 social, 22.7 influencer after the first-order discount,
 planted cohort left out). Paid search CAC EUR 19, social EUR 20, influencer
 EUR 13 (plus the commission, about 14 % of influencer spend). Realised CAC
-over the acquisition period is about EUR 20.5 / 21.6 / 17.3, some 8 % above
+over the acquisition period is about EUR 20.4 / 21.8 / 17.4, some 8 % above
 `cac_eur` for search and social because that period (January to October)
 lacks the cheap customers of the fourth quarter; over the whole run it is
-about EUR 19.1 / 20.7 / 15.7. Each channel pays back with the customer's
-second order, by 12 to 26 %, and by at least 9 % in every country
-(Austria 12 to 19 %).
-Austrian parcels cost about EUR 0.20 more than German ones
-(`carriers.parcel.*.cost_eur`); the shop charges the same EUR fee and
-free-shipping threshold in both, so Austrian orders earn close to German
-ones. CPM and CTR (search 13.8 / 3.5 %, social 4.2 / 1.5 %, influencer
-4.6 / 1.5 %) are set so that the clicks implied by spend match the configured
-session conversion rates (`conversion_rates`, social 2.0 %): paid sessions =
-clicks x U(0.80, 0.92) + 15 % of the expected sessions as organic.
+about EUR 19.1 / 20.7 / 15.8. Each channel pays back with the customer's
+second order, by 11 to 30 %, and by at least 7 % in every country
+(Austria 13 to 28 %).
+Parcels from the German warehouse to Austria cost about EUR 1.90 more than
+domestic ones (`carriers.parcel.*.cost_eur`, carrier-share weighted EUR 5.98
+against 4.06), so the shop charges Austria its own shipping fee and
+free-shipping threshold (`channels.web.shipping_fee_by_country` /
+`free_shipping_by_country`: EUR 6.95 below EUR 49, against EUR 4.95 below
+EUR 29 in Germany), as German D2C shops commonly do. Over 90 % of Austrian
+orders pay the fee (Germany about 72 %), and Austrian customers pay back like
+German ones. The Austrian parcel rates are EUR 0.80 below the 6.90 / 6.40 /
+7.20 they had before (contract rates of a volume shipper): with those, even
+this fee and threshold left Austrian social customers at break-even. CPM and
+CTR (search 13.8 / 3.5 %, social 4.2 / 1.5 %, influencer 4.6 / 1.5 %) are set
+so that the clicks implied by spend match the configured session conversion
+rates (`conversion_rates`, social 2.0 %): paid sessions = clicks x
+U(0.80, 0.92) + 15 % of the expected sessions as organic.
 
 ### `truth`
 

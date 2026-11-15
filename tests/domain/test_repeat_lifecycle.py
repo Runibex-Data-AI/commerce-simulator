@@ -165,11 +165,11 @@ def test_no_threshold_topup_when_basket_ships_free(monkeypatch):
     qty = int((threshold - 3.0) // mass.rrp_eur)  # just below the threshold, inside the top-up band
     ids, _ = h.s.sku_weights(h.world, "web", d)
     lines = [[mass.sku_id, qty]]
-    web._topup(h.world, h.world.rng("t.tu", 1), d, "EUR", lines, ids)
+    web._topup(h.world, h.world.rng("t.tu", 1), d, "DE", lines, ids)
     assert len(lines) == 2  # topped up normally
     h.s.active_promos = [_fs_promo(mass.brand)]
     lines = [[mass.sku_id, qty]]
-    web._topup(h.world, h.world.rng("t.tu", 1), d, "EUR", lines, ids)
+    web._topup(h.world, h.world.rng("t.tu", 1), d, "DE", lines, ids)
     assert lines == [[mass.sku_id, qty]]
     other = _sku(h, "derma")
     lines = [[other.sku_id, 1]]

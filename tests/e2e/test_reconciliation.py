@@ -120,8 +120,8 @@ def test_influencer_first_order_discount_one_code_per_order(run):
     fee_added = run.execute("""
         SELECT count(*) FROM shop.orders o JOIN shop.promotions p ON p.id = o.promotion_id
         WHERE p.code IN (SELECT code FROM mkt.influencer_codes) AND o.shipping_fee > 0
-          AND o.items_subtotal >= CASE o.currency WHEN 'CHF' THEN %s ELSE %s END
-    """, (web.free_shipping_chf, web.free_shipping_eur)).fetchone()[0]
+          AND o.items_subtotal >= CASE o.country WHEN 'DE' THEN %s WHEN 'AT' THEN %s ELSE %s END
+    """, tuple(web.free_shipping_threshold(c) for c in ("DE", "AT", "CH"))).fetchone()[0]
     assert fee_added == 0
     # an influencer customer's first order without any promotion would have been granted the discount.
     # Holds with chaos off only: a duplicate account of an influencer customer keeps the code on its shop
