@@ -769,6 +769,36 @@ def test_scenario_promo_recorded_and_free_shipping(monkeypatch):
     assert conds[1].rate == 0.25 and o.lines[0].discount_pct == 0.25
 
 
+def test_austrian_shipping_fee_in_erp_and_waived_fee_in_truth(monkeypatch):
+    """Austria's own fee (EUR 6.95 gross, 20 % VAT) on the ERP freight item, and as the waived amount in truth."""
+    h = Harness(monkeypatch, **_happy_cfg())
+    w = h.cfg.channels.web
+    fee = w.shipping_fee("AT")
+    net, tax = split_gross(fee, w.vat["AT"])
+    assert fee == 6.95 and (net, tax) == (5.79, 1.16)
+    sku = _sku(h, "mass", max_price=8.0)
+    o = web.place_order(h.world, h.customer(country="AT"), [(sku.sku_id, 1)], source="direct")
+    assert o.currency == "EUR" and o.shipping_fee == fee
+    h.run_until(START + timedelta(days=1))
+    fr = h.of(SalesDocCreated)[0].doc.items[-1]
+    assert fr.item_type == "freight" and (fr.net_value, fr.tax) == (net, tax)
+    assert [(c.ctype, c.amount) for c in fr.conditions] == [("shipping", net), ("tax", tax)]
+    # a free-shipping promotion waives the Austrian fee; truth records it gross and net
+    velmora = h.world.ref.catalogue.brand_of_role("mass")
+    promo = Promotion(
+        promo_id=900002, channel="web", name="Velmora 25", kind="automatic", code=None, discount_pct=0.25,
+        free_shipping=True, sku_ids=[], brand=velmora, start=START, end=START + timedelta(days=10),
+        announced_at=START, scenario_id="promo_margin_trap",
+    )
+    h.s.promo_fn = lambda world, t, sku_ids, rng: promo
+    o = web.place_order(h.world, h.customer(country="AT"), [(sku.sku_id, 1)], source="direct")
+    assert o.promo_id == promo.promo_id and o.shipping_fee == 0.0
+    det = h.s.effects[-1][6]
+    assert det["free_shipping_waived"] == fee and det["shipping_waived_eur"] == net
+    assert det["freight_eur"] == round(web.expected_freight_eur(h.world, "AT"), 2)
+    assert det["freight_eur"] > web.expected_freight_eur(h.world, "DE") + 1.5
+
+
 def test_promo_not_applied_without_eligible_line(monkeypatch):
     h = Harness(monkeypatch, **_happy_cfg())
     promo = Promotion(

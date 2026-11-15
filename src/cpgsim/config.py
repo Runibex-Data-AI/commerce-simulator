@@ -90,12 +90,29 @@ class WebCfg(_M):
     # than domestic ones (carriers.parcel cost_eur), so the shop charges Austria a higher fee (6.95 against
     # 4.95) and threshold (49 against 29), as German D2C shops commonly do: over 90 % of Austrian orders pay
     # the fee (Germany about 72 %), and Austrian customers pay back like German ones (MarketingCfg).
+    # Simplification: demand does not respond to the shipping terms (Austrian volume, conversion and repeat
+    # rates are the same whatever the fee), and with an average basket of about EUR 19 Austrian baskets rarely
+    # come within the threshold top-up band below EUR 49, so there is little bunching above it (Germany: about
+    # 14 % of orders within EUR 4 above its threshold, Austria about 4 %).
+    # Keys are customer countries (country_mix / vat), values >= 0. Overlays deep-merge, so an overlay cannot
+    # drop the AT entry with an empty mapping: to give Austria the currency's terms, set AT to those values.
     free_shipping_by_country: dict[str, float] = Field(default_factory=lambda: {"AT": 49.0})
     shipping_fee_by_country: dict[str, float] = Field(default_factory=lambda: {"AT": 6.95})
     basket_extra_lines_mean: float = 1.4  # basket lines = 1 + Poisson(mean)
     qty_two_prob: float = 0.12  # probability a line has qty 2 (else 1; rarely 3)
     threshold_topup_prob: float = 0.55  # prob. a basket just below the free-shipping threshold gets topped up
     vat: dict[str, float] = Field(default_factory=lambda: {"DE": 0.19, "AT": 0.20, "CH": 0.081})
+
+    @model_validator(mode="after")
+    def _shipping_terms_by_country(self) -> "WebCfg":
+        countries = set(self.country_mix) | set(self.vat)
+        for name in ("free_shipping_by_country", "shipping_fee_by_country"):
+            for k, v in getattr(self, name).items():
+                if k not in countries:
+                    raise ValueError(f"channels.web.{name}: {k!r} is not a customer country {sorted(countries)}")
+                if v < 0:
+                    raise ValueError(f"channels.web.{name}[{k!r}] must be >= 0, got {v}")
+        return self
 
     def free_shipping_threshold(self, country: str) -> float:
         """Free-shipping threshold on the goods (gross, order currency) for a customer country."""
@@ -326,6 +343,9 @@ class CarriersCfg(_M):
     # customers pay back like German ones (paid media design rule, MarketingCfg). The Austrian rates are
     # EUR 0.80 below their former 6.90 / 6.40 / 7.20 (a volume shipper's contract rates): with those, even the
     # highest plausible fee and threshold (6.95, free from 49) left Austrian social customers at break-even.
+    # promo_margin_trap orders ship free, so their truth contribution estimate rests on the Austrian and Swiss
+    # parcel costs (German trap orders are slightly positive); test_scenarios_e2e's estimate turns positive
+    # below a weighted Austrian cost of about EUR 4.40.
     parcel: dict[str, CarrierCfg] = Field(
         default_factory=lambda: {
             "Paketblitz": CarrierCfg(
@@ -485,7 +505,10 @@ class MarketingCfg(_M):
     # social order 2, influencer order 2; every paid channel's 12-month value above CAC (by 11 to 30 %),
     # and by at least 7 % in every country (Austria 13 to 28 %: its own shipping fee and threshold,
     # WebCfg.shipping_fee_by_country, cover its dearer parcels). Enforced by test_phase2_acceptance
-    # (test_paid_channels_pay_back_within_12_months). CPM and CTR are set so that the clicks implied by
+    # (test_paid_channels_pay_back_within_12_months) on the default seed, which these figures are. The
+    # acquisition-period CAC varies with the seed's flight draws far more than the value: social EUR 26.1 /
+    # 16.4 / 17.4 on seeds 1 / 2 / 3, so on seed 1 social is below 1 (0.93; DE 0.91, AT 0.92, CH 1.09), while
+    # search and influencer pay back on all three. CPM and CTR are set so that the clicks implied by
     # spend match the configured session conversion rates (sessions = clicks x 0.80-0.92 + 15 % organic).
     paid: dict[str, PaidChannelCfg] = Field(
         default_factory=lambda: {

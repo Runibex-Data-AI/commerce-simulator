@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import date, timedelta
 
-from test_web_lifecycle import START, Harness, _happy_cfg, _sku
+from test_web_lifecycle import START, Harness, _basket_between, _happy_cfg, _sku
 
 from cpgsim.domain import customers, subscriptions, web
 from cpgsim.domain.demandplan import DemandWindow
@@ -174,6 +174,31 @@ def test_no_threshold_topup_when_basket_ships_free(monkeypatch):
     other = _sku(h, "derma")
     lines = [[other.sku_id, 1]]
     assert not web.free_shipping_promo_covers(h.world, [other.sku_id])
+
+
+def test_threshold_topup_uses_the_customer_countrys_threshold(monkeypatch):
+    """Austria tops up towards its own threshold (EUR 49), Germany towards EUR 29, from the same EUR prices."""
+    h = Harness(monkeypatch, with_writers=False, channels={"web": {"threshold_topup_prob": 1.0}})
+    d = h.world.local_date()
+    w = h.cfg.channels.web
+    at_thr, de_thr = w.free_shipping_threshold("AT"), w.free_shipping_threshold("DE")
+    assert at_thr - 10 > de_thr  # the two top-up bands do not overlap
+    cat = h.world.ref.catalogue
+    ids, _ = h.s.sku_weights(h.world, "web", d)
+
+    def topped(country, basket):
+        lines = [list(x) for x in basket]
+        web._topup(h.world, h.world.rng("t.tu", 2), d, country, lines, ids)
+        return lines, round(sum(web.unit_price(cat.get(s), "EUR") * q for s, q in lines), 2)
+
+    near_at, _ = _basket_between(h, at_thr - 8.0, at_thr - 2.0, "EUR")  # in Austria's band, above Germany's threshold
+    lines, value = topped("AT", near_at)
+    assert len(lines) == 2 and value >= at_thr
+    assert topped("DE", near_at)[0] == [list(x) for x in near_at]
+    near_de, _ = _basket_between(h, de_thr - 8.0, de_thr - 2.0, "EUR")  # in Germany's band, far below Austria's
+    lines, value = topped("DE", near_de)
+    assert len(lines) == 2 and value >= de_thr
+    assert topped("AT", near_de)[0] == [list(x) for x in near_de]
 
 
 def test_promoted_order_truth_carries_contribution(monkeypatch):

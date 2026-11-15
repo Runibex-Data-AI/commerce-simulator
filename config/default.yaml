@@ -52,7 +52,9 @@ channels:
     shipping_fee_eur: 4.95
     shipping_fee_chf: 7.90
     # per customer country where it differs, in its currency (else the currency's value above):
-    # parcels to Austria cost about EUR 1.90 more (carriers), so Austria pays a higher fee and threshold
+    # parcels to Austria cost about EUR 1.90 more (carriers), so Austria pays a higher fee and threshold.
+    # Demand does not respond to these terms. Overlays deep-merge: to give Austria the EUR terms, set
+    # AT to 29.0 / 4.95 (an empty mapping keeps these entries).
     free_shipping_by_country: { AT: 49.0 }
     shipping_fee_by_country: { AT: 6.95 }
     basket_extra_lines_mean: 1.4   # basket lines = 1 + Poisson(mean)

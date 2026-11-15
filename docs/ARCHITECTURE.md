@@ -269,9 +269,14 @@ UTC, statuses as lower-case words (the neutral vocabulary), money as
   (`WebCfg.shipping_fee(country)` / `free_shipping_threshold(country)`): the
   per-currency values (EUR 4.95 below EUR 29, CHF 7.90 below CHF 35) unless
   `channels.web.shipping_fee_by_country` / `free_shipping_by_country` set the
-  country's own (Austria EUR 6.95 below EUR 49). The threshold top-up, the
-  free-shipping waiver and its value when promotions compete use the same
-  per-country terms.
+  country's own (Austria EUR 6.95 below EUR 49). The threshold top-up and
+  the free-shipping waiver use the same per-country terms, and so does the
+  waiver's value when promotions compete for EUR countries (Switzerland is
+  ranked at `shipping_fee_eur`, as before). Demand does not respond to the
+  terms (Austrian volume, conversion and repeat rates are the same whatever
+  the fee), and
+  Austrian baskets (about EUR 19 on average) rarely come within the top-up
+  band below EUR 49, so there is little bunching above that threshold.
 * Promotions: one per order (`orders.promotion_id`, `promo_code` for code
   promotions, one `promo_redemptions` row). The best calendar promotion for the
   basket wins (`promotions.web_promo_for_basket`). A customer acquired with an
@@ -496,7 +501,14 @@ over the acquisition period is about EUR 20.4 / 21.8 / 17.4, some 8 % above
 lacks the cheap customers of the fourth quarter; over the whole run it is
 about EUR 19.1 / 20.7 / 15.8. Each channel pays back with the customer's
 second order, by 11 to 30 %, and by at least 7 % in every country
-(Austria 13 to 28 %).
+(Austria 13 to 28 %). These margins are the default seed's, which
+`test_phase2_acceptance` checks. The realised CAC over the acquisition period
+varies with the seed's flight draws (Poisson flights per quarter, diminishing
+returns) far more than the value does: social EUR 26.1 / 16.4 / 17.4 on
+seeds 1 / 2 / 3, so on seed 1 social falls below its 12-month value (ratio
+0.93; Germany 0.91, Austria 0.92, Switzerland 1.09), although its whole-run
+CAC there (EUR 21.6) is still below the value. Paid search (1.27 to 1.39) and
+influencer (1.18 to 1.47) pay back on all three seeds.
 Parcels from the German warehouse to Austria cost about EUR 1.90 more than
 domestic ones (`carriers.parcel.*.cost_eur`, carrier-share weighted EUR 5.98
 against 4.06), so the shop charges Austria its own shipping fee and

@@ -154,6 +154,26 @@ def test_paid_media_calibration_and_influencer_discount_config():
             Config.model_validate({"marketing": {"influencer_first_order_discount_pct": tiny}})
 
 
+def test_shipping_terms_by_country_are_validated(tmp_path):
+    w = Config().channels.web
+    assert w.shipping_fee_by_country == {"AT": 6.95} and w.free_shipping_by_country == {"AT": 49.0}
+    for bad, match in (({"at": 5.0}, "'at' is not a customer country"), ({"FR": 3.0}, "'FR' is not a customer"),
+                       ({"AT": -1.0}, r"must be >= 0")):
+        for name in ("shipping_fee_by_country", "free_shipping_by_country"):
+            with pytest.raises(ValidationError, match=match):
+                Config.model_validate({"channels": {"web": {name: bad}}})
+    ok = Config.model_validate({"channels": {"web": {"shipping_fee_by_country": {"AT": 0.0, "CH": 9.9}}}})
+    assert ok.channels.web.shipping_fee("AT") == 0.0 and ok.channels.web.shipping_fee("CH") == 9.9
+    # overlays deep-merge: an empty mapping keeps the AT default; setting AT to the EUR terms restores them
+    ov = tmp_path / "ov.yaml"
+    ov.write_text("channels:\n  web:\n    shipping_fee_by_country: {}\n")
+    assert load_config(overlay=ov).channels.web.shipping_fee("AT") == 6.95
+    ov.write_text("channels:\n  web:\n    shipping_fee_by_country: {AT: 4.95}\n"
+                  "    free_shipping_by_country: {AT: 29.0}\n")
+    w = load_config(overlay=ov).channels.web
+    assert (w.shipping_fee("AT"), w.free_shipping_threshold("AT")) == (w.shipping_fee_eur, w.free_shipping_eur)
+
+
 def test_chaos_config_is_typed_and_validated():
     cfg = Config()
     assert cfg.chaos.duplicate_customer_rate == 0.02 and cfg.chaos.dst_truth is True

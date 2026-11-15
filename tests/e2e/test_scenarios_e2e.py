@@ -101,6 +101,10 @@ def test_promo_margin_trap_contribution_negative(margin_trap):
     # ... and truth carries a contribution estimate for every redeemed order that agrees in sign.
     missing = conn.execute(CONTRIBUTION_SQL + " SELECT count(*) FROM c WHERE est IS NULL").fetchone()[0]
     assert missing == 0
+    # The estimate's sign rests on the dearer Austrian and Swiss parcels (trap orders ship free, so the
+    # shop's shipping fee does not enter): German trap orders are slightly positive in aggregate, and in
+    # this reduced-volume run the sum is about 3 standard errors below 0 (about -830 on 3700 orders; each
+    # EUR 1 off the Austrian parcel cost raises it by about 500).
     assert est < 0
 
 
