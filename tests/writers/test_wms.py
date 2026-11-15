@@ -197,6 +197,35 @@ def test_unknown_codes_fail_loudly():
                                carrier="Swiftbox", location="Kassel"))
 
 
+def test_status_error_set_and_corrected_leave_residue():
+    from cpgsim.domain.events import StatusErrorCorrected, StatusErrorSet
+
+    d, _ = make_dispatcher()
+    sid = keys.wms_shipment_id(42)
+    d.dispatch(DeliveryCreated(at=T0, delivery=web_delivery(), sales_doc=sales_doc("web")))
+    d.dispatch(DeliveryChanged(at=T1, delivery_id=42, status="shipped", fields={"shipped_at": T1}))
+    d.dispatch(StatusErrorSet(at=T1, system="wms", entity_id=42, wrong_status="cancelled", error_at=T1))
+    row = d.batch.table("wms.shipments").pending(sid)
+    assert row["status_code"] == "CX" and row["cancelled_local"] == local(T1)
+    d.dispatch(StatusErrorCorrected(at=T2, system="wms", entity_id=42, status="in_transit"))
+    row = d.batch.table("wms.shipments").pending(sid)
+    assert row["status_code"] == "IT" and row["cancelled_local"] == local(T1) and row["updated_at"] == T2
+    d.dispatch(StatusErrorSet(at=T2, system="shop", entity_id=42, wrong_status="cancelled", error_at=T2))
+    assert d.batch.table("wms.shipments").pending(sid)["status_code"] == "IT"  # shop errors do not touch wms
+    with pytest.raises(ValueError):
+        d.dispatch(StatusErrorCorrected(at=T2, system="wms", entity_id=42, status="teleported"))
+
+
+def test_status_error_on_committed_shipment_is_an_update():
+    from cpgsim.domain.events import StatusErrorCorrected, StatusErrorSet
+
+    d, _ = make_dispatcher()
+    d.dispatch(StatusErrorSet(at=T1, system="wms", entity_id=42, wrong_status="cancelled", error_at=T1))
+    d.dispatch(StatusErrorCorrected(at=T2, system="wms", entity_id=42, status="delivered"))
+    upd = d.batch.table("wms.shipments").updates[(keys.wms_shipment_id(42),)]
+    assert upd == {"status_code": "DL", "cancelled_local": local(T1), "updated_at": T2}
+
+
 # -- Postgres round trip -----------------------------------------------------------
 
 DSN = os.environ.get("CPGSIM_TEST_DSN")

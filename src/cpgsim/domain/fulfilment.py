@@ -52,7 +52,10 @@ from ..engine.rng import derive_seed
 from ..models import delays
 from . import billing, warehouse
 from .events import CarrierScan, DeliveryChanged, DeliveryCreated, SalesDocChanged
+from .customers import _Lazy
 from .model import Address, Delivery, DeliveryLine, SalesDoc
+
+chaos = _Lazy("cpgsim.chaos")
 
 log = logging.getLogger("cpgsim.domain.fulfilment")
 
@@ -180,6 +183,7 @@ def _scan(world, d: Delivery, code: str, location: str, detail: str | None = Non
             tracking_no=d.tracking_no,
         )
     )
+    chaos.after_scan(world, d, code, location, detail)
 
 
 def _status(world, d: Delivery, status: str, **fields) -> None:

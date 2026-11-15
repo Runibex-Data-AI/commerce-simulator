@@ -20,7 +20,7 @@ from cpgsim.engine.world import UTC, World
 from cpgsim.models import pricing
 from cpgsim.models.seasonality import category_factor, event_factor
 
-RETAILERS = ("drogerie_kranz", "mylo")
+RETAILERS = ("drogerie_kranz", "mylo", "shopnova", "belle")
 
 
 class StubScenarios:
@@ -685,10 +685,30 @@ def test_hot_path_performance():
 
 
 def test_disabled_retailer_has_no_demand():
-    w, _ = make_world()
+    cfg = Config()
+    cfg.channels.shopnova.enabled = cfg.channels.belle.enabled = False
+    w, _ = make_world(cfg)
     d = date(2025, 6, 11)
     sid = w.ref.catalogue.active(d)[0].sku_id
     assert demandplan.expected_daily_units(w, sid, d, "shopnova") == 0.0
     assert demandplan.retail_weekly_demand(w, "belle", "BELLE-DC1", sid, d) == 0.0
     assert promotions.retail_promos(w, "shopnova", d) == []
     assert promotions.demand_factor(w, sid, "shopnova", d) == 1.0
+
+
+def test_retail_push_scales_planned_retail_demand_only():
+    """retailer_overstock: the warehouse plans the pushing retailer's over-order (expected_daily_units)."""
+    sc = StubScenarios(factors={"retail_push": lambda t, channel=None, **k: 1.35 if channel == "mylo" else 1.0})
+    w, _ = make_world(scenarios=sc)
+    plain, _ = make_world()
+    d = date(2025, 9, 10)
+    sids = plain.ref.catalogue.retailer_assortment("mylo", d)[:5]
+    for sid in sids:
+        base = demandplan.expected_daily_units(plain, sid, d, "mylo")
+        assert base > 0
+        assert demandplan.expected_daily_units(w, sid, d, "mylo") == pytest.approx(1.35 * base)
+        for ch in ("web", "drogerie_kranz"):
+            assert demandplan.expected_daily_units(w, sid, d, ch) == pytest.approx(
+                demandplan.expected_daily_units(plain, sid, d, ch))
+        total = demandplan.expected_daily_units(w, sid, d)
+        assert total == pytest.approx(demandplan.expected_daily_units(plain, sid, d) + 0.35 * base)

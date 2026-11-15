@@ -64,15 +64,30 @@ channels:
     dcs: 2
     payment_terms_days: 60
     assortment_share: 0.62
-  shopnova:               # marketplace, 1P wholesale: phase 2
+    online_share: 0.11    # share of sell-out from the retailer's online shop
+  shopnova:               # marketplace, 1P wholesale (the brand sells to the marketplace)
     share: 0.20
     model: 1p
-    enabled: false
-  belle:                  # perfumery chain (Parfümerie Belle), mainly Cutara: phase 2
-    share: 0.10
-    sellout_frequency: monthly
+    dcs: 2                # fulfilment centres
+    payment_terms_days: 60
+    trade_discount: 0.38
+    assortment_share: 0.85
     cutara_listed: true
-    enabled: false
+    order_weekdays: [0, 2, 4]   # purchase orders on Mon, Wed, Fri
+    sellout_frequency: daily    # daily sales, traffic and inventory reports
+    enabled: true
+  belle:                  # perfumery chain (Parfümerie Belle), mainly Cutara
+    share: 0.10
+    dcs: 2                # warehouses
+    order_cycle_days: 7
+    payment_terms_days: 30
+    trade_discount: 0.42
+    cutara_listed: true
+    brand_assortment: { derma: 1.0, seasonal: 0.3, mass: 0.0 }   # listing share per brand role
+    online_share: 0.10
+    promo_weeks_per_quarter: 1
+    sellout_frequency: monthly  # retail months (4-4-5 calendar of ISO weeks)
+    enabled: true
 
 erp:
   naming: sap             # SAP-style tables and fields; a readable English profile is phase 3
@@ -155,8 +170,45 @@ scenarios:
     cherry_pick_share: 0.8        # mixed baskets cut down to the promoted brand
     start: 2026-03-02
     end: 2026-03-29
+  - id: influencer_cohort_churn   # a campaign buys customers who never come back
+    influencer_code: GLOWWITHMIA
+    repurchase_multiplier: 0.3
+    acquisition_boost: 2.5
+    start: 2025-04-07
+    end: 2025-06-29
+  - id: retailer_overstock        # Mylo orders 30 % above its demand for a quarter, then cuts
+    retailer: mylo
+    over_order: 1.30
+    duration_weeks: 13
+    cut_weeks: 6
+    start: 2026-01-05
+  - id: hero_oos_substitution     # a hero SKU runs out; a sibling absorbs 40 % of its demand
+    sku: auto
+    duration_weeks: 3
+    substitution_share: 0.40
+    start: 2026-04-13
 
-# Data quality noise: phase 2. Spec default rates, not applied in phase 1.
+# Retailer and marketplace data feeds (local delivery hours).
+feeds:
+  weekly_delivery_hours: { drogerie_kranz: [6.0, 9.0], mylo: [10.0, 14.0] }   # Monday
+  monthly_delivery_hours: [8.0, 12.0]   # Wednesday after the retail period
+  marketplace_report_hours: [7.0, 9.0]  # daily reports, the next day
+  late_delivery_rate: 0.03              # retailer files arriving 1-2 days late
+
+# Trade deductions: claims raised by retailers and short-paid from invoices.
+deductions:
+  scanback_share: 0.25          # share of the consumer discount reimbursed per unit sold on promotion
+  claim_delay_weeks: [2, 8]     # promotion claims arrive this long after the promotion week
+  overclaim_rate: 0.15          # claims above what the sell-out supports
+  shortage_claim_rate: 0.03     # deliveries with a shortage claim
+  service_cut_threshold: 0.05   # cut share of a purchase order above which a penalty follows
+
+# Marketing stack: campaign spend drives new-customer acquisition.
+marketing:
+  response_elasticity: 0.7      # new customers respond to spend flights with this elasticity
+  tracking_share: 0.92          # shop orders tracked by web analytics (consent)
+
+# Data quality noise (spec default rates). Set a rate to 0 to switch a defect off.
 chaos:
   duplicate_customer_rate: 0.02         # shop: same person, slightly different name or email
   malformed_postcode_rate: 0.005        # shop: missing or malformed postcode
@@ -167,3 +219,4 @@ chaos:
   sellout_restatement_rate: 0.10        # feeds: retailer weeks restated the following week
   free_text_return_reason_rate: 0.15    # wms
   gdpr_erasure_rate_monthly: 0.0005     # shop: customers anonymised per month
+  dst_truth: true                       # wms: record each DST transition in truth

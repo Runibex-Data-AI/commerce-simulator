@@ -228,6 +228,49 @@ def test_retailer_assortment(cat, cfg):
         cat.retailer_assortment("nonexistent", date(2026, 1, 1))
 
 
+def test_new_channel_assortments(cat, cfg):
+    """Shopnova lists 85 % incl. Cutara; Belle lists by brand role; Kranz and Mylo are unchanged."""
+    derma = cat.brand_of_role("derma")
+    roles = {b: r for b, r in cat.brand_roles.items()}
+    for d in DATES:
+        active = cat.active(d)
+        # Shopnova: assortment_share of all brands (cutara_listed), heroes always
+        ids = set(cat.retailer_assortment("shopnova", d))
+        eligible = [s for s in active if s.season_profile != "gift"]
+        non_gift = [i for i in ids if cat.get(i).season_profile != "gift"]
+        assert abs(len(non_gift) / len(eligible) - 0.85) < 0.06, d
+        assert any(cat.get(i).brand == derma for i in ids)
+        assert {s.sku_id for s in active if s.hero} <= ids
+        # Belle: every derma SKU, about 30 % of the seasonal brand, no mass-market SKU
+        belle = [cat.get(i) for i in cat.retailer_assortment("belle", d)]
+        by_role: dict[str, int] = {}
+        for s in belle:
+            by_role[roles[s.brand]] = by_role.get(roles[s.brand], 0) + 1
+        assert by_role.get("mass", 0) == 0
+        derma_active = [s for s in active if s.brand == derma and (s.season_profile != "gift" or d.month in (11, 12))]
+        assert by_role["derma"] == len(derma_active) >= 0.9 * len(derma_active)
+        seasonal = [s for s in active if roles[s.brand] == "seasonal" and s.season_profile != "gift"]
+        seasonal_listed = [s for s in belle if roles[s.brand] == "seasonal" and s.season_profile != "gift"]
+        assert abs(len(seasonal_listed) - 0.3 * len(seasonal)) <= 2, d
+        assert {s.sku_id for s in active if s.hero and roles[s.brand] != "mass"} <= {s.sku_id for s in belle}
+        assert by_role["derma"] / len(belle) >= 0.8  # mainly Cutara
+    # the per-role cut-off is what masterdata's single comparison applies
+    for s in cat.skus:
+        if not cat.is_active(s, date(2026, 1, 1)) or s.season_profile == "gift":
+            continue
+        listed = s.sku_id in cat.retailer_assortment("belle", date(2026, 1, 1))
+        assert cat.lists("belle", s) == listed
+        assert (s.hero or cat._keys("belle")[s.sku_id] >= cat._threshold("belle")) == listed or not cat._eligible(
+            s, cfg.channels.belle)
+    # Kranz and Mylo listings do not depend on the new channels
+    off = cfg.model_copy(deep=True)
+    off.channels.shopnova.enabled = off.channels.belle.enabled = False
+    cat_off = build_catalogue(off)
+    for d in DATES:
+        for ch in ("drogerie_kranz", "mylo"):
+            assert cat.retailer_assortment(ch, d) == cat_off.retailer_assortment(ch, d)
+
+
 def test_customer_articles(cat):
     kranz = [cat.customer_article("drogerie_kranz", s.sku_id) for s in cat.skus]
     mylo = [cat.customer_article("mylo", s.sku_id) for s in cat.skus]
@@ -243,10 +286,14 @@ def test_accounts(cfg):
     acc = build_accounts(cfg)
     ids = [a.account_id for a in acc.all]
     assert ids == ["KRANZ", "KRANZ-DC1", "KRANZ-DC2", "KRANZ-DC3", "MYLO", "MYLO-DC1", "MYLO-DC2",
+                   "SHOPNOVA", "SHOPNOVA-DC1", "SHOPNOVA-DC2", "BELLE", "BELLE-DC1", "BELLE-DC2",
                    "WEB-DE", "WEB-AT", "WEB-CH"]
     assert acc.numbers["KRANZ"] == 100001 and acc.numbers["MYLO"] == 100002
+    assert acc.numbers["SHOPNOVA"] == 100003 and acc.numbers["BELLE"] == 100004
     assert [acc.numbers[a.account_id] for a in acc.dcs("drogerie_kranz")] == [200001, 200002, 200003]
     assert [acc.numbers[a.account_id] for a in acc.dcs("mylo")] == [200004, 200005]
+    assert [acc.numbers[a.account_id] for a in acc.dcs("shopnova")] == [200006, 200007]  # fulfilment centres
+    assert [acc.numbers[a.account_id] for a in acc.dcs("belle")] == [200008, 200009]  # perfumery warehouses
     assert [acc.numbers[f"WEB-{c}"] for c in ("DE", "AT", "CH")] == [900001, 900002, 900003]
     assert acc.retailer("drogerie_kranz").name == "Drogerie Kranz GmbH & Co. KG"
     assert acc.retailer("mylo").name == "Mylo Drogeriemarkt GmbH"
@@ -256,19 +303,25 @@ def test_accounts(cfg):
     assert ch.currency == "CHF" and ch.payment_terms_days == 0 and ch.address.country == "CH"
     assert acc.web_collective("DE").currency == "EUR"
     assert acc.get("KRANZ-DC2").kind == "retailer_dc"
-    for ch_key in ("drogerie_kranz", "mylo"):
+    assert acc.retailer("shopnova").payment_terms_days == 60 and acc.retailer("belle").payment_terms_days == 30
+    for ch_key in ("drogerie_kranz", "mylo", "shopnova", "belle"):
         dcs = acc.dcs(ch_key)
         assert all(d.address.country == "DE" for d in dcs)
         assert len({d.address.region for d in dcs}) == len(dcs)
     assert all(len(a.name) <= 35 for a in acc.all)  # SAP kna1.name1
     assert len(set(acc.numbers.values())) == len(acc.numbers)
+    off = cfg.model_copy(deep=True)
+    off.channels.shopnova.enabled = False
     with pytest.raises(KeyError):
-        acc.retailer("shopnova")  # disabled in phase 1
+        build_accounts(off).retailer("shopnova")  # disabled channels get no accounts
+    assert build_accounts(off).numbers["BELLE"] == 100003  # numbering follows the enabled channels
 
 
 def test_accounts_follow_config(cfg):
     cfg2 = cfg.model_copy(deep=True)
     cfg2.channels.mylo.enabled = False
+    cfg2.channels.shopnova.enabled = False
+    cfg2.channels.belle.enabled = False
     cfg2.channels.drogerie_kranz.dcs = 4
     acc = build_accounts(cfg2)
     assert [a.account_id for a in acc.all if a.kind != "web_collective"] == [

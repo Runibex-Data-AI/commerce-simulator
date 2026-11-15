@@ -23,9 +23,13 @@ Switch scenarios on
       sim scenario enable carrier_decay --param region=DE-BW
       sim scenario disable carrier_decay
 
-Phase 1 implements ``carrier_decay`` and ``promo_margin_trap``; see their
-modules for the story and parameters, ``base.py`` for writing a new one and
-``manager.py`` for window semantics, factors and truth recording.
+Implemented scenarios (see each module for the story and parameters):
+``carrier_decay`` and ``promo_margin_trap`` (web), ``hero_oos_substitution``
+(all channels: a central stock-out with substitution), ``retailer_overstock``
+(sell-in ahead of sell-out at one chain) and ``influencer_cohort_churn``
+(a campaign buys customers who never come back). ``base.py`` explains how to
+write a new one (factors, lifetime factors, transfers, promotions, duration)
+and ``manager.py`` window semantics, the factor table and truth recording.
 """
 
 from .base import PLANNED, REGISTRY, Scenario, ScenarioParamError, register

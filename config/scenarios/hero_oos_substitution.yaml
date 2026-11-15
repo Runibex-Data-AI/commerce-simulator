@@ -1,0 +1,18 @@
+# Generic scenario definition for live enabling:
+#   sim scenario enable hero_oos_substitution [--param sku=VEL-BOD-HYB-400 --param duration_weeks=2]
+# The scenario starts at the current simulation time and ends by itself after
+# duration_weeks (`sim scenario disable hero_oos_substitution` ends it earlier).
+# No dates here: fixed windows go in the `scenarios:` list of the config.
+id: hero_oos_substitution
+description: >
+  A hero SKU runs out: the central warehouse blocks and recalls its stock for
+  a few weeks. Web orders backorder, retailer purchase orders are cut and
+  retailer distribution centres run dry one after the other; part of the
+  hero's demand moves to its nearest sibling, the rest is lost. Shows in stock
+  levels and movements, sell-out dips, order cuts and service penalties
+  (wms, feeds, erp).
+params:
+  sku: auto                  # auto (most popular hero with a listed sibling), a SKU id or a SKU code
+  duration_weeks: 3          # length of the stock-out; the window closes by itself
+  substitution_share: 0.40   # share of the hero's demand moved to the sibling (rest is lost)
+  recovery_weeks: 6          # weeks after the window while retailer stock recovers

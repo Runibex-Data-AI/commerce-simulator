@@ -32,6 +32,8 @@ from ..domain.events import (
     DeliveryCreated,
     ReturnChanged,
     ReturnCreated,
+    StatusErrorCorrected,
+    StatusErrorSet,
     StockMoved,
     StockSnapshotTaken,
 )
@@ -199,6 +201,8 @@ class WmsWriter(Writer):
             ReturnChanged: self.on_return_changed,
             StockMoved: self.on_stock_moved,
             StockSnapshotTaken: self.on_stock_snapshot,
+            StatusErrorSet: self.on_status_error_set,
+            StatusErrorCorrected: self.on_status_error_corrected,
         }
 
     # -- helpers -----------------------------------------------------------
@@ -317,6 +321,23 @@ class WmsWriter(Writer):
             buf = self.t(SHIPMENT_LINES)
             for line_no in sorted(picked, key=int):
                 buf.update((shipment_id, int(line_no)), {"qty_picked": int(picked[line_no])}, e.at)
+
+    def on_status_error_set(self, e: StatusErrorSet) -> None:
+        """Chaos: a shipment status set in error, with its local time column (``cancelled_local``)."""
+        if e.system != "wms":
+            return
+        changes: dict[str, Any] = {"status_code": _code(SHIPMENT_STATUS_CODES, e.wrong_status, "delivery status")}
+        time_col = SHIPMENT_STATUS_TIME_COLUMN.get(e.wrong_status)
+        if time_col is not None:
+            changes[time_col] = self.local(e.error_at)
+        self.t(SHIPMENTS).update(keys.wms_shipment_id(e.entity_id), changes, e.at)
+
+    def on_status_error_corrected(self, e: StatusErrorCorrected) -> None:
+        """Chaos: the status code is reverted by hand; ``cancelled_local`` stays (residue)."""
+        if e.system != "wms":
+            return
+        code = _code(SHIPMENT_STATUS_CODES, e.status, "delivery status")
+        self.t(SHIPMENTS).update(keys.wms_shipment_id(e.entity_id), {"status_code": code}, e.at)
 
     def on_carrier_scan(self, e: CarrierScan) -> None:
         self.t(CARRIER_EVENTS).insert(

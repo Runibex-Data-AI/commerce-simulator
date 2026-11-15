@@ -47,7 +47,10 @@ from .events import (
     SkuListed,
     StandardCostRevised,
 )
+from .customers import _Lazy
 from .model import Sku
+
+chaos = _Lazy("cpgsim.chaos")
 
 LISTING_LEAD_DAYS = 60
 LISTING_HOUR = 6
@@ -197,6 +200,8 @@ def _emit_customer_materials(world, sku: Sku) -> None:
     cat = world.ref.catalogue
     for channel in _retailers(world):
         if retailer_lists(world, channel, sku):
+            if chaos.knmt_suppressed(world, channel, sku.sku_id):
+                continue  # retailer article without a customer-material mapping (chaos; truth recorded)
             world.emit(
                 CustomerMaterialListed(
                     at=world.now,

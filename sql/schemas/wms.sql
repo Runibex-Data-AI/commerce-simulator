@@ -196,8 +196,8 @@ CREATE INDEX IF NOT EXISTS stock_movements_updated_at_idx ON wms.stock_movements
 COMMENT ON TABLE wms.stock_movements IS 'Stock postings in the central warehouse.';
 COMMENT ON COLUMN wms.stock_movements.movement_code IS 'GR goods receipt (production), GI goods issue (shipment), RT customer return to stock, SC scrap, AD inventory adjustment.';
 COMMENT ON COLUMN wms.stock_movements.qty IS 'Signed units: positive into stock, negative out of stock.';
-COMMENT ON COLUMN wms.stock_movements.delivery_no IS 'ERP delivery number for goods issues; NULL otherwise.';
-COMMENT ON COLUMN wms.stock_movements.return_id IS 'wms.returns.return_id for return and scrap postings; NULL otherwise.';
+COMMENT ON COLUMN wms.stock_movements.delivery_no IS 'ERP delivery number: the delivery issued (GI) or the original delivery of a returned item (RT, and SC when a returned item is scrapped); NULL on goods receipts, adjustments and scrap postings that are not returns.';
+COMMENT ON COLUMN wms.stock_movements.return_id IS 'wms.returns.return_id for RT and SC postings of a customer return; NULL for parcels returned to sender, scrap postings that are not returns (delisting write-offs, recalls) and all other movements.';
 
 CREATE TABLE IF NOT EXISTS wms.stock_levels_daily (
     snapshot_date      date         NOT NULL,

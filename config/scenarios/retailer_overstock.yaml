@@ -1,0 +1,19 @@
+# Generic scenario definition for live enabling:
+#   sim scenario enable retailer_overstock [--param retailer=drogerie_kranz --param over_order=1.4]
+# The scenario starts at the current simulation time and ends by itself after
+# duration_weeks (`sim scenario disable retailer_overstock` ends it earlier).
+# No dates here: fixed windows go in the `scenarios:` list of the config.
+id: retailer_overstock
+description: >
+  Sell-in runs ahead of sell-out at one chain: its distribution centres order
+  well above their demand for a quarter, whatever their stock, then order
+  nothing until the excess is sold and claim clearance deductions. Shows in
+  the sell-in versus sell-out gap, rising retailer stock and extra deductions
+  (erp, feeds).
+params:
+  retailer: mylo                # retailer channel: drogerie_kranz | mylo | shopnova | belle
+  over_order: 1.30              # order quantity = forecast cycle demand x this, during the window
+  duration_weeks: 13            # length of the push; the window closes by itself
+  cut_weeks: 6                  # cut phase after the window (truth and sell-in/sell-out exclusion)
+  extra_deduction_share: 0.20   # clearance claims, share of the over-ordered value
+  extra_claims: 2               # number of clearance claims after the window

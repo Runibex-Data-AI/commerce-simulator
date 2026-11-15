@@ -10,10 +10,11 @@ and the conventions each source system follows. The behaviour is specified in
 config ──► engine (clock, queue, entity store, rng, tick loop)
               │  handlers(world, event)
               ▼
-           domain (business logic: catalogue, customers, web, fulfilment, retail, ...)
+           domain (business logic: catalogue, customers, web, fulfilment, retail,
+              │     feeds, deductions, marketing, ...) and chaos (data quality noise)
               │  world.emit(DomainEvent)
               ▼
-           writers (shop, wms, erp, truth) ──► WriteBatch ──► one Postgres transaction per commit
+           writers (shop, wms, erp, mkt, feeds, truth) ──► WriteBatch ──► one Postgres transaction per commit
 ```
 
 * **Business logic never writes SQL.** It mutates entities in `world.store`,
@@ -73,7 +74,10 @@ Reference data is rebuilt from seed and config at start-up (`world.ref`):
 * `domain/reference.py`: `ReferenceData(catalogue, geo, accounts, calendar)`, `build_reference(cfg)`.
 * `domain/catalogue.py`: `Catalogue` with `skus`, `get(sku_id)`, `by_ean(ean)`,
   `active(d)`, `siblings(sku_id)`, `affinity`, `retailer_assortment(channel, d)`,
-  `customer_article(channel, sku_id)`; `CATEGORIES`.
+  `customer_article(channel, sku_id)`, `lists(channel, sku_id)` (listing per channel; a channel with
+  `brand_assortment`, the perfumery, lists by brand role); `CATEGORIES`.
+* `models/retail_calendar.py`: 4-4-5 retail months of ISO weeks (`retail_period`, `retail_quarter`,
+  `quarter_weeks`) for the perfumery's monthly sell-out and the AC1 quarters.
 * `domain/geography.py`: `Geography.sample_address(rng, country) -> Address`
   (population-weighted real DACH postcodes with ISO 3166-2 region),
   `regions(country)`.
@@ -95,15 +99,19 @@ Stateful business logic lives in `domain/`. Each module registers its handlers:
 | `masterdata` | Material/account master emission, monthly FX, annual cost revision | `fx_rate(world, currency, d) -> float` (EUR per unit), `std_cost(world, sku_id, d) -> float` |
 | `demandplan` | Expected consumer demand per SKU, channel and day; web demand windows (events, promotions) for repeat customers | `sku_weights(world, channel, d) -> (sku_ids, cum_weights)`, `expected_daily_units(world, sku_id, d, channel=None)`, `repeat_lift(world, sku_ids, d)`, `demand_windows(world, sku_ids, d0, d1) -> list[DemandWindow]` |
 | `promotions` | Web and retailer promotion calendar, lift and dip | `active_web_promos(world, t)`, `web_promo_for_basket(world, t, sku_ids, rng)`, `demand_factor(world, sku_id, channel, d)`, `retail_promos(world, channel, d)` |
-| `billing` | Invoices, credit memos, clearing (called by fulfilment, returns and retail) | `create_invoice(...)`, `create_credit_memo(...) -> BillingDoc \| None` (None when nothing is left to credit), `clear(world, billing_id, amount=None)` |
-| `warehouse` | Central stock, production replenishment, daily snapshots | `available`, `reserve`, `unreserve`, `issue`, `receive_return` |
+| `billing` | Invoices, credit memos, clearing (called by fulfilment, returns and retail) | `create_invoice(...)`, `create_credit_memo(...) -> BillingDoc \| None` (None when nothing is left to credit), `clear(world, billing_id, amount=None, status=None)` |
+| `warehouse` | Central stock, production replenishment, daily snapshots, the `hero_oos_substitution` quality block (`wh.quality_block`: QI-BLOCK, held receipts, QI-RECALL) | `available`, `reserve`, `unreserve`, `issue`, `receive_return` |
 | `customers` | Web customer creation, repurchase intents (event/promotion conversion and pull-forward), deal seekers of `promo_margin_trap` | `new_customer(world, rng, acquisition=None) -> Customer`, `schedule_repurchase(world, customer, order)`, `cherry_pick(world, rng, lines)`, `deal_return_rate(world, order)` |
 | `web` | Web arrivals, basket, pricing, payment, release, cancellation, backorders | `place_order(world, customer, lines, source, subscription_id=None) -> WebOrder` |
 | `fulfilment` | Deliveries for web and retail: pick, ship, carrier scans, outcomes, web invoicing at shipment | `create_delivery(world, kind, sales_doc, lines, ship_to_account, ship_to, carrier, planned_ship_date, order_id, seq_in_order=1) -> Delivery`, `cancel_delivery(world, delivery_id, reason)` |
 | `returns` | Web returns, refunds, credit memos | `maybe_schedule_return(world, order, delivery)`, `refund(world, order, amount, reason, return_id=None, credit_items=None, include_shipping=False, delivery_id=None) -> refund_id \| None` |
 | `subscriptions` | Subscription lifecycle and recurring orders (never gift, sun or after-sun products) | `maybe_start_subscription(world, customer, order)` |
-| `retail` | Hidden retailer demand and inventory, retailer POs, confirmation, delivery planning, invoicing after proof of delivery, payment | none |
-| `scenarios/manager` | Scenario windows from config and CLI, truth recording | `world.scenarios.active(scenario_id, t) -> list[ScenarioWindow]`, `factor(name, t, **ctx) -> float`, `record_effect(...)` |
+| `retail` | Hidden retailer demand and inventory per DC (weekly sell-out, daily for the marketplace), order weekdays, event-aware order-up-to targets, `retailer_overstock` push mode, hero substitution on lost units, retailer POs, confirmation, delivery planning, invoicing after proof of delivery, payment net of deductions | none (hands each period to `feeds` and `deductions`) |
+| `feeds` | Feed accumulators per period (`feed_acc`), delivery at each sender's schedule (`feeds.delivery`), restatements as new loads | `record_sellout_week(world, channel, dc, week_start, sold, lost, demand, on_hand)`, `record_marketplace_day(world, channel, dc, day, sold, demand, on_hand, on_order)` |
+| `deductions` | Trade promotion agreements, retailer claims by kind, matching, disputes, short payment with partial taking, repayment (`deduction`, `deduction_book`, `promo_claim`) | `record_sellout(...)`, `record_pod(...)`, `record_cut(...)`, `take_on_payment(world, channel, billing_id, gross) -> float` (amount short-paid) |
+| `marketing` | Pure campaign calendar, spend-driven acquisition, attribution and the daily `mkt` export (`mkt_day`) | `new_customer_multiplier(world, t)`, `acquisition_mix(world, t)`, `pick_influencer_code(world, rng, t)`, `note_order(world, order, customer, source, new_customer)` |
+| `scenarios/manager` | Scenario windows from config and CLI (self-limiting windows end at `start + duration`), truth recording | `world.scenarios.active(scenario_id, t) -> list[ScenarioWindow]`, `factor(name, t, **ctx) -> float` (lifetime factors such as `repurchase` keep applying after the window to entities acquired inside it), `transfers(name, t, world=world, **ctx)` (hero substitution of expected units), `visible_from(window)`, `record_effect(...)` |
+| `chaos` (package) | Data quality defects (see Chaos below) | `hit(world, defect, *ids)`, `record(...)` and the seams called from customers, web, fulfilment, returns, masterdata and deductions |
 
 Fulfilment hands lifecycle outcomes back through `world.schedule` events
 handled by the owning module (`"web.delivery_outcome"`, `"retail.pod"`), so
@@ -190,7 +198,13 @@ evicted from the store (`customers.maybe_evict`, on lapse, on subscription
 cancellation and when their last order is cleaned up; a one-off `on_load` pass
 counts open orders for states written before). Their shop rows stay; ids are never reused. New code must not
 look customers up in the store by id unless an open order, intent or
-subscription guarantees they are there. Measured on a 24-month state: resident
+subscription guarantees they are there, and nothing written may depend on
+whether an inactive customer is still in the store (`tests/e2e/test_live.py`
+compares a run with eviction switched off). Phase-2 entity kinds are removed
+when their lifecycle ends: `feed_acc` after delivery (at most two per channel
+remain), `promo_claim` after the claim, `deduction` when the case closes (and
+from its payer's `deduction_book`), `mkt_day` after the daily export;
+`chaos_ledger` keeps the erased customer ids (small). Measured on a 24-month state: resident
 memory after resume 880 MB before, 415 MB on the first resume (eviction pass),
 250 MB afterwards.
 
@@ -289,7 +303,8 @@ currency (`waerk`) plus EUR (`netwr_eur`, at the month's rate `kurrf`).
 | price_conditions | `konv` |
 | standard_costs | `mbew` |
 | exchange rates (extra) | `tcurr` |
-| deductions | phase 2 |
+| deductions | `zdeduct` (claim header), `zdeduct_item` (claimed articles and units), `zdeduct_clr` (clearing items: taken by short payment `T`, repaid `P`). SAP has no SD standard table for them; real systems keep them in FSCM dispute management or a customer table |
+| trade promotion agreements (extra) | `kona` (header, `knuma`) / `zkona_item` (promoted materials, scan-back amount per unit) |
 
 Status fields follow the S/4HANA style on the header and item tables
 (`gbstk`, `lfstk`, `fkstk`, `wbstk`, `kostk`; values blank / A / B / C).
@@ -318,9 +333,131 @@ never precedes it, and `kna1.erdat` is a deterministic account-opening date
 customer. An unknown catalogue category has no material group and fails
 loudly (`MATKL`).
 
+**Trade deductions** (`domain/deductions.py`). Deduction kinds per channel
+come from `deductions.types` (Kranz and Mylo: promotion, advertising fee per
+promotion, shortage, service penalty; Shopnova: promotion, co-op percentage of
+every invoice, shortage, service penalty; Belle: promotion, advertising
+percentage of invoice value, shortage; every retailer can raise unexplained
+claims). `zztype`: ZP01 promotion scan-back, ZW01 advertising, ZK01 co-op,
+ZP05 clearance (`retailer_overstock`), ZS01 shortage, ZL01 service penalty,
+ZX99 unexplained. Claims are matched or disputed, then accepted (in full,
+partly or as goodwill) or reversed. A dispute over a claim with a verifiable
+part (over agreement, D01; clearance) always settles at the verified amount
+and the excess is repaid; only a claim with nothing verifiable (no promotion,
+POD complete, duplicate) can be reversed. Payment of a retail invoice short-pays the
+open deductions in ascending case order with partial taking, so a claim larger
+than one invoice is split across invoices (`zdeduct_clr` rows with
+`vbeln_vf`); the unaccepted part is repaid. **No credit memo is booked for an
+accepted deduction in phase 2**: accepted trade funding is
+`zdeduct.zzaccepted`, and trade revenue in `vbrk` is gross of it. Every case
+reconciles to the cent: per paid retail invoice `zzpaid_amount + Σ taken =
+netwr + mwsbk` (R1), per closed case `Σ T - Σ P = zzaccepted` (R2), per
+promotion claim `wrbtr = Σ zdeduct_item.wrbtr` with an existing `kona` (R3).
+A closed case leaves the store, so open deductions never accumulate.
+
+### `feeds` (retailer and marketplace data feeds)
+
+Flat, file-like rows as each sender delivers them (`writers/feeds.py`). One
+`feed_loads` row per delivered file (`load_id` such as `KRZ_SO_20260302_01`,
+file name, delivery time, row count) and its data rows in
+`retailer_sellout`, `marketplace_sales_daily` or `marketplace_inventory_daily`.
+**All four tables are insert-only.** A restated period arrives as a new load
+(`is_restatement`, `restates_load_id`) whose rows replace the earlier load's
+rows for that period, so a consumer takes the latest load per
+(`source`, `feed_type`, `period_start`).
+
+* Sell-out is per retailer, period, sales region (the region a DC serves),
+  sales channel (store or online) and the retailer's own article number, with
+  the period-end stock on store rows (also zero-sales rows of listed
+  articles). Layouts differ by sender, not by schema: period label (`2026-W10`,
+  `KW10/2026`, retail month `2026P03`), region codes, sales-channel codes, NET
+  or GROSS value basis, article text style and file naming.
+* Kranz and Mylo report weekly (Monday 06:00-09:00 and 10:00-14:00), Belle
+  per retail month (4-4-5 calendar of ISO weeks, `models/retail_calendar.py`)
+  on the Wednesday after the period, Shopnova daily the next morning. 3 % of
+  retailer files arrive 1-2 days late (`feed_loads.delivered_at` only).
+* The marketplace reports carry only the marketplace product code (`SNV` + 8
+  digits), mapped through `erp.knmt` like retailer articles, and traffic as
+  `glance_views` (views are reported on out-of-stock days with 0 units).
+
+### `mkt` (marketing stack)
+
+Text keys (`PS-2026Q1-01`, `ATT-NV-10004711`), dates rather than timestamps
+for daily facts. `campaigns` are updated as their status moves (planned,
+active, ended); `influencer_codes` is written once per code at the history
+start and not updated afterwards; `campaign_spend_daily`,
+`sessions_daily` and `attributions` are written once per day after the day
+closes (04:00-05:00 local), like real marketing exports. Attribution is
+single-touch last click, one row per tracked web order (92 %: consent loss)
+noted when the order's payment is authorised (orders whose payment fails never
+reach mkt; a later cancellation stays attributed), referencing the shop order
+and customer UUIDs as text. Channel words are the shop's traffic sources, with
+one exception: the shop's `deal_site` source is the `affiliate` channel, so
+campaigns, attributions and sessions share one vocabulary. Coupon sites take
+the last click of 15 % of the tracked promoted orders from organic search and
+direct traffic (always-on coupon campaign, listing fee); the
+`promo_margin_trap` deal-site campaign is paid by commission, so its clicks
+come from the deal traffic it drives, not from spend. Affiliate sessions are
+affiliate clicks (`clicks >= sessions >= orders`), and `platform_conversions`
+never exceed clicks. `influencer_cohort_churn` raises the budget of every
+influencer campaign of its code: each gets a truth `spend_boost` row and a
+`daily_budget_eur` update on the first export it is boosted in, and the budget
+goes back on the first export after the window if the campaign still runs
+(a campaign that ends inside the window keeps the boosted budget). The campaign calendar
+is a pure function of seed, config, year and the regular promotion calendar
+(`domain/marketing.py`); ids never depend on scenario windows, and a campaign
+row is written before any spend or attribution that references it, also for
+scenario campaigns switched on live. Spend flights drive new-customer
+acquisition through a multiplier normalised per calendar year (rate-weighted
+mean 1), so web volume and the value-share calibration hold.
+
 ### `truth`
 
-Ground truth for planted scenarios (phase 1: `carrier_decay`,
-`promo_margin_trap`). Entity ids are recorded both neutrally and in the
-system key formats (`system_refs` jsonb) so findings in BI can be checked
-directly. Never granted to `bi_reader`.
+Ground truth for planted scenarios and data quality defects. Entity ids are
+recorded both neutrally and in the system key formats (`system_refs` jsonb)
+so findings in BI can be checked directly. Never granted to `bi_reader`.
+
+| entity_type | entity_id | system_refs |
+| --- | --- | --- |
+| web_order, delivery, customer (also duplicates), sku, sales_doc, billing | neutral id | shop / wms / erp keys |
+| `carrier_scan` | `<delivery_id>:<scan_seq>` | `wms_event_id`, `wms_shipment_id`, `erp_delivery` |
+| `customer_material` | `<retailer account>:<sku_id>` | `kunnr`, `matnr`, `kdmat`, `ean` |
+| `feed_load` | load id | `feeds_load_id`, `feeds_restatement_load_id` |
+| `retailer_dc_week` | `<dc account>:<YYYY-MM-DD>` (period start, or the PO order day for `post_overstock_cut`) | DC `kunnr`, `week_start` (always the Monday), `order_date` (when the id is an order day) |
+| `deduction` | neutral id | `erp_deduction` (`belnr`) |
+| `campaign` | campaign id | `mkt_campaign_id` |
+| `web_return` | neutral id | `wms_return_id`, `rma_no` |
+| `dst_transition` | local date | none |
+
+Every truth effect is recorded exactly once by construction (unique handler
+key, ledger or one call per entity), because the manager's in-memory
+de-duplication does not survive a restart and a second record would break
+the primary key.
+
+## Chaos (data quality noise)
+
+`src/cpgsim/chaos/` plants the defects of SPEC § Data quality noise at the
+configured rates (`chaos:` in the config; a rate of 0 switches a defect off).
+Domain code decides, writers only render: the seams in customers, web,
+fulfilment, returns, masterdata and deductions call the package. Selection is
+`hit(world, defect, *ids)`, a hash of `derive_seed(seed, "chaos", defect,
+*ids)` against the rate: pure in the ids, it never consumes a domain random
+stream. Every defect gets a truth window `<defect>:chaos` at history start
+(`source = 'chaos'`, `params = {"rate": r}`) and one effect per planted
+instance.
+
+| Defect | Module | Footprint in the business data |
+| --- | --- | --- |
+| duplicate_customer | `shop` | a second `shop.customers` account of the same person (varied name, e-mail, street format), id `50_000_000 + original id`; when the original is still active the person's next repeat order is placed on it |
+| malformed_postcode | `shop` | `shop.addresses.postcode` missing or malformed; the warehouse ships to the true one |
+| status_error | `orders` | `shop.orders` set `cancelled` (60 %) or the first `wms.shipments` row set `CX` (40 %) in error and corrected 2-10 hours later; the correction keeps the error timestamp: `status <> 'cancelled' AND cancelled_at IS NOT NULL` (shop), `status_code <> 'CX' AND cancelled_local IS NOT NULL` (wms) |
+| duplicate_carrier_event | `logistics` | a second `wms.carrier_events` row with the same time, code and location and its own `scan_seq` |
+| dst_local_time | `dst` | one truth row per DST transition (`chaos.dst`); `wms` `*_local` times skip or repeat an hour |
+| missing_order_ref | `orders` | web `vbak.bstnk` missing or truncated |
+| unmapped_article | `master` | a retailer article without `erp.knmt` row (about 95 % coverage); EDI order lines (`vbap.kdmat` + `matnr`) and `zkona_item` keep the pair, so the mapping is recoverable from history; `zdeduct_item.matnr` is NULL |
+| sellout_restatement | `domain/feeds.py` | a load under-reports one region; the next delivery restates the period as a new load |
+| free_text_return_reason | `logistics` | `wms.returns.reason_text` (German phrases, 10 % contradict the code) |
+| gdpr_erasure | `shop` | `shop.customers.status = 'anonymised'` and anonymised addresses; `wms` keeps the consignee name (deliberate cross-system disagreement) |
+
+Exact-reconciliation e2e tests run with chaos off (`CHAOS_OFF`); determinism
+tests run with chaos on.

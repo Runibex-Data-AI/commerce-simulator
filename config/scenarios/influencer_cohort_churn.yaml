@@ -1,0 +1,17 @@
+# Generic scenario definition for live enabling:
+#   sim scenario enable influencer_cohort_churn [--param influencer_code=LENA10]
+# The scenario starts at the current simulation time and stays on until
+# `sim scenario disable influencer_cohort_churn`. Customers acquired while it
+# is on keep the lower repurchase rate for life. No dates here: fixed windows
+# go in the `scenarios:` list of the config.
+id: influencer_cohort_churn
+description: >
+  A campaign buys customers who never come back: one influencer code's
+  campaign spend is boosted and buys more first-time customers, who then
+  rarely order again. Shows in the cohort retention curve by acquisition code
+  against the code's spend: customer acquisition cost versus lifetime value
+  (shop, mkt).
+params:
+  influencer_code: GLOWWITHMIA   # one of customers.influencer_codes
+  repurchase_multiplier: 0.3     # repurchase conversion of the window's cohort, x this (for life)
+  acquisition_boost: 2.5         # the code's campaign spend, x this while the window is open

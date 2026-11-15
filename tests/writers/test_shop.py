@@ -428,3 +428,35 @@ def test_write_and_update_roundtrip(conn):
     cur.execute("SELECT street, house_number, postcode FROM shop.addresses WHERE id = %s",
                 (keys.shop_address_id(SEED, 2, 1),))
     assert cur.fetchone() == ("anonymised", None, "80331")
+
+
+# -- chaos: status set in error (phase 2, WP5) ---------------------------------------
+
+
+def test_status_error_set_and_corrected_leave_residue():
+    from cpgsim.domain.events import StatusErrorCorrected, StatusErrorSet
+
+    d, _ = make_dispatcher()
+    d.dispatch(placed(order()))
+    d.dispatch(WebOrderStatusChanged(at=T1, order_id=5, status="released"))
+    d.dispatch(StatusErrorSet(at=T1, system="shop", entity_id=5, wrong_status="cancelled", error_at=T1))
+    (o,) = rows(d, "shop.orders")
+    assert o["status"] == "cancelled" and o["cancelled_at"] == T1 and o["cancel_reason"] is None
+    d.dispatch(StatusErrorCorrected(at=T2, system="shop", entity_id=5, status="released"))
+    (o,) = rows(d, "shop.orders")
+    assert o["status"] == "released" and o["cancelled_at"] == T1 and o["updated_at"] == T2
+    # wms errors and unknown statuses do not touch the shop
+    d.dispatch(StatusErrorSet(at=T3, system="wms", entity_id=5, wrong_status="cancelled", error_at=T3))
+    assert rows(d, "shop.orders")[0]["status"] == "released"
+    with pytest.raises(ValueError):
+        d.dispatch(StatusErrorCorrected(at=T3, system="shop", entity_id=5, status="teleported"))
+
+
+def test_status_error_on_committed_order_is_an_update():
+    from cpgsim.domain.events import StatusErrorCorrected, StatusErrorSet
+
+    d, _ = make_dispatcher()
+    d.dispatch(StatusErrorSet(at=T1, system="shop", entity_id=5, wrong_status="cancelled", error_at=T1))
+    d.dispatch(StatusErrorCorrected(at=T2, system="shop", entity_id=5, status="shipped"))
+    upd = d.batch.table("shop.orders").updates[(keys.shop_order_id(SEED, 5),)]
+    assert upd == {"status": "shipped", "cancelled_at": T1, "updated_at": T2}

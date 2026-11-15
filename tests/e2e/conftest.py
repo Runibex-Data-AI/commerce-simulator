@@ -23,12 +23,31 @@ from cpgsim.config import load_config
 DSN = os.environ.get("CPGSIM_TEST_DSN")
 pytestmark = pytest.mark.db
 
-BUSINESS = ("shop", "wms", "erp")
+BUSINESS = ("shop", "wms", "erp", "mkt", "feeds")
 WRITER, READER = "cpgsim_e2e_writer", "cpgsim_e2e_reader"
 
 #: Small but complete business: every lifecycle runs, quickly.
 SMALL = {
     "channels": {"web": {"base_orders_per_day": 60, "initial_customers": 1800}},
+}
+
+
+#: Overrides that switch every data quality defect off: ``small_cfg(**CHAOS_OFF)``.
+#: Exact-reconciliation tests check the business without noise; determinism
+#: tests keep chaos on (the default).
+CHAOS_OFF = {
+    "chaos": {
+        "duplicate_customer_rate": 0.0,
+        "malformed_postcode_rate": 0.0,
+        "status_error_rate": 0.0,
+        "duplicate_carrier_event_rate": 0.0,
+        "missing_order_ref_rate": 0.0,
+        "unmapped_article_rate": 0.0,
+        "sellout_restatement_rate": 0.0,
+        "free_text_return_reason_rate": 0.0,
+        "gdpr_erasure_rate_monthly": 0.0,
+        "dst_truth": False,
+    }
 }
 
 

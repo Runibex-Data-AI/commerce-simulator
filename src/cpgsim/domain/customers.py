@@ -95,6 +95,8 @@ def lazy(module: str) -> _Lazy:
 
 web = lazy("web")
 demandplan = lazy("demandplan")
+marketing = lazy("marketing")
+chaos = _Lazy("cpgsim.chaos")
 
 LOCALES = {"DE": "de_DE", "AT": "de_AT", "CH": "de_CH"}
 INTENT_GROUP_DAYS = 14.0  # lines running out within this many days of the first go into one intent
@@ -281,11 +283,10 @@ def new_customer(
     if country is None:
         country = pick(rng, cfg.channels.web.country_mix)
     if acquisition is None:
-        acquisition = pick(rng, cfg.customers.acquisition_mix)
+        acquisition = pick(rng, marketing.acquisition_mix(world, world.now))
     code = None
-    codes = cfg.customers.influencer_codes
-    if acquisition == "influencer" and codes:
-        code = codes[min(int(rng.random() * len(codes)), len(codes) - 1)]
+    if acquisition == "influencer":
+        code = marketing.pick_influencer_code(world, rng, world.now)
     prng = world.rng("customer.person", cid)
     address = world.ref.geo.sample_address(prng, country)
     domains = cfg.customers.email_domains.get(country) or None
@@ -310,9 +311,17 @@ def new_customer(
             birth_year=person["birth_year"] if prng.random() < BIRTH_YEAR_SHARE else None,
             marketing_opt_in=prng.random() < MARKETING_OPT_IN,
             locale=LOCALES.get(country, "de_DE"),
-            address=copy_address(address),
+            # the shop's record (chaos may garble it); the entity keeps the true address, so wms ships to it
+            address=chaos.shop_address(world, cid, copy_address(address)),
         )
     )
+    chaos.on_customer_registered(world, c)
+    if code and world.scenarios is not None:
+        # lifetime factor: records the customers acquired with a code while a cohort window is open
+        world.scenarios.factor(
+            "repurchase", world.now, world=world, record=("customer", cid), customer_id=cid,
+            acquisition=acquisition, influencer_code=code, acquired_at=c.created_at,
+        )
     return c
 
 
@@ -431,7 +440,8 @@ def on_intent(world, ev) -> None:
         return
     ccfg = world.cfg.customers
     mult = world.scenarios.factor(
-        "repurchase", world.now, customer_id=cid, acquisition=c.acquisition, influencer_code=c.influencer_code
+        "repurchase", world.now, customer_id=cid, acquisition=c.acquisition, influencer_code=c.influencer_code,
+        acquired_at=c.meta.get("acquired_at", c.created_at),
     )
     lines = [[int(s), int(q)] for s, q in zip(ev.data.get("skus", []), ev.data.get("qtys", []))]
     mult *= event_conversion_multiplier(world, [s for s, _ in lines])
@@ -440,12 +450,14 @@ def on_intent(world, ev) -> None:
     if rng.random() < p:
         basket = cherry_pick(world, rng, web.repeat_basket(world, rng, c.country, lines))
         if basket:
+            # A linked duplicate record may take over the person (chaos); it may evict ``c``.
+            buyer = chaos.repeat_customer(world, c)
             early = int(ev.data.get("early_days", 0))
             if early > 0:
                 # Bought ahead of running out: the stock left over pushes the
                 # next intent back by the same number of days.
-                world.store.mut("customer", cid).meta["carry_days"] = early
-            web.place_order(world, c, basket, source=pick(rng, REPEAT_SOURCES))
+                world.store.mut("customer", buyer.customer_id).meta["carry_days"] = early
+            web.place_order(world, buyer, basket, source=pick(rng, REPEAT_SOURCES))
             return
     c = world.store.mut("customer", cid)
     c.missed_intents += 1

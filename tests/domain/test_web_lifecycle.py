@@ -20,9 +20,11 @@ from cpgsim.config import load_config
 from cpgsim.domain import billing as real_billing
 from cpgsim.domain import customers, subscriptions, web
 from cpgsim.domain.events import (
+    BillingDocCreated,
     CustomerRegistered,
-    DeliveryCreated,
     DeliveryChanged,
+    DeliveryCreated,
+    PaymentRecorded,
     PaymentStatusChanged,
     RefundChanged,
     RefundIssued,
@@ -36,7 +38,6 @@ from cpgsim.domain.events import (
     WebOrderMilestoneReached,
     WebOrderPlaced,
     WebOrderStatusChanged,
-    BillingDocCreated,
 )
 from cpgsim.domain.model import (
     ENTITY_KINDS,
@@ -548,6 +549,28 @@ def test_payment_retry_success(monkeypatch):
     order = h.world.store.get("web_order", o.order_id)
     assert order.payment_attempts == 2 and len(order.payment_ids) == 2
     assert h.statuses(o.order_id)[:2] == ["authorised", "released"]
+
+
+@pytest.mark.parametrize("auth", [0.0, 1.0])
+def test_marketing_attributes_only_authorised_orders(monkeypatch, auth):
+    """mkt counts confirmed orders: the order is noted when its payment is authorised, with its source."""
+    from cpgsim.domain import marketing
+
+    noted = []
+    monkeypatch.setattr(marketing, "note_order",
+                        lambda w, o, cu, src, new_customer: noted.append((o.order_id, w.now, src, new_customer,
+                                                                          cu.customer_id)))
+    h = Harness(monkeypatch, payments={"auth_rate": auth, "retry_share": 0.0},
+                fulfilment={"cancel_before_pick": 0.0, "return_rate": 0.0})
+    c = h.customer()
+    o = web.place_order(h.world, c, [(_sku(h).sku_id, 1)], source="social")
+    assert noted == []
+    h.run_until(START + timedelta(days=1))
+    if auth:
+        (pay,) = [e for e in h.of(PaymentRecorded) if e.payment.order_id == o.order_id]
+        assert noted == [(o.order_id, pay.at, "social", True, c.customer_id)]
+    else:
+        assert noted == [] and h.statuses(o.order_id) == ["payment_failed"]
 
 
 def test_customer_cancel_before_pick(monkeypatch):

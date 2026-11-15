@@ -97,26 +97,77 @@ class RetailerCfg(_M):
     trade_discount: float = 0.36  # off trade list price (customer discount condition)
     assortment_share: float = 0.7  # share of eligible active SKUs listed (eligible: brand listed here; gift sets Nov-Dec)
     cutara_listed: bool = False  # whether the dermocosmetic brand is listed
-    promo_weeks_per_quarter: int = 2
-    model: str | None = None  # phase 2 (marketplace 1p)
-    sellout_frequency: Literal["weekly", "monthly"] = "weekly"
+    # promotions start in quarter-weeks 3-12 with a free week either side: at most 5 fit
+    promo_weeks_per_quarter: int = Field(2, ge=0, le=5)
+    model: str | None = None  # marketplace: "1p" (the brand sells wholesale to the marketplace)
+    sellout_frequency: Literal["weekly", "monthly", "daily"] = "weekly"
+    order_weekdays: list[int] | None = None  # 0=Mon..6=Sun, unique; overrides order_cycle_days
+    online_share: float | None = None  # None -> retail.online_share
+    # brand role (mass | derma | seasonal) -> listing share; overrides assortment_share / cutara_listed
+    brand_assortment: dict[str, float] | None = None
     enabled: bool = True
+
+    @field_validator("order_weekdays")
+    @classmethod
+    def _order_weekdays(cls, v: list[int] | None) -> list[int] | None:
+        if v is None:
+            return v
+        if not v:
+            raise ValueError("order_weekdays must not be empty (omit it to use order_cycle_days)")
+        if any(not 0 <= d <= 6 for d in v):
+            raise ValueError(f"order_weekdays must lie in 0..6 (0 = Monday), got {v}")
+        if len(set(v)) != len(v):
+            raise ValueError(f"order_weekdays must be unique, got {v}")
+        return v
+
+    @field_validator("online_share")
+    @classmethod
+    def _online_share(cls, v: float | None) -> float | None:
+        if v is not None and not 0.0 <= v <= 1.0:
+            raise ValueError(f"online_share must lie in [0, 1], got {v}")
+        return v
+
+    @field_validator("brand_assortment")
+    @classmethod
+    def _brand_assortment(cls, v: dict[str, float] | None) -> dict[str, float] | None:
+        if v is None:
+            return v
+        for role, share in v.items():
+            if role not in BRAND_ROLES:
+                raise ValueError(f"brand_assortment: unknown brand role {role!r}; roles: {', '.join(BRAND_ROLES)}")
+            if not 0.0 <= share <= 1.0:
+                raise ValueError(f"brand_assortment[{role}] must lie in [0, 1], got {share}")
+        return v
+
+
+#: Brand roles (catalogue): the mass-market, dermocosmetic and seasonal brand.
+BRAND_ROLES = ("mass", "derma", "seasonal")
 
 
 class ChannelsCfg(_M):
+    # Defaults mirror default.yaml. The marketplace and the perfumery are
+    # switched on together with the retail logic they need.
     web: WebCfg = Field(default_factory=WebCfg)
     drogerie_kranz: RetailerCfg = Field(
         default_factory=lambda: RetailerCfg(share=0.35, dcs=3, payment_terms_days=45, assortment_share=0.72)
     )
     mylo: RetailerCfg = Field(
-        default_factory=lambda: RetailerCfg(share=0.25, dcs=2, payment_terms_days=60, assortment_share=0.62)
+        default_factory=lambda: RetailerCfg(
+            share=0.25, dcs=2, payment_terms_days=60, assortment_share=0.62, online_share=0.11
+        )
     )
     shopnova: RetailerCfg = Field(
-        default_factory=lambda: RetailerCfg(share=0.20, model="1p", enabled=False)
+        default_factory=lambda: RetailerCfg(
+            share=0.20, model="1p", dcs=2, payment_terms_days=60, trade_discount=0.38,
+            assortment_share=0.85, cutara_listed=True, order_weekdays=[0, 2, 4],
+            sellout_frequency="daily", enabled=True,
+        )
     )
     belle: RetailerCfg = Field(
         default_factory=lambda: RetailerCfg(
-            share=0.10, sellout_frequency="monthly", cutara_listed=True, enabled=False
+            share=0.10, dcs=2, payment_terms_days=30, trade_discount=0.42, cutara_listed=True,
+            brand_assortment={"derma": 1.0, "seasonal": 0.3, "mass": 0.0}, order_cycle_days=7,
+            online_share=0.10, promo_weeks_per_quarter=1, sellout_frequency="monthly", enabled=True,
         )
     )
 
@@ -287,6 +338,161 @@ class RetailCfg(_M):
     order_hour_local: int = 5
 
 
+# -- phase 2: feeds, deductions, marketing, chaos ------------------------------
+
+
+class FeedsCfg(_M):
+    """Retailer and marketplace data feeds (delivery times are local hours)."""
+
+    weekly_delivery_hours: dict[str, tuple[float, float]] = Field(
+        default_factory=lambda: {"drogerie_kranz": (6.0, 9.0), "mylo": (10.0, 14.0)}
+    )  # weekly sell-out file on Monday, per retailer
+    default_weekly_delivery_hours: tuple[float, float] = (8.0, 12.0)
+    monthly_delivery_weekday: int = 2  # Wednesday after the retail period's last Sunday
+    monthly_delivery_hours: tuple[float, float] = (8.0, 12.0)
+    marketplace_report_hours: tuple[float, float] = (7.0, 9.0)  # daily reports, the next day
+    late_delivery_rate: float = 0.03  # retailer files (not marketplace) arriving 1-2 days late
+    late_delivery_days: tuple[int, int] = (1, 2)
+    restatement_missing_share: tuple[float, float] = (0.05, 0.35)  # under-reported share of one region
+    marketplace_price_index: float = 0.93  # marketplace consumer price / RRP
+    marketplace_sale_discount: float = 0.15  # consumer discount in the marketplace sale week
+    marketplace_conversion: tuple[float, float] = (0.06, 0.14)  # units per product page view, per SKU
+
+    @field_validator("late_delivery_rate")
+    @classmethod
+    def _rate(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(f"late_delivery_rate must lie in [0, 1], got {v}")
+        return v
+
+    @field_validator("monthly_delivery_weekday")
+    @classmethod
+    def _weekday(cls, v: int) -> int:
+        if not 0 <= v <= 6:
+            raise ValueError(f"monthly_delivery_weekday must lie in 0..6, got {v}")
+        return v
+
+
+class DeductionKindsCfg(_M):
+    """Which deductions one retailer channel raises, and its contractual rates."""
+
+    promotion: bool = True  # scan-based promotion claims (ZP01)
+    shortage: bool = True  # shortage claims after proof of delivery (ZS01)
+    unexplained: bool = True  # duplicate / unexplained claims (ZX99)
+    service_penalty: bool = False  # penalties for cut purchase orders (ZL01)
+    advertising: Literal["none", "per_promotion", "per_invoice"] = "none"  # ZW01
+    advertising_fee_eur: float = 0.0  # per_promotion: fixed WKZ fee per promotion (also kona.zzwkz_eur)
+    advertising_pct: float = 0.0  # per_invoice: share of invoice gross
+    coop_pct: float = 0.0  # co-op / marketing fee, share of invoice gross (0 = none) (ZK01)
+
+    @model_validator(mode="after")
+    def _check(self) -> "DeductionKindsCfg":
+        for name in ("advertising_pct", "coop_pct"):
+            v = getattr(self, name)
+            if not 0.0 <= v <= 0.2:
+                raise ValueError(f"{name} must lie in [0, 0.2], got {v}")
+        if (self.advertising_fee_eur > 0) != (self.advertising == "per_promotion"):
+            raise ValueError(
+                "advertising_fee_eur must be > 0 exactly when advertising is 'per_promotion'"
+                f" (advertising={self.advertising!r}, advertising_fee_eur={self.advertising_fee_eur})"
+            )
+        if self.advertising_fee_eur < 0:
+            raise ValueError("advertising_fee_eur must be >= 0")
+        return self
+
+
+class DeductionsCfg(_M):
+    """Trade deductions: claims raised by retailers and short-paid from invoices."""
+
+    types: dict[str, DeductionKindsCfg] = Field(
+        default_factory=lambda: {  # a channel missing from the map raises no deductions
+            "drogerie_kranz": DeductionKindsCfg(
+                service_penalty=True, advertising="per_promotion", advertising_fee_eur=2500.0
+            ),
+            "mylo": DeductionKindsCfg(service_penalty=True, advertising="per_promotion", advertising_fee_eur=1800.0),
+            "shopnova": DeductionKindsCfg(service_penalty=True, coop_pct=0.04),
+            "belle": DeductionKindsCfg(advertising="per_invoice", advertising_pct=0.02),
+        }
+    )
+    scanback_share: float = 0.25  # share of the consumer discount reimbursed per unit sold
+    service_cut_threshold: float = 0.05  # cut share of ordered units above which a penalty follows
+    service_penalty_pct: float = 0.05  # of the cut net value
+    penalty_delay_days: tuple[int, int] = (14, 35)
+    claim_delay_weeks: tuple[int, int] = (2, 8)
+    match_days: tuple[int, int] = (2, 10)  # working days
+    accept_days: tuple[int, int] = (1, 5)
+    dispute_weeks: tuple[int, int] = (2, 8)
+    match_tolerance: float = 0.02
+    overclaim_rate: float = 0.15
+    overclaim_range: tuple[float, float] = (0.05, 0.30)
+    invalid_claim_rate: float = 0.05
+    shortage_claim_rate: float = 0.03
+    shortage_valid_share: float = 0.60
+    repay_days: tuple[int, int] = (5, 20)
+
+
+class PaidChannelCfg(_M):
+    cac_eur: float
+    always_on_share: float  # share of the channel's baseline budget that is always on
+    flights_per_quarter: float = 0.0
+    flight_days: tuple[int, int] = (14, 28)
+    flight_intensity: tuple[float, float] = (1.5, 2.5)
+    cpm_eur: float = 6.0
+    ctr: float = 0.012
+
+
+class MarketingCfg(_M):
+    """Marketing stack: campaign calendar, spend-driven acquisition, daily exports."""
+
+    response_elasticity: float = 0.7  # new customers respond to spend flights with this elasticity
+    paid: dict[str, PaidChannelCfg] = Field(
+        default_factory=lambda: {
+            "paid_search": PaidChannelCfg(
+                cac_eur=28.0, always_on_share=0.8, flights_per_quarter=1.0, cpm_eur=9.0, ctr=0.035
+            ),
+            "social": PaidChannelCfg(cac_eur=35.0, always_on_share=0.4, flights_per_quarter=2.0, cpm_eur=5.5, ctr=0.011),
+            "influencer": PaidChannelCfg(
+                cac_eur=45.0, always_on_share=0.5, flights_per_quarter=1.5, cpm_eur=4.0, ctr=0.008
+            ),
+        }
+    )
+    conversion_rates: dict[str, float] = Field(
+        default_factory=lambda: {
+            "organic_search": 0.024, "paid_search": 0.031, "social": 0.011, "influencer": 0.020,
+            "marketplace_spillover": 0.018, "direct": 0.035, "email": 0.042, "app": 0.050, "deal_site": 0.060,
+        }
+    )  # orders per session, by traffic source
+    tracking_share: float = 0.92  # share of shop orders tracked by web analytics (consent)
+    device_mix: dict[str, float] = Field(default_factory=lambda: {"mobile": 0.62, "desktop": 0.31, "tablet": 0.07})
+    influencer_commission_pct: float = 12.0
+    deal_site_commission_pct: float = 8.0
+    newsletter_cost_eur: float = 180.0
+
+
+class ChaosCfg(_M):
+    """Data quality noise (spec default rates). A rate of 0 switches a defect off."""
+
+    duplicate_customer_rate: float = 0.02  # shop: same person, slightly different name or email
+    malformed_postcode_rate: float = 0.005  # shop: missing or malformed postcode
+    status_error_rate: float = 0.003  # shop, wms: status set in error, corrected hours later
+    duplicate_carrier_event_rate: float = 0.01  # wms
+    missing_order_ref_rate: float = 0.01  # erp: missing or truncated shop order reference
+    unmapped_article_rate: float = 0.05  # erp, feeds: retailer article without EAN mapping
+    sellout_restatement_rate: float = 0.10  # feeds: retailer periods restated with the next delivery
+    free_text_return_reason_rate: float = 0.15  # wms
+    gdpr_erasure_rate_monthly: float = 0.0005  # shop: customers anonymised per month
+    dst_truth: bool = True  # record each DST transition in truth (local wms times)
+
+    @model_validator(mode="after")
+    def _rates(self) -> "ChaosCfg":
+        for name, v in self:
+            if isinstance(v, bool):
+                continue
+            if not 0.0 <= float(v) <= 1.0:
+                raise ValueError(f"chaos.{name} must lie in [0, 1], got {v}")
+        return self
+
+
 class DatabaseCfg(_M):
     dsn: str | None = None  # overridden by CPGSIM_DSN; never commit real values
 
@@ -331,7 +537,10 @@ class Config(_M):
     carriers: CarriersCfg = Field(default_factory=CarriersCfg)
     retail: RetailCfg = Field(default_factory=RetailCfg)
     scenarios: list[ScenarioCfg] = Field(default_factory=list)
-    chaos: dict[str, Any] = Field(default_factory=dict)  # phase 2
+    feeds: FeedsCfg = Field(default_factory=FeedsCfg)
+    deductions: DeductionsCfg = Field(default_factory=DeductionsCfg)
+    marketing: MarketingCfg = Field(default_factory=MarketingCfg)
+    chaos: ChaosCfg = Field(default_factory=ChaosCfg)
 
     @field_validator("erp")
     @classmethod

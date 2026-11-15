@@ -24,6 +24,11 @@ HANDLER_MODULES = (
     "cpgsim.domain.subscriptions",
     "cpgsim.domain.retail",
     "cpgsim.scenarios.manager",
+    # phase 2
+    "cpgsim.domain.feeds",
+    "cpgsim.domain.deductions",
+    "cpgsim.domain.marketing",
+    "cpgsim.chaos",  # the package __init__ imports its submodules
 )
 
 

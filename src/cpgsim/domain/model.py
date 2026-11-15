@@ -85,6 +85,11 @@ STOCK_MOVEMENT_TYPES = (
     "adjustment",  # inventory count difference
 )
 
+# Trade deductions (phase 2). Writers map kinds to SAP claim types (ZP01 ...)
+# and statuses to one-letter codes (O, M, D, A, R).
+DEDUCTION_STATUSES = ("claimed", "matched", "disputed", "accepted", "reversed")
+DEDUCTION_KINDS = ("promotion", "advertising", "coop", "clearance", "shortage", "service_penalty", "unexplained")
+
 
 # ---------------------------------------------------------------------------
 # Reference data (rebuilt from seed + config, not persisted)
@@ -450,6 +455,7 @@ class RetailPO:
     billing_id: int | None = None
     promo_ids: list[int] = field(default_factory=list)
     meta: dict = field(default_factory=dict)  # module scratch space, JSON values only
+    invoice_gross: float | None = None  # set at invoice creation (payment does not need the billing entity)
 
 
 @dataclass(slots=True)
@@ -470,12 +476,14 @@ class StockPosition:
     backorder_qty: int = 0
     avg_daily_out: float = 0.0  # smoothed outbound units per day (planning)
     issued_today: int = 0  # units issued since the last daily snapshot
+    blocked: int = 0  # quality-blocked units (not on hand)
+    held_receipts: list[dict] = field(default_factory=list)  # receipt event data held during a block
 
 
 @dataclass(slots=True)
 class Promotion:
     promo_id: int
-    channel: str  # web | drogerie_kranz | mylo
+    channel: str  # web | retailer channel key
     name: str
     kind: str  # code | automatic
     code: str | None
@@ -498,6 +506,121 @@ class RetailerInventory:
     on_hand: dict[int, float] = field(default_factory=dict)  # sku_id -> units
     on_order: dict[int, float] = field(default_factory=dict)  # sku_id -> units in transit
     forecast: dict[int, float] = field(default_factory=dict)  # sku_id -> weekly units (smoothed)
+    push_backlog: dict[int, float] = field(default_factory=dict)  # sku_id -> units cut during push mode
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: marketing, deductions, feeds, chaos
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class Campaign:
+    """A marketing campaign of the pure campaign calendar (not stored)."""
+
+    campaign_id: str
+    name: str
+    channel: str  # paid_search | social | influencer | email | affiliate
+    objective: str  # acquisition | promotion | retention
+    start: date
+    end: date  # inclusive
+    daily_budget_eur: float
+    created_on: date  # local date of defined_at
+    defined_at: datetime  # when the campaign record is created (CampaignDefined)
+    influencer_code: str | None = None
+    promo_id: int | None = None
+    scenario_id: str | None = None
+    window_id: str | None = None  # scenario campaigns
+
+
+@dataclass(slots=True)
+class DeductionItem:
+    sku_id: int | None
+    customer_article: str | None
+    mapped: bool  # False -> zdeduct_item.matnr NULL
+    units: int
+    rate_net: float
+    amount: float  # gross
+
+
+@dataclass(slots=True)
+class Deduction:
+    """A deduction claimed by a trade customer (id = deduction_id; removed when closed)."""
+
+    deduction_id: int
+    kind: str  # DEDUCTION_KINDS
+    channel: str
+    payer: str  # retailer account id
+    claimed_on: date
+    claimed_at: datetime
+    amount: float  # claimed, EUR gross
+    validated_amount: float  # what the brand can verify (drives matching)
+    status: str = "claimed"  # DEDUCTION_STATUSES
+    items: list[DeductionItem] = field(default_factory=list)
+    promo_id: int | None = None
+    promo_text: str | None = None
+    period_from: date | None = None
+    period_to: date | None = None
+    delivery_id: int | None = None  # shortage
+    sales_doc_id: int | None = None  # service penalty
+    billing_id: int | None = None  # contractual kinds: the invoice that triggered the claim
+    accepted_amount: float | None = None
+    dispute_reason: str | None = None
+    taken: float = 0.0  # short-paid so far
+    repaid: float = 0.0  # repaid so far
+    clr_seq: int = 0  # last clearing sequence used
+    window_id: str | None = None  # scenario window (clearance claims)
+    meta: dict = field(default_factory=dict)  # module scratch space, JSON values only
+
+
+@dataclass(slots=True)
+class DeductionBook:
+    """Open deductions of one payer (id = payer account id)."""
+
+    payer: str
+    open_ids: list[int] = field(default_factory=list)  # ascending
+
+
+@dataclass(slots=True)
+class PromoClaimBasis:
+    """Units sold on promotion, per promotion week and brand (id = f"{promo_id}:{week_start:%Y%m%d}:{brand}")."""
+
+    promo_id: int
+    channel: str
+    week_start: date
+    brand: str
+    units: dict[int, int] = field(default_factory=dict)  # sku_id -> promo units sold
+
+
+@dataclass(slots=True)
+class FeedAccumulator:
+    """Sell-out of one feed period being collected (id = f"{channel}:{W|M|D}:{period_start iso}")."""
+
+    channel: str
+    period_type: str  # W | M | D
+    period_start: date
+    period_end: date
+    # "dc|sku" -> [store_units, online_units, value_net, value_gross, on_hand]  (W/M; on_hand = latest week end)
+    # "sku"    -> [sold, demand, on_hand, on_order]                            (D, summed over FCs)
+    rows: dict[str, list] = field(default_factory=dict)
+    dcs_reported: list[str] = field(default_factory=list)
+    meta: dict = field(default_factory=dict)  # restate flag, run-1 load, region/missing share
+
+
+@dataclass(slots=True)
+class MarketingDay:
+    """Tracked web orders of one local day, until the daily export (id = local date iso)."""
+
+    day: date
+    by_channel: dict[str, list] = field(default_factory=dict)  # "channel|country" -> [orders, revenue_eur, new_customers]
+    attributions: list[list] = field(default_factory=list)  # [order_id, customer_id, channel, campaign_id, code, is_new, revenue_eur]
+
+
+@dataclass(slots=True)
+class ChaosLedger:
+    """Ids a chaos defect has acted on (id = defect name, e.g. "gdpr")."""
+
+    ids: list[int] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -519,4 +642,11 @@ ENTITY_KINDS: dict[str, type] = {
     "stock": StockPosition,
     "retailer_inventory": RetailerInventory,
     "promotion": Promotion,
+    # phase 2
+    "deduction": Deduction,
+    "deduction_book": DeductionBook,
+    "promo_claim": PromoClaimBasis,
+    "feed_acc": FeedAccumulator,
+    "mkt_day": MarketingDay,
+    "chaos_ledger": ChaosLedger,
 }

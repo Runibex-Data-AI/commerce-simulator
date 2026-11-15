@@ -179,17 +179,31 @@ def scenario_windows(
             if sc.end
             else None
         )
-        out.append(Window(sc.id, "config", start, end, sc.params()))
+        out.append(Window(sc.id, "config", start, _self_limited_end(sc.id, sc.params(), start, end, tz),
+                          sc.params()))
     for _id, sid, action, at, params in overrides:
         at = at.astimezone(UTC)
         if action == "enable":
-            out.append(Window(sid, "cli", at, None, dict(params or {})))
+            p = dict(params or {})
+            out.append(Window(sid, "cli", at, _self_limited_end(sid, p, at, None, tz), p))
         elif action == "disable":
             open_ = [(i, w) for i, w in enumerate(out) if w.scenario_id == sid and w.contains(at)]
             if open_:
                 _, w = max(open_, key=lambda iw: (iw[1].start or _MIN_UTC, iw[0]))
                 w.end = at
     return out
+
+
+def _self_limited_end(sid: str, params: dict, start: datetime | None, end: datetime | None,
+                      tz: ZoneInfo) -> datetime | None:
+    """``end`` limited by a self-limiting scenario's duration (as the engine does, ``manager._bounded_end``)."""
+    from .scenarios import base as scenario_base
+    from .scenarios.manager import _bounded_end
+
+    impl = scenario_base.get(sid)
+    if impl is None or start is None:
+        return end
+    return _bounded_end(sid, {**getattr(impl, "defaults", {}), **params}, start, end, tz)
 
 
 def active_scenarios(windows: Sequence[Window], t: datetime) -> list[Window]:

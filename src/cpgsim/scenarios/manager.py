@@ -33,22 +33,37 @@ windows active at ``t`` whose implementation provides ``name`` and applies to
 ``world=world, record=(entity_type, entity_id)`` at decision points that affect
 one entity and every contributing window writes a row to
 ``truth.planted_effects`` (effect = the factor name, magnitude = that window's
-factor, detail = the call context). Factor names in phase 1:
+factor, detail = the call context). Factor names:
 
-=====================  ======================================  ==================
-Factor                 Asked by                                Provided by
-=====================  ======================================  ==================
-``carrier_delay``      fulfilment, per web delivery            ``carrier_decay``
-``carrier_exception``  fulfilment, per web delivery            ``carrier_decay``
-``sku_demand``         demand plan, per SKU/channel/day        (phase 2)
-``web_orders``         demand plan, total web demand           (phase 2)
-``web_new_customers``  web arrivals                            (phase 2)
-``repurchase``         customers, per repurchase intent        (phase 2)
-``retail_order``       retail, per purchase order              (phase 2)
-=====================  ======================================  ==================
+=====================  ==========================================  ===========================
+Factor                 Asked by                                    Provided by
+=====================  ==========================================  ===========================
+``carrier_delay``      fulfilment, per web delivery                ``carrier_decay``
+``carrier_exception``  fulfilment, per web delivery                ``carrier_decay``
+``repurchase``         customers, per new customer (record) and    ``influencer_cohort_churn``
+                       per repurchase intent (lifetime factor)
+``mkt_spend``          marketing, campaign plan per channel/code   ``influencer_cohort_churn``
+``retail_push``        retail, per purchase order; demand plan     ``retailer_overstock``
+``sku_demand``         demand plan, per SKU/channel/day            (unused)
+``web_orders``         demand plan, total web demand               (unused)
+``web_new_customers``  web arrivals                                (unused)
+``retail_order``       retail, per purchase order                  (unused)
+=====================  ==========================================  ===========================
+
+A factor in an implementation's ``lifetime_factors`` is asked for every ``t``
+from the window's start on, also after its end (``repurchase``: customers
+acquired inside the window keep the multiplier for life).
+
+``transfers(name, t, world=world, **ctx)`` lists demand transfers
+``(window, from_sku, to_sku, share)`` of the active windows
+(``hero_oos_substitution`` moves a share of the hero's web demand to a sibling).
 
 ``scenario_promotions()`` lists promotion specs (``promo_margin_trap``), which
 the promotions calendar turns into ordinary promotions.
+
+An implementation with a ``duration(params)`` bounds its windows: the end is
+``start + duration`` (or the configured end, if earlier), so a live window
+closes by itself and a later ``disable`` is a no-op.
 
 Determinism: windows are a pure function of config, the override rows and
 the simulation time, so caches keyed by ``version`` (which changes only when
@@ -108,7 +123,10 @@ from ..engine.queue import Event
 from ..engine.registry import arrival_source, bootstrap, handler, on_load
 from . import base
 from . import carrier_decay as _carrier_decay  # noqa: F401  (registers the implementation)
+from . import hero_oos_substitution as _hero_oos_substitution  # noqa: F401  (registers the implementation)
+from . import influencer_cohort_churn as _influencer_cohort_churn  # noqa: F401  (registers the implementation)
 from . import promo_margin_trap as _promo_margin_trap  # noqa: F401  (registers the implementation)
+from . import retailer_overstock as _retailer_overstock  # noqa: F401  (registers the implementation)
 from .base import ScenarioParamError
 
 log = logging.getLogger("cpgsim.scenarios")
@@ -200,7 +218,7 @@ class ScenarioManager:
         self._windows: list[ScenarioWindow] = []
         self._closes: list[tuple[datetime, str, int]] = []
         self._signature: tuple = ()
-        self._install([replace(w) for w in self._config_windows], [])
+        self._install(self._effective_config_windows(), [])
 
     # -- construction --------------------------------------------------------
     def _local_midnight(self, d: date) -> datetime:
@@ -336,6 +354,10 @@ class ScenarioManager:
                         w.window_id, k.isoformat(),
                     )
                     continue
+            # A window without a start begins at history start (once known).
+            base_start = self.history_start if w.from_history_start else w.start
+            if base_start is not None:
+                w.end = _bounded_end(w.scenario_id, w.params, base_start, w.end, self.tz)
             out.append(w)
         return out
 
@@ -370,7 +392,8 @@ class ScenarioManager:
                     continue
                 windows.append(
                     ScenarioWindow(
-                        window_id=f"{sid}:cli:{oid}", scenario_id=sid, params=p, start=at, end=None,
+                        window_id=f"{sid}:cli:{oid}", scenario_id=sid, params=p, start=at,
+                        end=_bounded_end(sid, p, at, None, self.tz),
                         source="cli", index=CLI_INDEX_OFFSET + oid, override_id=oid,
                         position=len(windows),
                     )
@@ -378,10 +401,19 @@ class ScenarioManager:
             elif action == "disable":
                 open_ = [w for w in windows if w.scenario_id == sid and w.contains(at)]
                 if not open_:
-                    self._warn_once(
-                        f"{oid}", "scenario override #%d: no open %r window at %s; nothing to disable",
-                        oid, sid, at.isoformat(),
-                    )
+                    ended = [w for w in windows if w.scenario_id == sid and w.end is not None
+                             and w.start <= at and w.end <= at]
+                    if ended:
+                        self._warn_once(
+                            f"{oid}", "scenario override #%d: the %r window %s already ended at %s"
+                            " (self-limited); nothing to disable",
+                            oid, sid, ended[-1].window_id, ended[-1].end.isoformat(),
+                        )
+                    else:
+                        self._warn_once(
+                            f"{oid}", "scenario override #%d: no open %r window at %s; nothing to disable",
+                            oid, sid, at.isoformat(),
+                        )
                     continue
                 w = max(open_, key=lambda x: (x.start, x.position))
                 w.end = at
@@ -426,7 +458,7 @@ class ScenarioManager:
             return 1.0
         f = 1.0
         for w, impl in cands:
-            if not w.contains(t):
+            if not w.contains(t) and not (name in impl.lifetime_factors and w.start <= t):
                 continue
             v = impl.factor(name, w, t, ctx)
             if v is None:
@@ -437,6 +469,35 @@ class ScenarioManager:
                 etype, eid = record
                 self._emit_effect(world, w.scenario_id, w.window_id, str(etype), eid, name, v, ctx)
         return f
+
+    def transfers(self, name: str, t: datetime, **ctx: Any) -> list[tuple[ScenarioWindow, int, int, float]]:
+        """Demand transfers ``(window, from_sku, to_sku, share)`` of the windows active at ``t``.
+
+        ``ctx`` must contain ``world`` (callers pass ``world=world``); it is passed
+        to the implementations unchanged. Empty when nothing applies.
+        """
+        out: list[tuple[ScenarioWindow, int, int, float]] = []
+        for w in self._windows:
+            if not w.contains(t):
+                continue
+            impl = base.REGISTRY[w.scenario_id]
+            if type(impl).transfers is base.Scenario.transfers:
+                continue
+            for src, dst, share in impl.transfers(name, w, t, ctx):
+                out.append((w, int(src), int(dst), float(share)))
+        return out
+
+    def visible_from(self, window: ScenarioWindow) -> datetime | None:
+        """Earliest time at which rows about ``window`` may be written, or ``None`` (no bound).
+
+        A live (CLI) window becomes known at its start; a config window that was
+        added after the fresh start at ``known_at + 1 us``; any other config
+        window was known from the start of the simulation.
+        """
+        if window.source == "cli":
+            return window.start
+        k = self._known_at.get(window.window_id)
+        return k + EPS if k is not None else None
 
     def record_effect(
         self,
@@ -526,6 +587,8 @@ class ScenarioManager:
         if world.history_start != self.history_start:
             self.history_start = world.history_start
             self._promos = None
+            if any(w.from_history_start and _has_duration(w.scenario_id) for w in self._config_windows):
+                self._rebuild(force=True)  # their self-limited end counts from history start
 
     def truth_arrivals(self, start: datetime, end: datetime) -> list[Event]:
         """Record/close events due in ``(start, end]``; pure in the windows."""
@@ -568,6 +631,29 @@ class ScenarioManager:
 
 
 # -- helpers -------------------------------------------------------------------
+
+
+def _has_duration(scenario_id: str) -> bool:
+    impl = base.get(scenario_id)
+    return impl is not None and type(impl).duration is not base.Scenario.duration
+
+
+def _bounded_end(
+    scenario_id: str, params: dict, start: datetime, end: datetime | None, tz: ZoneInfo
+) -> datetime | None:
+    """``end`` limited to ``start + duration(params)`` for self-limiting scenarios.
+
+    The duration is added in local wall-clock time, so a window opening at
+    00:00 local closes at 00:00 local, also across a DST change.
+    """
+    impl = base.get(scenario_id)
+    if impl is None:
+        return end
+    dur = impl.duration(params)
+    if dur is None:
+        return end
+    limit = (start.astimezone(tz) + dur).astimezone(UTC)
+    return limit if end is None else min(end, limit)
 
 
 def _aware_utc(t: datetime) -> datetime:

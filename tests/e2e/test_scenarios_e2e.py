@@ -17,7 +17,7 @@ from datetime import date
 import psycopg
 import pytest
 
-from .conftest import simulation, small_cfg, utc
+from .conftest import CHAOS_OFF, simulation, small_cfg, utc
 
 pytestmark = [pytest.mark.db, pytest.mark.slow]
 
@@ -70,7 +70,7 @@ WITH promo AS (
 @pytest.fixture(scope="module")
 def margin_trap(fresh_db_module):
     dsn = fresh_db_module()
-    cfg = small_cfg(scenarios=[{"id": "promo_margin_trap", "start": WINDOW[0], "end": WINDOW[1]}])
+    cfg = small_cfg(scenarios=[{"id": "promo_margin_trap", "start": WINDOW[0], "end": WINDOW[1]}], **CHAOS_OFF)
     with simulation(dsn, cfg, date(2026, 1, 5)) as sim:
         # four weeks after the window, so returns and their credit memos are booked
         sim.backfill(utc(date(2026, 4, 27)))

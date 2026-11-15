@@ -245,6 +245,7 @@ class FakeBilling:
     def __init__(self) -> None:
         self.invoices: list[tuple[BillingDoc, datetime]] = []
         self.cleared: list[tuple[int, datetime]] = []
+        self.paid: list[tuple[int, float | None, str | None]] = []
 
     def module(self) -> types.ModuleType:
         mod = types.ModuleType("cpgsim.domain.billing")
@@ -268,12 +269,78 @@ class FakeBilling:
             self.invoices.append((doc, world.now))
             return doc
 
-        def clear(world, billing_id, amount=None):
+        def clear(world, billing_id, amount=None, status=None):
             self.cleared.append((billing_id, world.now))
+            self.paid.append((billing_id, amount, status))
 
         mod.create_invoice = create_invoice
         mod.clear = clear
         return mod
+
+
+class FakeFeeds:
+    """Captures the sell-out handed to ``domain.feeds`` (weekly and daily)."""
+
+    def __init__(self) -> None:
+        self.weeks: list[tuple] = []  # (channel, dc, week_start, sold, lost, demand, on_hand)
+        self.days: list[tuple] = []  # (channel, dc, day, sold, demand, on_hand, on_order)
+
+    def module(self) -> types.ModuleType:
+        mod = types.ModuleType("cpgsim.domain.feeds")
+
+        def record_sellout_week(world, channel, dc, week_start, sold, lost, demand, on_hand):
+            self.weeks.append((channel, dc, week_start, dict(sold), dict(lost), dict(demand), dict(on_hand)))
+
+        def record_marketplace_day(world, channel, dc, day, sold, demand, on_hand, on_order):
+            self.days.append((channel, dc, day, dict(sold), dict(demand), dict(on_hand), dict(on_order)))
+
+        mod.record_sellout_week = record_sellout_week
+        mod.record_marketplace_day = record_marketplace_day
+        return mod
+
+
+class FakeDeductions:
+    """Captures the retail calls into ``domain.deductions``; takes ``take`` EUR per payment."""
+
+    def __init__(self, take: float = 0.0) -> None:
+        self.take = take
+        self.sellout: list[tuple] = []
+        self.pods: list[tuple] = []
+        self.cuts: list[tuple] = []
+        self.payments: list[tuple] = []
+
+    def module(self) -> types.ModuleType:
+        mod = types.ModuleType("cpgsim.domain.deductions")
+
+        def record_sellout(world, channel, dc, first_day, days, sold):
+            self.sellout.append((channel, dc, first_day, days, dict(sold)))
+
+        def record_pod(world, po_id, channel, dc, delivery_id, lines):
+            self.pods.append((po_id, channel, dc, delivery_id, list(lines)))
+
+        def record_cut(world, po_id, channel, dc, ordered_units, cut_units, cut_value_net):
+            self.cuts.append((po_id, channel, dc, ordered_units, cut_units, cut_value_net))
+
+        def take_on_payment(world, channel, billing_id, gross):
+            t = min(self.take, gross)
+            self.payments.append((channel, billing_id, gross, t))
+            return t
+
+        mod.record_sellout = record_sellout
+        mod.record_pod = record_pod
+        mod.record_cut = record_cut
+        mod.take_on_payment = take_on_payment
+        return mod
+
+
+def sellout_by_week(feeds: FakeFeeds) -> dict:
+    """``{dc: {week_start iso: units sold}}`` from the captured feeds calls (days summed into weeks)."""
+    out: dict = defaultdict(lambda: defaultdict(float))
+    for _, dc, ws, sold, *_ in feeds.weeks:
+        out[dc][ws.isoformat()] += sum(sold.values())
+    for _, dc, day, sold, *_ in feeds.days:
+        out[dc][retail.monday(day).isoformat()] += sum(sold.values())
+    return out
 
 
 def kranz_promo(world) -> Promotion:
@@ -301,17 +368,26 @@ def sim(monkeypatch):
     short_sku = sorted((i for i in kranz_ids if i not in promo.sku_ids),
                        key=lambda i: (-cat.get(i).popularity, i))[0]
     wh = FakeWarehouse({short_sku: 2 * cat.get(short_sku).units_per_case + 3})
-    ful, bil = FakeFulfilment(), FakeBilling()
+    ful, bil, feeds, ded = FakeFulfilment(), FakeBilling(), FakeFeeds(), FakeDeductions()
+    install_fakes(monkeypatch, promos_mod, wh, ful, bil, feeds, ded)
+    return types.SimpleNamespace(world=world, events=collected, promo=promo, wh=wh, ful=ful,
+                                 bil=bil, feeds=feeds, ded=ded, short_sku=short_sku)
+
+
+def install_fakes(monkeypatch, promos_mod, wh, ful, bil, feeds, ded) -> None:
     monkeypatch.setitem(sys.modules, "cpgsim.domain.promotions", promos_mod)
     monkeypatch.setitem(sys.modules, "cpgsim.domain.demandplan", stub_demandplan(promos_mod))
     monkeypatch.setitem(sys.modules, "cpgsim.domain.warehouse", wh.module())
     monkeypatch.setitem(sys.modules, "cpgsim.domain.fulfilment", ful.module())
     monkeypatch.setitem(sys.modules, "cpgsim.domain.billing", bil.module())
-    return types.SimpleNamespace(world=world, events=collected, promo=promo, wh=wh, ful=ful,
-                                 bil=bil, short_sku=short_sku)
+    monkeypatch.setitem(sys.modules, "cpgsim.domain.feeds", feeds.module())
+    monkeypatch.setitem(sys.modules, "cpgsim.domain.deductions", ded.module())
 
 
 RETAIL_SOURCES = ("retail.sellout", "retail.po_cycle")
+WEEKLY_DCS = ("KRANZ-DC1", "KRANZ-DC2", "KRANZ-DC3", "MYLO-DC1", "MYLO-DC2", "BELLE-DC1", "BELLE-DC2")
+DAILY_DCS = ("SHOPNOVA-DC1", "SHOPNOVA-DC2")
+CHANNEL_OF_PAYER = {"KRANZ": "drogerie_kranz", "MYLO": "mylo", "SHOPNOVA": "shopnova", "BELLE": "belle"}
 
 
 # ---------------------------------------------------------------------------
@@ -376,7 +452,10 @@ def test_master_bootstrap():
     for channel in world.cfg.channels.retailers():
         acc = world.ref.accounts.retailer(channel).account_id
         assort = set(cat.retailer_assortment(channel, HIST))
-        assert assort <= knmt[acc]
+        # unmapped articles (chaos defect, about 5 %) have no customer-material record
+        from cpgsim import chaos
+        unmapped = {s for s in assort if chaos.is_unmapped(world, channel, s)}
+        assert assort - unmapped <= knmt[acc] and not unmapped & knmt[acc]
         for sku_id in knmt[acc]:
             assert masterdata.retailer_lists(world, channel, cat.get(sku_id))
     # Cutara is not listed at the drugstores
@@ -453,6 +532,8 @@ def test_master_fx_on_first_of_month_start():
 def test_po_schedule_and_pricing():
     assert retail.po_number("drogerie_kranz", 17, date(2025, 3, 4)) == "4500000017"
     assert retail.po_number("mylo", 17, date(2025, 3, 4)) == "MY2503-000017"
+    assert retail.po_number("shopnova", 17, date(2025, 3, 4)) == "SNV-PO-0000017"
+    assert retail.po_number("belle", 17, date(2025, 3, 4)) == "BEL/2025/00017"
     conds, net, tax = retail.price_line(3.10, 24, 0.36, 0.10)
     assert [c.ctype for c in conds] == ["list_price", "customer_discount", "promo_discount", "tax"]
     assert conds[0].amount == 74.4 and conds[1].amount == -26.78
@@ -461,23 +542,35 @@ def test_po_schedule_and_pricing():
     assert tax == round(net * 0.19, 2)
     world, _ = make_world()
     plan = retail.dc_plan(world)
-    assert [p[1] for p in plan] == ["KRANZ-DC1", "KRANZ-DC2", "KRANZ-DC3", "MYLO-DC1", "MYLO-DC2"]
-    weekdays = [next(d.weekday() for d in (HIST + timedelta(days=k) for k in range(7))
-                     if retail.is_order_day(7, i, d)) for _, _, i in plan]
-    assert sorted(weekdays) == [0, 1, 2, 3, 4]
+    assert [p[1] for p in plan] == ["KRANZ-DC1", "KRANZ-DC2", "KRANZ-DC3", "MYLO-DC1", "MYLO-DC2",
+                                    "SHOPNOVA-DC1", "SHOPNOVA-DC2", "BELLE-DC1", "BELLE-DC2"]
+    retailers = world.cfg.channels.retailers()
+    week = [HIST + timedelta(days=k) for k in range(14)]
+    days = {dc: [d.weekday() for d in week if retail.is_order_day(retailers[ch], i, d)] for ch, dc, i in plan}
+    # weekly cycles on weekday index % 5 (phase-1 DCs unchanged), Shopnova on Mon, Wed, Fri
+    assert [days[dc][0] for dc in WEEKLY_DCS] == [1, 2, 3, 4, 0, 3, 4]
+    assert all(len(days[dc]) == 2 for dc in WEEKLY_DCS)
+    assert days["SHOPNOVA-DC1"] == days["SHOPNOVA-DC2"] == [0, 2, 4, 0, 2, 4]
+    assert retail.is_order_day(7, 1, HIST + timedelta(days=1))  # phase-1 call form still works
+    assert retail._cycle_days(retailers["shopnova"]) == pytest.approx(7 / 3)
+    assert retail._cycle_days(retailers["belle"]) == 7.0
 
 
 def test_retail_bootstrap(sim):
     world = sim.world
     retail.bootstrap_retail(world)
+    retailers = world.cfg.channels.retailers()
     for channel, dc, _ in retail.dc_plan(world):
         inv = world.store.get("retailer_inventory", dc)
         assort = world.ref.catalogue.retailer_assortment(channel, HIST)
         assert sorted(inv.forecast) == assort
         mid = HIST + timedelta(days=3)
+        # one seasonal order cycle (Shopnova: 7/3 days) plus a flat safety week; no calendar event in March
+        cycle = (7 / 3 if channel == "shopnova" else 7.0) / 7
+        assert retail._cycle_weeks(retailers[channel]) == pytest.approx(cycle)
         for s in assort:
             season = max(category_factor(world.ref.catalogue.get(s).season_profile, mid), 0.05)
-            assert inv.on_hand[s] == round(inv.forecast[s] * season * 2.0)
+            assert inv.on_hand[s] == round(inv.forecast[s] * (season * cycle + 1.0))
         assert sum(inv.on_hand.values()) > 0
 
 
@@ -486,8 +579,6 @@ def quarter(sim):
     """Run 26 weeks of retail; collect weekly sell-out per DC and POD receipts."""
     world = sim.world
     retail.bootstrap_retail(world)
-    sellout = defaultdict(lambda: defaultdict(float))  # (dc) -> week_start -> units
-    lost = defaultdict(float)  # sku -> units
     receipts = defaultdict(lambda: defaultdict(float))  # dc -> week (monday) -> units
     pods: list = []
     payments: list = []
@@ -495,12 +586,7 @@ def quarter(sim):
                        for _, dc, _ in retail.dc_plan(world)}
 
     def on_event(w, ev):
-        if ev.kind == "retail.sellout":
-            so = w.store.get("retailer_inventory", ev.data["dc"] + retail.SELLOUT_SUFFIX)
-            sellout[ev.data["dc"]][ev.data["week_start"]] += sum(so.on_hand.values())
-            for s, q in so.on_order.items():
-                lost[s] += q
-        elif ev.kind == "retail.pod":
+        if ev.kind == "retail.pod":
             d = w.store.get("delivery", ev.data["delivery_id"])
             po = w.store.get("retail_po", d.order_id)
             wk = retail.monday(w.local_date()).isoformat()
@@ -510,15 +596,26 @@ def quarter(sim):
             payments.append((ev.data["po_id"], ev.data["billing_id"], w.now))
 
     run(world, world.at_local(HIST + timedelta(weeks=26), 0), RETAIL_SOURCES, on_event=on_event)
-    return types.SimpleNamespace(sim=sim, sellout=sellout, lost=lost, receipts=receipts, pods=pods,
-                                 payments=payments, inventory_start=inventory_start)
+    lost = defaultdict(float)  # sku -> units
+    for _, _, _, _, lost_m, _, _ in sim.feeds.weeks:
+        for s, q in lost_m.items():
+            lost[s] += q
+    for _, _, _, sold, demand, _, _ in sim.feeds.days:
+        for s, q in demand.items():
+            lost[s] += q - sold.get(s, 0)
+    return types.SimpleNamespace(sim=sim, sellout=sellout_by_week(sim.feeds), lost=lost, receipts=receipts,
+                                 pods=pods, payments=payments, inventory_start=inventory_start)
 
 
 def test_po_lifecycle(quarter):
     sim = quarter.sim
     world = sim.world
     created = [e for e in sim.events if isinstance(e, SalesDocCreated)]
-    assert len(created) == 5 * 26  # one PO per DC and week
+    per_dc = defaultdict(int)
+    for e in created:
+        per_dc[e.doc.ship_to] += 1
+    assert all(per_dc[dc] == 26 for dc in WEEKLY_DCS)  # one PO per DC and week
+    assert all(per_dc[dc] == 3 * 26 for dc in DAILY_DCS)  # Mon, Wed, Fri
     cal = world.ref.calendar
     for e in created:
         doc = e.doc
@@ -536,10 +633,7 @@ def test_po_lifecycle(quarter):
             amounts = {c.ctype: c.amount for c in it.conditions}
             assert it.net_value == round(sum(v for k, v in amounts.items() if k != "tax"), 2)
             assert it.tax == amounts["tax"] == round(it.net_value * 0.19, 2)
-        if doc.channel == "drogerie_kranz":
-            assert doc.external_ref.startswith("45") and len(doc.external_ref) == 10
-        else:
-            assert doc.external_ref.startswith("MY")
+        assert doc.external_ref == retail.po_number(doc.channel, doc.order_id, loc.date())
         lead = cal.working_days_between(loc.date(), doc.requested_date, "DE",
                                         world.ref.accounts.get(doc.ship_to).address.region)
         assert 2 <= lead <= 4
@@ -553,9 +647,8 @@ def test_po_lifecycle(quarter):
     for doc, at in sim.bil.invoices:
         po_id = next(x.order_id for x in sim.ful.created if x.sales_doc_id == doc.sales_doc_id)
         assert at > pod_at[po_id]
-        assert 0 <= (doc.billing_date - world.local_date(pod_at[po_id])).days <= 4
-        terms = world.cfg.channels.retailers()[
-            "drogerie_kranz" if doc.payer == "KRANZ" else "mylo"].payment_terms_days
+        assert 0 <= (doc.billing_date - world.local_date(pod_at[po_id])).days <= 5  # Easter: Fri + Mon off
+        terms = world.cfg.channels.retailers()[CHANNEL_OF_PAYER[doc.payer]].payment_terms_days
         assert doc.due_date == doc.billing_date + timedelta(days=terms)
         by_billing[doc.billing_id] = doc
     assert sim.bil.cleared, "early POs are paid within the half year"
@@ -564,14 +657,23 @@ def test_po_lifecycle(quarter):
         d = world.local_date(at)
         assert cal.is_working_day(d, "DE", "DE-HE")
         assert -6 <= (d - doc.due_date).days <= 6 + 4
-        assert 30 <= (d - doc.billing_date).days <= 70
+        terms = world.cfg.channels.retailers()[CHANNEL_OF_PAYER[doc.payer]].payment_terms_days
+        assert terms - 6 <= (d - doc.billing_date).days <= terms + 10
         # paid POs are removed together with their sales doc and invoice
         assert not world.store.has("billing", bid)
         assert not world.store.has("sales_doc", doc.sales_doc_id)
     # every open PO has a plausible status, older ones are further along
     statuses = {po.status for _, po in world.store.items("retail_po")}
     assert statuses <= {"received", "confirmed", "delivery_planned", "shipped", "delivered", "invoiced"}
-    assert world.store.count("retail_po") < 5 * 12
+    assert world.store.count("retail_po") < 7 * 12 + 2 * 3 * 7
+    # handoffs: one POD and one cut record per PO; payments clear the invoice at gross minus deductions
+    assert len(sim.ded.pods) == len(pod_at) and {p[0] for p in sim.ded.pods} == set(pod_at)
+    assert len(sim.ded.cuts) == len(created)
+    gross = {doc.billing_id: round(doc.net_value + doc.tax, 2) for doc, _ in sim.bil.invoices}
+    assert len(sim.ded.payments) == len(sim.bil.paid) == len(sim.bil.cleared)
+    for (channel, bid, g, taken), (bid2, paid, status) in zip(sim.ded.payments, sim.bil.paid):
+        assert bid == bid2 and g == gross[bid] and paid == round(g - taken, 2) and status == "cleared"
+        assert channel == CHANNEL_OF_PAYER[by_billing[bid].payer]
     # shipped -> delivered_qty updates carry confirmed_qty
     changed = [e for e in sim.events if isinstance(e, SalesDocChanged) and e.header.get("status") == "in_process"]
     assert changed
@@ -651,18 +753,17 @@ def test_retail_partition_invariance(monkeypatch):
     for step in (1.0, 13.0):
         world, ev = make_world()
         promos_mod = fake_promotions([kranz_promo(world)])
-        monkeypatch.setitem(sys.modules, "cpgsim.domain.promotions", promos_mod)
-        monkeypatch.setitem(sys.modules, "cpgsim.domain.demandplan", stub_demandplan(promos_mod))
-        monkeypatch.setitem(sys.modules, "cpgsim.domain.warehouse", FakeWarehouse().module())
-        monkeypatch.setitem(sys.modules, "cpgsim.domain.fulfilment", FakeFulfilment().module())
-        monkeypatch.setitem(sys.modules, "cpgsim.domain.billing", FakeBilling().module())
+        feeds = FakeFeeds()
+        install_fakes(monkeypatch, promos_mod, FakeWarehouse(), FakeFulfilment(), FakeBilling(), feeds,
+                      FakeDeductions())
         retail.bootstrap_retail(world)
         run(world, world.at_local(HIST + timedelta(weeks=6), 0), RETAIL_SOURCES, step_hours=step)
-        results.append([
+        results.append(([
             (e.doc.sales_doc_id, e.doc.external_ref, e.at, [(i.sku_id, i.qty, i.net_value) for i in e.doc.items])
             for e in ev if isinstance(e, SalesDocCreated)
-        ])
+        ], feeds.weeks, feeds.days))
     assert results[0] == results[1]
+    assert results[0][2], "daily marketplace sell-out is covered"
 
 
 def test_retail_order_scenario_factor(sim):
@@ -670,7 +771,7 @@ def test_retail_order_scenario_factor(sim):
     world.scenarios = StubScenarios({"retail_order": 1.3})
     retail.bootstrap_retail(world)
     run(world, world.at_local(HIST + timedelta(days=7), 0), ("retail.po_cycle",))
-    assert len(world.scenarios.recorded) == 5
+    assert len(world.scenarios.recorded) == 7 + 2 * 3  # weekly DCs once, Shopnova FCs three times
     assert all(r[1][0] == "sales_doc" for r in world.scenarios.recorded)
 
 
@@ -741,9 +842,176 @@ def test_retail_value_share(monkeypatch):
     total = web_value + sum(values.values())
     share = {k: v / total for k, v in values.items()}
     share["web"] = web_value / total
-    # enabled channels: 35 / 25 / 10 of the full business -> 50 / 35.7 / 14.3 % among them
-    assert abs(share["drogerie_kranz"] - 0.35 / 0.70) < 0.04, share
-    assert abs(share["mylo"] - 0.25 / 0.70) < 0.04, share
-    assert abs(share["web"] - 0.10 / 0.70) < 0.03, share
-    assert abs(values["drogerie_kranz"] / web_value - 3.5) < 0.35, values["drogerie_kranz"] / web_value
-    assert abs(values["mylo"] / web_value - 2.5) < 0.25, values["mylo"] / web_value
+    # all five channels: 35 / 25 / 20 / 10 / 10 of the business
+    for ch, target in (("drogerie_kranz", 0.35), ("mylo", 0.25), ("shopnova", 0.20), ("belle", 0.10),
+                       ("web", 0.10)):
+        assert abs(share[ch] - target) < 0.02, share
+        if ch != "web":
+            assert abs(values[ch] / web_value - target / 0.10) < 0.1 * target / 0.10, (ch, values[ch] / web_value)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: daily sell-out, event-aware targets, push mode (design 2.2, 2.4, 5.7)
+# ---------------------------------------------------------------------------
+
+
+def _fire(world, kind: str, at: datetime, data: dict) -> None:
+    from cpgsim.engine.queue import Event
+
+    world.now = at
+    from cpgsim.engine.registry import HANDLERS as _H
+
+    _H[kind](world, Event(due=at, kind=kind, key=f"{kind}:test", data=data))
+
+
+def test_daily_sellout_adds_up_to_the_weekly_draw(sim):
+    world = sim.world
+    retail.bootstrap_retail(world)
+    dc = "SHOPNOVA-DC1"
+    inv = world.store.mut("retailer_inventory", dc)
+    for s in inv.on_hand:
+        inv.on_hand[s] = 10**6  # nothing is censored
+    ws = HIST + timedelta(weeks=1)  # a Monday in March: no calendar event
+    dp = sys.modules["cpgsim.domain.demandplan"]
+    g = retail._week_noise(world, dc, ws)
+    # g: mean-1 log-normal per SKU, spread demand_noise_cv
+    vals = list(g.values())
+    m = sum(vals) / len(vals)
+    sd = (sum((v - m) ** 2 for v in vals) / len(vals)) ** 0.5
+    assert m == pytest.approx(1.0, abs=0.03)
+    assert sd == pytest.approx(world.cfg.retail.demand_noise_cv, rel=0.15)
+
+    sku0 = sorted(inv.on_hand)[0]
+    fc0 = inv.forecast[sku0]
+    for k in range(7):
+        day = ws + timedelta(days=k)
+        _fire(world, "retail.sellout", world.at_local(day + timedelta(days=1), 0, 30),
+              {"channel": "shopnova", "dc": dc, "week_start": ws.isoformat(), "day": day.isoformat(), "days": 1})
+        if k == 0:
+            # forecast: daily EWMA of sold / (level factor x dow share), alpha_day = 1-(1-a)^(1/7)
+            a = 1 - (1 - world.cfg.retail.forecast_alpha) ** (1 / 7)
+            pf = retail._level_factor(world, "shopnova", sku0, ws) * retail._dow_share(world, day)
+            sold = sim.feeds.days[-1][3].get(sku0, 0)
+            assert inv.forecast[sku0] == pytest.approx(round(a * sold / pf + (1 - a) * fc0, 3))
+    assert [c[2] for c in sim.feeds.days] == [ws + timedelta(days=k) for k in range(7)]
+    want = defaultdict(int)
+    for _, _, _, sold, demand, on_hand, on_order in sim.feeds.days:
+        assert sold == demand  # uncensored
+        assert sorted(on_hand) == sorted(on_order) == sorted(retail._listed(world, "shopnova", ws))
+        for s, q in demand.items():
+            want[s] += q
+    assert not sim.feeds.weeks
+    assert [(c[1], c[2], c[3]) for c in sim.ded.sellout][:2] == [(dc, ws, 1), (dc, ws + timedelta(days=1), 1)]
+    listed = sorted(retail._listed(world, "shopnova", ws))
+    for s in listed:
+        mean = dp.retail_weekly_demand(world, "shopnova", dc, s, ws) * g[s]
+        assert abs(want[s] - mean) <= 7  # seven stochastic roundings
+    total = sum(dp.retail_weekly_demand(world, "shopnova", dc, s, ws) * g[s] for s in listed)
+    assert sum(want[s] for s in listed) == pytest.approx(total, rel=0.02)
+
+
+def test_window_demand_is_event_aware_and_tapers_with_the_listing(sim):
+    world = sim.world
+    cat = world.ref.catalogue
+    from cpgsim.models.seasonality import marketplace_sale_week
+
+    lo, hi = marketplace_sale_week(2025)
+    sku = cat.get(sorted(retail._listed(world, "shopnova", lo))[0])
+    before = retail._coverage_days(world, lo - timedelta(days=7), 7.0)
+    into = retail._coverage_days(world, lo - timedelta(days=3), 7.0)
+    w_before = retail._window_demand(world, "shopnova", sku, 70.0, before)
+    w_into = retail._window_demand(world, "shopnova", sku, 70.0, into)
+    lift = world.cfg.seasonality.marketplace_sale_lift
+    season = [retail._season(world, sku.sku_id, d) for d, _ in into]
+    expected = 70.0 / 7 * sum(s * (lift if d >= lo else 1.0) for s, (d, _) in zip(season, into))
+    assert w_into == pytest.approx(expected)
+    assert w_into > 2 * w_before
+    # the retailers do not have the marketplace sale
+    kranz_sku = cat.get(sorted(retail._listed(world, "drogerie_kranz", lo))[0])
+    kr = retail._window_demand(world, "drogerie_kranz", kranz_sku, 70.0, into)
+    assert kr == pytest.approx(70.0 / 7 * sum(retail._season(world, kranz_sku.sku_id, d) for d, _ in into))
+    # fractional last day
+    assert retail._coverage_days(world, lo, 7 / 3) == [(lo, 1.0), (lo + timedelta(days=1), 1.0),
+                                                      (lo + timedelta(days=2), pytest.approx(1 / 3))]
+
+    # a SKU whose listing ends: no demand (and no safety stock) on the days after its last listed day
+    hit = None
+    for ch in ("drogerie_kranz", "mylo", "belle", "shopnova"):
+        for k in range(0, 600, 7):
+            d = HIST + timedelta(days=k)
+            gone = retail._listed(world, ch, d) - retail._listed(world, ch, d + timedelta(days=7))
+            if gone:
+                hit = (ch, d, min(gone))
+                break
+        if hit:
+            break
+    assert hit, "some SKU leaves a retailer range within the horizon"
+    ch, d, sid = hit
+    last = max(x for x in (d + timedelta(days=j) for j in range(8)) if sid in retail._listed(world, ch, x))
+    after = retail._coverage_days(world, last + timedelta(days=1), 14.0)
+    assert retail._window_demand(world, ch, cat.get(sid), 50.0, after) == 0.0
+    assert retail._safety_stock(world, ch, sid, 50.0, after) == 0.0
+    span = retail._coverage_days(world, last - timedelta(days=2), 7.0)
+    assert 0 < retail._window_demand(world, ch, cat.get(sid), 50.0, span) < retail._window_demand(
+        world, ch, cat.get(sid), 50.0, retail._coverage_days(world, last - timedelta(days=9), 7.0)) + 1e-9
+    assert retail._safety_stock(world, ch, sid, 49.0, span) == pytest.approx(49.0 * 3 / 7)
+
+
+def _mylo_order_day(world, start: date) -> date:
+    rc = world.cfg.channels.mylo
+    idx = next(i for c, dc, i in retail.dc_plan(world) if dc == "MYLO-DC1")
+    return next(start + timedelta(days=k) for k in range(8) if retail.is_order_day(rc, idx, start + timedelta(days=k)))
+
+
+def test_push_mode_backlog_and_recording(sim):
+    world = sim.world
+    world.scenarios = StubScenarios({"retail_push": 1.3})
+    retail.bootstrap_retail(world)
+    cat = world.ref.catalogue
+    mylo = cat.retailer_assortment("mylo", HIST)
+    short = sorted(mylo, key=lambda i: (-cat.get(i).popularity, i))[0]
+    sim.wh.short.clear()
+    sim.wh.short[short] = 0  # the warehouse cannot deliver it at all
+    d = _mylo_order_day(world, HIST)
+    _fire(world, "retail.po_cycle", world.at_local(d, 6), {"channel": "mylo", "dc": "MYLO-DC1"})
+    (po_id,) = [p for p, _ in world.store.items("retail_po")]
+    po = world.store.get("retail_po", po_id)
+    doc = world.store.get("sales_doc", po.sales_doc_id)
+    assert world.scenarios.recorded == [("retail_push", ("sales_doc", po.sales_doc_id),
+                                         {"channel": "mylo", "dc": "MYLO-DC1"})]
+    q_short = next(l.qty for l in po.lines if l.sku_id == short)
+    _fire(world, "retail.confirm", world.at_local(d, 11), {"po_id": po.po_id})
+    inv = world.store.get("retailer_inventory", "MYLO-DC1")
+    assert inv.push_backlog == {short: float(q_short)}
+    assert inv.on_order[short] == 0
+    # the cut handed to deductions: ordered and cut units, net value of the cut share
+    (cut,) = [c for c in sim.ded.cuts if c[0] == po.po_id]
+    item = next(i for i in doc.items if i.sku_id == short)
+    assert cut[1:5] == ("mylo", "MYLO-DC1", sum(l.qty for l in po.lines), q_short)
+    assert cut[5] == pytest.approx(item.net_value, abs=0.01)
+
+    # the backlog rides on the next PO (on top of cycle demand x push), then is gone
+    d2 = _mylo_order_day(world, d + timedelta(days=1))
+    world_b, _ = make_world(scenarios=StubScenarios({"retail_push": 1.3}))
+    retail.bootstrap_retail(world_b)
+    inv_b = world_b.store.mut("retailer_inventory", "MYLO-DC1")
+    inv_b.on_hand = dict(inv.on_hand)
+    inv_b.on_order = dict(inv.on_order)
+    inv_b.forecast = dict(inv.forecast)
+    _fire(world, "retail.po_cycle", world.at_local(d2, 6), {"channel": "mylo", "dc": "MYLO-DC1"})
+    _fire(world_b, "retail.po_cycle", world_b.at_local(d2, 6), {"channel": "mylo", "dc": "MYLO-DC1"})
+    new = [x for _, x in world.store.items("retail_po") if x.po_id != po.po_id]
+    (po_b,) = [x for _, x in world_b.store.items("retail_po")]
+    qa = {l.sku_id: l.qty for l in new[0].lines}
+    qb = {l.sku_id: l.qty for l in po_b.lines}
+    assert qa[short] > qb.get(short, 0) and qa[short] - qb.get(short, 0) >= 0.5 * q_short
+    assert {s: q for s, q in qa.items() if s != short} == {s: q for s, q in qb.items() if s != short}
+    assert short not in world.store.get("retailer_inventory", "MYLO-DC1").push_backlog
+
+    # push ends: an open backlog is dropped and orders follow the target again
+    inv = world.store.mut("retailer_inventory", "MYLO-DC1")
+    inv.push_backlog[short] = 99.0
+    world.scenarios.factors = {}
+    d3 = _mylo_order_day(world, d2 + timedelta(days=1))
+    _fire(world, "retail.po_cycle", world.at_local(d3, 6), {"channel": "mylo", "dc": "MYLO-DC1"})
+    assert world.store.get("retailer_inventory", "MYLO-DC1").push_backlog == {}

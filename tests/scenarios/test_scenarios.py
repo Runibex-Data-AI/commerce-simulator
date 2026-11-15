@@ -121,11 +121,40 @@ def test_unknown_scenario_raises():
         ScenarioManager(make_cfg([{"id": "carier_decay"}]))
 
 
-def test_phase2_scenario_warns_and_is_ignored(caplog):
-    with caplog.at_level(logging.WARNING, logger="cpgsim.scenarios"):
-        sm = ScenarioManager(make_cfg([{"id": "retailer_overstock", "start": "2026-01-05"}]))
-    assert sm.windows() == []
-    assert "not implemented yet" in caplog.text
+def test_phase2_scenarios_are_registered():
+    from cpgsim.scenarios import PLANNED, REGISTRY
+
+    assert PLANNED == frozenset()
+    assert {"hero_oos_substitution", "influencer_cohort_churn", "retailer_overstock"} <= set(REGISTRY)
+
+
+def test_phase2_scenarios_normalise_from_config():
+    sm = ScenarioManager(make_cfg([
+        {"id": "hero_oos_substitution", "start": "2026-04-13"},
+        {"id": "retailer_overstock", "start": "2026-01-05"},
+        {"id": "influencer_cohort_churn", "influencer_code": "glowwithmia", "start": "2025-04-07",
+         "end": "2025-06-29"},
+    ]))
+    hero, over, infl = sm.windows()
+    assert hero.params == {"sku": "auto", "duration_weeks": 3, "substitution_share": 0.40, "recovery_weeks": 6}
+    assert (hero.start, hero.end) == (local(2026, 4, 13), local(2026, 5, 4))  # self-limited: 3 weeks
+    assert over.params == {"retailer": "mylo", "over_order": 1.30, "duration_weeks": 13, "cut_weeks": 6,
+                           "extra_deduction_share": 0.20, "extra_claims": 2}
+    assert (over.start, over.end) == (local(2026, 1, 5), local(2026, 4, 6))  # 13 weeks
+    assert infl.params == {"influencer_code": "GLOWWITHMIA", "repurchase_multiplier": 0.3,
+                           "acquisition_boost": 2.5}
+    assert (infl.start, infl.end) == (local(2025, 4, 7), local(2025, 6, 30))
+
+
+def test_phase2_scenarios_reject_bad_params():
+    with pytest.raises(ScenarioParamError, match="unknown retailer"):
+        ScenarioManager(make_cfg([{"id": "retailer_overstock", "retailer": "nowhere"}]))
+    with pytest.raises(ScenarioParamError, match="unknown influencer_code"):
+        ScenarioManager(make_cfg([{"id": "influencer_cohort_churn", "influencer_code": "NOPE"}]))
+    with pytest.raises(ScenarioParamError, match="substitution_share"):
+        ScenarioManager(make_cfg([{"id": "hero_oos_substitution", "substitution_share": 1.5}]))
+    with pytest.raises(ScenarioParamError, match="duration_weeks"):
+        ScenarioManager(make_cfg([{"id": "hero_oos_substitution", "duration_weeks": 0}]))
 
 
 def test_disabled_and_bad_params():
@@ -273,10 +302,10 @@ def test_bad_override_rows_are_ignored(caplog):
         sm.load_overrides([
             (1, "nope", "enable", t, {}),
             (2, "carrier_decay", "enable", t, {"delay_multiplier": -1}),
-            (3, "hero_oos_substitution", "enable", t, {}),
+            (3, "retailer_overstock", "enable", t, {"retailer": "nowhere"}),
         ])
     assert sm.windows() == [] and sm.version == 0
-    assert "unknown" in caplog.text and "delay_multiplier" in caplog.text
+    assert "unknown" in caplog.text and "delay_multiplier" in caplog.text and "nowhere" in caplog.text
 
 
 # -- promotions ----------------------------------------------------------------------
