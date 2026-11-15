@@ -159,7 +159,7 @@ An administrator creates the roles first with [sql/roles.sql](sql/roles.sql). Te
 ## Compatibility
 
 Anything with a Postgres connector and query-based incremental loads, for example Incorta,
-Microsoft Fabric or Databricks. Platform-specific notes will live under `examples/`.
+Microsoft Fabric or Databricks. Platform-specific notes live under `examples/`: [Incorta](examples/incorta/README.md) (load plans, queries and [joins](examples/incorta/joins.md)).
 
 ## Documentation
 
