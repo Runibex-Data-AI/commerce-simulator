@@ -135,7 +135,9 @@ def test_influencer_first_order_discount_one_code_per_order(run):
         FROM erp.vbak h JOIN erp.konv k ON k.knumv = h.knumv
         WHERE h.auart = 'ZWEB' GROUP BY h.bstnk HAVING bool_or(k.kschl = 'ZINF')
     """).fetchall()
-    assert {r[0] for r in erp} == {str(r[0]) for r in orders}
+    released = {r[0] for r in run.execute("SELECT bstnk FROM erp.vbak WHERE auart = 'ZWEB'")}
+    assert {r[0] for r in erp} == {str(r[0]) for r in orders} & released  # payment failed: never in the ERP
+    assert len(erp) > 30
     assert all(not r[2] and r[3] == [Decimal("-15.000")] for r in erp), [r for r in erp if r[2]][:5]
 
 
