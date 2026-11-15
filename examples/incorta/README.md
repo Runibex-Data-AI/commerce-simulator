@@ -31,8 +31,7 @@ v0.2.0 DDL on PostgreSQL 16.
 | Postgres schema | Tables | Load |
 | --- | --- | --- |
 | `shop` | 9 | Incremental on `updated_at` |
-| `wms` | 6 | Incremental on `updated_at` |
-| `wms` | `stock_levels_daily` | Full load only, once a day |
+| `wms` | 7 | Incremental on `updated_at` (including the insert-only `stock_levels_daily`) |
 | `erp` | 18 | Incremental on `updated_at` |
 | `mkt` | 5 | Incremental on `updated_at` |
 | `feeds` | 4 | Full load only, once a day |
@@ -97,22 +96,23 @@ allows 100 connections by default, and the generator needs only a few.
 
 ## 2. Incorta schemas and tables
 
-Create six Incorta schemas:
+Create five Incorta schemas:
 
 | Incorta schema | Postgres tables | Why separate |
 | --- | --- | --- |
 | `cpgsim_shop` | all of `shop` | |
-| `cpgsim_wms` | all of `wms` except `stock_levels_daily` | |
+| `cpgsim_wms` | all of `wms` | |
 | `cpgsim_erp` | all of `erp` | |
 | `cpgsim_mkt` | all of `mkt` | |
-| `cpgsim_wms_snapshots` | `wms.stock_levels_daily` | Full load only, on its own schedule |
 | `cpgsim_feeds` | all of `feeds` | Full load only, on its own schedule |
 
 An incremental load job fully reloads every table in the schema that has incremental load
-disabled. Keeping the snapshot table in `cpgsim_wms` would therefore re-extract it completely on
-every 15-minute run, and the same would happen to the `feeds` tables in any incremental
-schema. Separate schemas keep them in their own daily plan using only documented load plan
-features. Table-level scheduling is the alternative (see [Load plans](#3-load-plans)).
+disabled. Keeping the `feeds` tables in an incremental schema would therefore re-extract them
+completely on every 15-minute run. A separate schema keeps them in their own daily plan using
+only documented load plan features. Table-level scheduling is the alternative (see
+[Load plans](#3-load-plans)). The insert-only snapshot table `wms.stock_levels_daily` stays in
+`cpgsim_wms` and loads incrementally on `updated_at` like the other tables (see
+[Insert-only tables](#insert-only-tables)).
 
 ### Settings for every incremental table
 
@@ -412,7 +412,7 @@ WHERE updated_at > ?
 | `returns` | `return_id` | Incremental |
 | `return_lines` | `return_id`, `line_no` | Incremental |
 | `stock_movements` | `movement_id` | Incremental |
-| `stock_levels_daily` | `snapshot_date`, `warehouse_code`, `item_code`, `load_id` | Full only, in `cpgsim_wms_snapshots` |
+| `stock_levels_daily` | `snapshot_date`, `warehouse_code`, `item_code`, `load_id` | Incremental (insert-only) |
 
 #### `wms.shipments`
 
@@ -1074,33 +1074,45 @@ FROM mkt.attributions
 WHERE updated_at > ?
 ```
 
-### Insert-only tables (full load only)
+### Insert-only tables
 
 `wms.stock_levels_daily` and the four `feeds` tables are insert-only: rows are never updated or
 deleted, and a restatement arrives as new rows with a new `load_id`. They have no `is_deleted`
-or `deleted_at`.
+or `deleted_at`. `wms.stock_levels_daily` loads incrementally on `updated_at` in `cpgsim_wms`;
+the `feeds` tables load fully in `cpgsim_feeds`.
 
 | Table | Key columns | Load |
 | --- | --- | --- |
-| `wms.stock_levels_daily` | `snapshot_date`, `warehouse_code`, `item_code`, `load_id` | Full only, in `cpgsim_wms_snapshots` |
+| `wms.stock_levels_daily` | `snapshot_date`, `warehouse_code`, `item_code`, `load_id` | Incremental on `updated_at`, in `cpgsim_wms` |
 | `feeds.feed_loads` | `load_id` | Full only, in `cpgsim_feeds` |
 | `feeds.retailer_sellout` | `load_id`, `line_no` | Full only, in `cpgsim_feeds` |
 | `feeds.marketplace_sales_daily` | `report_date`, `product_code`, `load_id` | Full only, in `cpgsim_feeds` |
 | `feeds.marketplace_inventory_daily` | `report_date`, `product_code`, `load_id` | Full only, in `cpgsim_feeds` |
 
-For each of these tables, set **Incremental** off, leave Update Query empty, set **Function**
-to **key** on the key columns above (the Postgres primary key), and leave Enforce Primary Key
-Constraint off here too.
+For `wms.stock_levels_daily`, use the
+[settings for every incremental table](#settings-for-every-incremental-table) with the query pair
+below. For each `feeds` table, set **Incremental** off and leave Update Query empty. In both
+cases set **Function** to **key** on the key columns above (the Postgres primary key), and leave
+Enforce Primary Key Constraint off.
 
 Do not switch on **Disable Full Load** for these tables. That setting is for incremental tables
 that must never be fully reloaded; it does not make a table full-load-only. Leaving Incremental
 off does.
 
-**Why no incremental.** The simulator's loading contract for these tables is "load them in
-full, or append by `load_id`". Restatements come in as new rows, so a daily full load picks
+**Why `wms.stock_levels_daily` is incremental.** Fully reloaded, its roughly 130,000 rows
+would be re-extracted on every 15-minute run of `cpgsim_wms`. It is insert-only, and like every
+table it carries `updated_at`, indexed and stamped with the commit time (equal to `created_at`,
+since rows are never updated), so Maximum Value of a Column on `updated_at` appends each
+day's snapshot, and the key keeps a repeated read of the last commit from duplicating rows. A
+restatement would also arrive: it is new rows with a new commit stamp. `load_id` is not used as
+the watermark: it is the snapshot date followed by a run number, so a restatement of an older day
+would get a lower `load_id` than the latest snapshot and be skipped. (v0.2.0 writes run `01`
+only.)
+
+**Why no incremental for `feeds`.** The simulator's loading contract for these tables is "load
+them in full, or append by `load_id`". Restatements come in as new rows, so a daily full load picks
 them up with no special handling and no watermark to check. The tables are small: about
-130,000 rows in `wms.stock_levels_daily` (one row per item a day) and about 0.3 million rows in
-`feeds` after a 24-month backfill. Because every load stays in Incorta, row counts match
+0.3 million rows in `feeds` after a 24-month backfill. Because every load stays in Incorta, row counts match
 Postgres directly, and you choose the current load in the business layer.
 
 **When feed files arrive.** All times are Europe/Berlin:
@@ -1122,8 +1134,17 @@ with a higher `load_id`.
 -- Query
 SELECT
   snapshot_date, warehouse_code, item_code, load_id, ean, qty_on_hand, qty_reserved,
-  qty_available, qty_in_production, snapshot_local, created_at, updated_at
+  qty_available, qty_in_production, snapshot_local, created_at,
+  date_trunc('milliseconds', updated_at) AS updated_at
 FROM wms.stock_levels_daily
+
+-- Update Query
+SELECT
+  snapshot_date, warehouse_code, item_code, load_id, ean, qty_on_hand, qty_reserved,
+  qty_available, qty_in_production, snapshot_local, created_at,
+  date_trunc('milliseconds', updated_at) AS updated_at
+FROM wms.stock_levels_daily
+WHERE updated_at > ?
 ```
 
 For analysis, use the highest `load_id` per `snapshot_date`, `warehouse_code` and `item_code`.
@@ -1296,7 +1317,7 @@ before a schema change, instead of relying on timing.
 
 ### First load
 
-Before you schedule anything, run a full load of each of the six schemas once (Schema Designer,
+Before you schedule anything, run a full load of each of the five schemas once (Schema Designer,
 **Load > Full Load**). Maximum Value of a Column takes its watermark from the data already in
 Incorta, so incremental runs start from there.
 
@@ -1305,13 +1326,13 @@ Incorta, so incremental runs start from there.
 | Plan | Schemas | Default load type | Schedule |
 | --- | --- | --- | --- |
 | `cpgsim_incremental_15m` | `cpgsim_shop`, `cpgsim_wms`, `cpgsim_erp`, `cpgsim_mkt` | Incremental Load | **Recur Every** 15 minutes, **Does not end** |
-| `cpgsim_snapshots_daily` | `cpgsim_wms_snapshots`, `cpgsim_feeds` | Full Load | **Recur Every** 1 day, **At** 12:30 AM, time zone Europe/Berlin |
-| `cpgsim_full_weekly` (optional) | all six schemas | Full Load | **Schedule later** (Not Scheduled); run by hand, see below |
+| `cpgsim_feeds_daily` | `cpgsim_feeds` | Full Load | **Recur Every** 1 day, **At** 12:30 AM, time zone Europe/Berlin |
+| `cpgsim_full_weekly` (optional) | all five schemas | Full Load | **Schedule later** (Not Scheduled); run by hand, see below |
 
 **Incremental, every 15 minutes.** One load group is enough: schemas in one group load
 concurrently in a single load job. In an Incremental Load, only tables with Incremental on load
-incrementally and every other table loads fully, which is why the insert-only tables live in
-their own schemas. At the default volume the simulator writes about 13,800 rows a day in an
+incrementally and every other table loads fully, which is why the `feeds` tables live in
+their own schema. At the default volume the simulator writes about 13,800 rows a day in an
 ordinary month and 15,300 a day averaged over a year, about 145 to 160 rows per 15 minutes on
 average, so each run is short. The data an insight sees is at most one 30-second generator
 tick plus 15 minutes plus the run time behind the simulator. The exception is the three daily
@@ -1329,10 +1350,10 @@ of the same plan, or another load of the same schema, is still running. An Incor
 FAQ says the run is skipped, but no official documentation page says so. Check the load job
 history after the first full day.
 
-**Snapshots and feeds, daily.** The snapshot for a day is written at 23:55 Europe/Berlin; 12:30
-AM leaves a margin. Feed files arrive in the morning (see
-[Insert-only tables](#insert-only-tables-full-load-only)), so each file is loaded the night
-after it arrives. Incorta's scheduler documentation notes that a scheduled job should run at
+**Feeds, daily.** Feed files arrive in the morning (see
+[Insert-only tables](#insert-only-tables)), so each file is loaded the night after it arrives.
+The stock snapshot for a day is written at 23:55 Europe/Berlin and arrives with the next
+15-minute run. Incorta's scheduler documentation notes that a scheduled job should run at
 least once before a daylight saving change, and that `Etc/GMT+x` time zones have the opposite
 sign of `GMT+x:00`; use a named zone such as Europe/Berlin.
 
@@ -1345,10 +1366,10 @@ the 15-minute plan on the same schemas. A cheaper safety net is to run the row c
 below once a week and reload fully only when counts drift. If you keep the weekly reload,
 create `cpgsim_full_weekly` with **Schedule later** and run it by hand in the quietest hour:
 
-1. Suspend `cpgsim_incremental_15m` and `cpgsim_snapshots_daily` and wait until no run of
+1. Suspend `cpgsim_incremental_15m` and `cpgsim_feeds_daily` and wait until no run of
    them is listed as running under **Schema Manager > Load Jobs**.
 2. Select **Execute Load Plan** on `cpgsim_full_weekly` and wait for it to finish.
-3. Activate `cpgsim_incremental_15m` and `cpgsim_snapshots_daily` again.
+3. Activate `cpgsim_incremental_15m` and `cpgsim_feeds_daily` again.
 
 A scheduled weekly plan cannot suspend the other plans, so it would rely on the scheduler's
 undocumented behaviour for overlapping triggers (see **Overlapping loads** above). If you
@@ -1358,9 +1379,8 @@ date (**From**), which is **not confirmed**.
 
 **Alternative: table-level scheduling.** The v8.0.0 release notes announce granular table
 scheduling in load plans (individual tables of a schema instead of the whole schema) and the
-same schema or table in several load groups within a single load plan. With that,
-`wms.stock_levels_daily` could stay in `cpgsim_wms` and be scheduled on its own, and the same
-goes for the `feeds` tables. Other pages of
+same schema or table in several load groups within a single load plan. With that, the
+`feeds` tables could sit in an incremental schema and be scheduled on their own. Other pages of
 the same documentation still contradict it: the Scheduler page says a schema can be added only
 once per plan, **Concepts > Full Load** says object full load jobs are available only on
 demand, and **Data Ingestion and Loading** says a load job for a physical schema object can only
@@ -1377,13 +1397,13 @@ pick up at most the newest slice of the new history and keep the old timeline's 
 applies after any `sim backfill` on a database Incorta has already loaded (see
 [Why Maximum Value of a Column](#settings-for-every-incremental-table)). To reset:
 
-1. Suspend `cpgsim_incremental_15m`, `cpgsim_snapshots_daily` and, if it is scheduled,
+1. Suspend `cpgsim_incremental_15m`, `cpgsim_feeds_daily` and, if it is scheduled,
    `cpgsim_full_weekly` (**Scheduler > Load Plans > More Options > Suspend**; see
    [Suspending and running plans](#suspending-and-running-plans)). Wait until none of their runs
    is listed as running under **Schema Manager > Load Jobs**.
 2. Run `sim reset` and wait until the backfill has finished and the generator runs live
    (`sim status`). Incorta keeps showing the old data meanwhile.
-3. Run a full load of all six schemas, from the Schema Designer (**Load > Full Load**), with
+3. Run a full load of all five schemas, from the Schema Designer (**Load > Full Load**), with
    **Execute Load Plan** on `cpgsim_full_weekly`, or with the Public API
    (`POST /incorta/api/v2/{tenant}/schema/{schemaName}/load` with `"loadSource": "FULL"`,
    available since v8.1.0; see the endpoint documentation for authentication). The API call
@@ -1474,7 +1494,8 @@ tables reach an age of up to about 25 hours before each export (see [`mkt`](#mkt
 insert-only tables change only when a snapshot is taken or a file arrives:
 `wms.stock_levels_daily`, `feeds.feed_loads` and the two marketplace tables once a day, and
 `feeds.retailer_sellout` once or twice a week, so an age of up to about a week is normal there;
-compare their counts with Incorta after the daily plan has run.
+compare the `feeds` counts with Incorta after the daily plan has run, and
+`wms.stock_levels_daily` after the first incremental run after 23:55 Europe/Berlin.
 
 Do this comparison after the first two incremental runs and again after the first daylight
 saving change; it is the check for the unconfirmed binding of `?`. In Incorta, `max(updated_at)`
