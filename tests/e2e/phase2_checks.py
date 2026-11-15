@@ -449,31 +449,92 @@ def overstock_checks(conn) -> list[Check]:
     return out
 
 
-def influencer_checks(conn, horizon_days: int = 180, max_ratio: float = 0.5) -> list[Check]:
+#: Per customer acquired with an influencer code inside the window: orders within the horizon from
+#: registration. Every order counts, whatever its status (payment_failed and cancelled included), as an
+#: order a customer placed; the first order is the acquisition order.
+INFLUENCER_COHORT_SQL = """
+WITH c AS (
+    SELECT c.id, c.influencer_code = %(code)s AS target, c.registered_at FROM shop.customers c
+    WHERE c.signup_source = 'influencer' AND c.registered_at >= %(s)s AND c.registered_at < %(e)s),
+o AS (
+    SELECT c.id, c.target, count(o.id) FILTER (WHERE o.placed_at < c.registered_at + %(h)s * interval '1 day') n
+    FROM c LEFT JOIN shop.orders o ON o.customer_id = c.id GROUP BY 1, 2)
+SELECT target, count(*), count(*) FILTER (WHERE n >= 2), sum(greatest(n - 1, 0)), sum(greatest(n - 1, 0) ^ 2)
+FROM o GROUP BY 1"""
+
+
+@dataclass(frozen=True)
+class Cohort:
+    """Customers acquired with influencer code(s) inside the window, counted over a horizon."""
+
+    n: int = 0  # customers
+    second: int = 0  # customers with a second order (>= 2 orders) within the horizon
+    repeat: int = 0  # orders after the first within the horizon, summed over the customers
+    repeat_sq: float = 0.0  # sum of squared per-customer repeat orders (for a standard error)
+
+    @property
+    def share(self) -> float:
+        return self.second / self.n if self.n else 0.0
+
+    @property
+    def repeat_mean(self) -> float:
+        return self.repeat / self.n if self.n else 0.0
+
+    def __add__(self, other: Cohort) -> Cohort:
+        return Cohort(self.n + other.n, self.second + other.second, self.repeat + other.repeat,
+                      self.repeat_sq + other.repeat_sq)
+
+
+@dataclass(frozen=True)
+class InfluencerCohorts:
+    code: str
+    start: date
+    end: date
+    horizon_days: int
+    target: Cohort  # acquired with the scenario's code
+    other: Cohort  # acquired with any other influencer code, same window
+
+
+def influencer_cohort_counts(conn, horizon_days: int = 180) -> InfluencerCohorts | None:
+    """Cohort counts of the influencer_cohort_churn window: the code against the other codes."""
     w = window(conn, "influencer_cohort_churn")
-    if w is None:
-        return [Check("influencer window", None, False)]
+    if w is None or w[1] is None:
+        return None
     start, end, params = w
     code = params.get("influencer_code", "GLOWWITHMIA")
+    s = datetime.combine(start, datetime.min.time(), BERLIN)
+    e = datetime.combine(end, datetime.min.time(), BERLIN)
+    rows = {t: Cohort(int(n), int(k), int(r or 0), float(r2 or 0)) for t, n, k, r, r2 in conn.execute(
+        INFLUENCER_COHORT_SQL, {"code": code, "s": s, "e": e, "h": horizon_days}).fetchall()}
+    return InfluencerCohorts(code, start, end, horizon_days, rows.get(True, Cohort()), rows.get(False, Cohort()))
+
+
+def influencer_checks(conn, horizon_days: int = 180, max_ratio: float = 0.5,
+                      max_repeat_ratio: float | None = None) -> list[Check]:
+    """Visibility of influencer_cohort_churn in shop and mkt.
+
+    ``max_ratio`` bounds the code's share of customers with a second order within ``horizon_days``
+    against the other codes' share; ``max_repeat_ratio`` (optional) bounds the code's mean repeat
+    orders (orders after the first) per customer within the horizon against the other codes' mean.
+    """
+    cc = influencer_cohort_counts(conn, horizon_days)
+    if cc is None:
+        return [Check("influencer window", None, False)]
+    start, end, code = cc.start, cc.end, cc.code
     out = [Check("truth effects", dict(conn.execute(
         "SELECT effect, count(*) FROM truth.planted_effects WHERE scenario_id = 'influencer_cohort_churn'"
         " GROUP BY 1 ORDER BY 1").fetchall()), True, note=f"code {code}, window {start}..{end}")]
-    q = """
-    WITH c AS (
-        SELECT c.id, c.influencer_code = %(code)s AS target, c.registered_at FROM shop.customers c
-        WHERE c.signup_source = 'influencer' AND c.registered_at >= %(s)s AND c.registered_at < %(e)s),
-    o AS (
-        SELECT c.id, c.target, count(o.id) FILTER (WHERE o.placed_at < c.registered_at + %(h)s * interval '1 day') n
-        FROM c LEFT JOIN shop.orders o ON o.customer_id = c.id GROUP BY 1, 2)
-    SELECT target, count(*), avg((n >= 2)::int) FROM o GROUP BY 1"""
+    tgt, oth = cc.target, cc.other
+    out.append(Check(f"second order within {horizon_days} days: code share < {max_ratio} x other codes' share",
+                     f"{tgt.share:.3f} (n={tgt.n}) vs {oth.share:.3f} (n={oth.n})",
+                     tgt.n > 0 and tgt.share < max_ratio * oth.share, INFLUENCER_COHORT_SQL))
+    if max_repeat_ratio is not None:
+        out.append(Check(f"repeat orders per customer within {horizon_days} days: code mean < {max_repeat_ratio}"
+                         " x other codes' mean",
+                         f"{tgt.repeat_mean:.3f} (n={tgt.n}) vs {oth.repeat_mean:.3f} (n={oth.n})",
+                         tgt.n > 0 and tgt.repeat_mean < max_repeat_ratio * oth.repeat_mean, INFLUENCER_COHORT_SQL))
     s = datetime.combine(start, datetime.min.time(), BERLIN)
     e = datetime.combine(end, datetime.min.time(), BERLIN)
-    rows = {t: (int(n), float(r)) for t, n, r in conn.execute(q, {"code": code, "s": s, "e": e,
-                                                                   "h": horizon_days}).fetchall()}
-    tgt, oth = rows.get(True, (0, 0.0)), rows.get(False, (0, 0.0))
-    out.append(Check(f"second order within {horizon_days} days: code share < {max_ratio} x other codes' share",
-                     f"{tgt[1]:.3f} (n={tgt[0]}) vs {oth[1]:.3f} (n={oth[0]})",
-                     tgt[0] > 0 and tgt[1] < max_ratio * oth[1], q))
     q = """
     SELECT avg(d) FILTER (WHERE spend_date >= %(s)s AND spend_date < %(e)s),
            avg(d) FILTER (WHERE spend_date >= %(b)s AND spend_date < %(s)s)

@@ -74,7 +74,7 @@ def test_retailer_overstock_is_visible(run):
 
 def test_influencer_cohort_churn_is_visible(run):
     conn, _ = run
-    # small volume and a short horizon: the direction only (0.5x is measured at default volume)
+    # small volume and a short horizon: the direction only (0.5x: default volume, pooled over four seeds)
     assert not _bad(p2.influencer_checks(conn, horizon_days=120, max_ratio=1.0))
 
 

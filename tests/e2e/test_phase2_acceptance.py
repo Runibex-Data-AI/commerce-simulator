@@ -71,7 +71,13 @@ def test_hero_and_overstock_visible_at_default_volume(run):
 
 def test_influencer_cohort_churn_at_default_volume(run):
     conn, _ = run
-    bad = [(c.name, c.value) for c in p2.influencer_checks(conn, horizon_days=180, max_ratio=0.5) if not c.ok]
+    # One seed holds only about 400 customers of the code's cohort: the second-order share is held to
+    # its direction here, and to < 0.5 x the other codes' share pooled over four seeds
+    # (test_phase2_influencer_seeds). Repeat orders per customer separate the cohorts far more clearly
+    # (about 0.2 x), so their 0.5 limit holds at one seed.
+    checks = p2.influencer_checks(conn, horizon_days=180, max_ratio=1.0, max_repeat_ratio=0.5)
+    print(*((c.name, c.value) for c in checks), sep="\n")  # shown with -s or -rP
+    bad = [(c.name, c.value) for c in checks if not c.ok]
     assert not bad
 
 
