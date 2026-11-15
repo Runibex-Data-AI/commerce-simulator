@@ -122,8 +122,12 @@ class Stubs:
         return list(getattr(self, "active_promos", []))
 
     @staticmethod
-    def is_eligible(promo, sku):
-        return sku.sku_id in promo.sku_ids or (promo.brand is not None and promo.brand == sku.brand)
+    def is_eligible(promo, sku):  # as promotions.is_eligible: SKU scope, else brand scope, else sitewide
+        if promo.sku_ids:
+            return sku.sku_id in promo.sku_ids
+        if promo.brand:
+            return sku.brand == promo.brand
+        return True
 
     # masterdata
     @staticmethod
@@ -754,8 +758,247 @@ def test_promo_not_applied_without_eligible_line(monkeypatch):
         announced_at=START,
     )
     h.s.promo_fn = lambda world, t, sku_ids, rng: promo
-    o = web.place_order(h.world, h.customer(), [(_sku(h).sku_id, 1)], source="direct")
+    c = h.customer(acquisition="direct")  # no influencer code (its first-order discount would apply)
+    o = web.place_order(h.world, c, [(_sku(h).sku_id, 1)], source="direct")
     assert o.promo_id is None and h.of(WebOrderPlaced)[0].promotion is None
+
+
+# ---------------------------------------------------------------------------
+# Influencer code first-order discount (one code per order)
+# ---------------------------------------------------------------------------
+
+
+def _trap_promo(h):
+    return Promotion(
+        promo_id=900000, channel="web", name="Velmora 25% off + free shipping", kind="automatic", code=None,
+        discount_pct=0.25, free_shipping=True, sku_ids=[], brand=h.world.ref.catalogue.brand_of_role("mass"),
+        start=START, end=START + timedelta(days=28), announced_at=START, scenario_id="promo_margin_trap",
+    )
+
+
+def _basket_promo(promo):
+    """Like promotions.web_promo_for_basket: the promotion only if a basket SKU is eligible."""
+    def fn(world, t, sku_ids, rng):
+        cat = world.ref.catalogue
+        return promo if any(Stubs.is_eligible(promo, cat.get(s)) for s in sku_ids) else None
+    return fn
+
+
+def _influencer_customer(h):
+    c = h.customer(country="DE", acquisition="influencer")
+    assert c.influencer_code in h.cfg.customers.influencer_codes
+    return c
+
+
+def _shop_rows(h, table, **match):
+    rows = h.dispatcher.batch.table(table).inserts.values()
+    return [r for r in rows if all(r.get(k) == v for k, v in match.items())]
+
+
+def test_influencer_first_order_gets_the_code_discount_in_shop_and_erp(monkeypatch):
+    from cpgsim.domain import marketing
+    from cpgsim.writers import keys
+
+    h = Harness(monkeypatch, **_happy_cfg())
+    c = _influencer_customer(h)
+    sku, other = _sku(h, "mass", min_price=12.0), _sku(h, "derma")
+    o = web.place_order(h.world, c, [(sku.sku_id, 2), (other.sku_id, 1)], source="influencer")
+    promo = marketing.influencer_promotion(h.world, c.influencer_code)
+    assert promo.kind == "code" and promo.code == c.influencer_code and promo.discount_pct == 0.15
+    assert not promo.free_shipping and promo.sku_ids == [] and promo.brand is None
+    assert marketing.is_influencer_promo(promo.promo_id) and o.promo_id == promo.promo_id
+    assert h.of(WebOrderPlaced)[0].promotion is promo
+    for ln in o.lines:  # 15 % off every item
+        assert ln.discount == round(ln.unit_price * ln.qty * 0.15, 2) and ln.discount_pct == 0.15
+    assert o.shipping_fee == 0.0 and not h.s.effects  # above the threshold; no scenario truth
+    # shop: order, lines and redemption carry the code and the same discount
+    oid, pid = keys.shop_order_id(h.world.seed, o.order_id), keys.shop_promotion_id(h.world.seed, promo.promo_id)
+    (row,) = _shop_rows(h, "shop.orders", id=oid)
+    lines = _shop_rows(h, "shop.order_lines", order_id=oid)
+    (red,) = _shop_rows(h, "shop.promo_redemptions", order_id=oid)
+    disc = round(sum(ln.discount for ln in o.lines), 2)
+    assert (row["promo_code"], row["promotion_id"]) == (c.influencer_code, pid)
+    assert float(row["discount_total"]) == disc == float(sum(r["discount_amount"] for r in lines))
+    assert float(row["total_amount"]) == o.total == round(o.goods_gross, 2)
+    assert (red["promotion_id"], red["code"], float(red["discount_amount"])) == (pid, c.influencer_code, disc)
+    # ERP: a ZINF condition per item at the nominal rate (no ZPRO); conditions add up to the net value
+    h.run_until(START + timedelta(days=1))
+    sd = h.of(SalesDocCreated)[0].doc
+    goods = [it for it in sd.items if it.item_type != "freight"]
+    for it in goods:
+        assert [cond.ctype for cond in it.conditions] == ["list_price", "influencer_discount", "tax"]
+        assert it.conditions[1].rate == 0.15
+        assert round(sum(cond.amount for cond in it.conditions if cond.ctype != "tax"), 2) == it.net_value
+    konv = list(h.dispatcher.batch.table("erp.konv").inserts.values())
+    zinf = [k for k in konv if k["kschl"] == "ZINF"]
+    assert len(zinf) == len(goods) and not [k for k in konv if k["kschl"] == "ZPRO"]
+    assert {float(k["kbetr"]) for k in zinf} == {-15.0}
+    assert round(sum(float(k["kwert"]) for k in zinf), 2) == round(
+        sum(cond.amount for it in goods for cond in it.conditions if cond.ctype == "influencer_discount"), 2)
+    vbap = [r for r in h.dispatcher.batch.table("erp.vbap").inserts.values() if r["matnr"] != "SHIPPING"]
+    assert round(sum(float(r["netwr"]) for r in vbap), 2) == round(sum(it.net_value for it in goods), 2)
+    assert round(sd.net_value + sum(i.tax for i in sd.items), 2) == o.total
+
+
+def test_influencer_discount_only_on_the_first_order(monkeypatch):
+    h = Harness(monkeypatch, **_happy_cfg())
+    c = _influencer_customer(h)
+    sku = _sku(h, min_price=10.0)
+    o1 = web.place_order(h.world, c, [(sku.sku_id, 3)], source="influencer")
+    o2 = web.place_order(h.world, c, [(sku.sku_id, 3)], source="email")
+    assert o1.promo_id is not None and o1.lines[0].discount > 0
+    assert o2.promo_id is None and o2.lines[0].discount == 0.0 and h.of(WebOrderPlaced)[1].promotion is None
+
+
+def _basket_between(h, low, high, currency):
+    """A one-SKU basket whose list value lies in [low, high)."""
+    for sku in h.world.ref.catalogue.active(h.world.local_date()):
+        price = web.unit_price(sku, currency)
+        for q in range(1, 8):
+            if low <= round(price * q, 2) < high:
+                return [(sku.sku_id, q)], round(price * q, 2)
+    raise AssertionError("no basket")
+
+
+def test_influencer_discount_never_costs_the_free_shipping(monkeypatch):
+    """A basket that ships free at list prices still ships free after the code's 15 % (threshold before discount)."""
+    from cpgsim.domain import marketing
+
+    h = Harness(monkeypatch, **_happy_cfg())
+    w = h.cfg.channels.web
+    for country, threshold in (("DE", w.free_shipping_eur), ("CH", w.free_shipping_chf)):
+        currency = web.currency_of(country)
+        lines, listed = _basket_between(h, threshold, round(threshold / 0.85, 2) - 0.01, currency)
+        c = h.customer(country=country, acquisition="influencer")
+        o = web.place_order(h.world, c, lines, source="influencer")
+        assert marketing.is_influencer_promo(o.promo_id) and o.lines[0].discount_pct == 0.15
+        assert o.goods_gross < threshold <= listed  # below the threshold after the discount ...
+        assert o.shipping_fee == 0.0 and o.total == o.goods_gross < listed  # ... yet free shipping
+    # a calendar promotion keeps testing the threshold on the goods after its discount (unchanged)
+    lines, _ = _basket_between(h, w.free_shipping_eur, round(w.free_shipping_eur / 0.85, 2) - 0.01, "EUR")
+    promo = Promotion(
+        promo_id=20250302, channel="web", name="Everything 15% off", kind="code", code="ALL15-2503",
+        discount_pct=0.15, free_shipping=False, sku_ids=[], brand=None, start=START,
+        end=START + timedelta(days=7), announced_at=START,
+    )
+    h.s.promo_fn = _basket_promo(promo)
+    o = web.place_order(h.world, h.customer(country="DE", acquisition="direct"), lines, source="direct")
+    assert o.promo_id == promo.promo_id and o.shipping_fee == w.shipping_fee_eur
+
+
+def test_influencer_discount_not_combined_with_the_margin_trap_promotion(monkeypatch):
+    """One code per order: a qualifying promo_margin_trap basket keeps the trap promotion only."""
+    from cpgsim.domain import marketing
+    from cpgsim.writers import keys
+
+    h = Harness(monkeypatch, **_happy_cfg())
+    trap = _trap_promo(h)
+    h.s.promo_fn = _basket_promo(trap)
+    velmora = _sku(h, "mass", max_price=8.0)
+    derma = _sku(h, "derma", max_price=12.0)
+    c1, c2 = _influencer_customer(h), _influencer_customer(h)
+    o1 = web.place_order(h.world, c1, [(velmora.sku_id, 1), (derma.sku_id, 1)], source="influencer")
+    assert o1.promo_id == trap.promo_id and o1.shipping_fee == 0.0  # trap: free shipping, no minimum
+    assert [ln.discount_pct for ln in o1.lines] == [0.25, 0.0]
+    assert o1.lines[0].discount == round(velmora.rrp_eur * 0.25, 2) and o1.lines[1].discount == 0.0
+    assert h.of(WebOrderPlaced)[0].promotion is trap
+    (eff,) = h.s.effects  # the trap's truth as before
+    assert eff[3] == o1.order_id and eff[5] == o1.lines[0].discount
+    # a basket the trap promotion does not cover gets the influencer discount instead
+    o2 = web.place_order(h.world, c2, [(derma.sku_id, 1)], source="influencer")
+    assert marketing.is_influencer_promo(o2.promo_id) and o2.lines[0].discount_pct == 0.15
+    assert o2.shipping_fee == h.cfg.channels.web.shipping_fee_eur  # no free shipping with the code
+    assert len(h.s.effects) == 1
+    # the offer is not carried over: c1's second order (no promotion) is at full price
+    h.s.promo_fn = lambda world, t, sku_ids, rng: None
+    o3 = web.place_order(h.world, c1, [(derma.sku_id, 1)], source="email")
+    assert o3.promo_id is None and o3.lines[0].discount == 0.0
+    # shop rows: the trap order carries the trap promotion and no voucher code
+    seed = h.world.seed
+    (row,) = _shop_rows(h, "shop.orders", id=keys.shop_order_id(seed, o1.order_id))
+    assert (row["promo_code"], row["promotion_id"]) == (None, keys.shop_promotion_id(seed, trap.promo_id))
+    (row2,) = _shop_rows(h, "shop.orders", id=keys.shop_order_id(seed, o2.order_id))
+    assert row2["promo_code"] == c2.influencer_code
+    h.run_until(START + timedelta(days=1))
+    by_ref = {e.doc.external_ref: e.doc for e in h.of(SalesDocCreated)}
+    ctypes = [cond.ctype for it in by_ref[str(o1.order_id)].items for cond in it.conditions]
+    assert "promo_discount" in ctypes and "influencer_discount" not in ctypes
+
+
+def test_trap_order_of_an_influencer_customer_stays_attributed_to_the_code(monkeypatch):
+    """The trap promotion wins the order, but the customer and the order stay attributed to the influencer code."""
+    from cpgsim.domain import marketing
+    from cpgsim.engine.queue import Event
+    from cpgsim.writers import keys
+
+    h = Harness(monkeypatch, marketing={"tracking_share": 1.0}, **_happy_cfg())
+    trap = _trap_promo(h)
+    h.s.promo_fn = _basket_promo(trap)
+    c = _influencer_customer(h)
+    code = c.influencer_code
+    o = web.place_order(h.world, c, [(_sku(h, "mass", max_price=8.0).sku_id, 1)], source="influencer")
+    # the order carries the trap promotion only: no influencer discount, no voucher code
+    assert o.promo_id == trap.promo_id and not marketing.is_influencer_promo(o.promo_id)
+    assert o.lines[0].discount_pct == 0.25
+    seed = h.world.seed
+    oid = keys.shop_order_id(seed, o.order_id)
+    (row,) = _shop_rows(h, "shop.orders", id=oid)
+    assert (row["promo_code"], row["promotion_id"]) == (None, keys.shop_promotion_id(seed, trap.promo_id))
+    (red,) = _shop_rows(h, "shop.promo_redemptions", order_id=oid)
+    assert red["promotion_id"] == keys.shop_promotion_id(seed, trap.promo_id) and red["code"] != code
+    # the customer keeps the signup source and the code it signed up with
+    (cust,) = _shop_rows(h, "shop.customers", id=keys.shop_customer_id(seed, c.customer_id))
+    assert (cust["signup_source"], cust["influencer_code"]) == ("influencer", code)
+    # mkt: attributed to the influencer channel and the code (never to the trap's promotion or a coupon site)
+    h.run_until(START + timedelta(days=1))
+    d = h.world.local_date(START)
+    h.world.now = h.world.at_local(d + timedelta(days=1), 6)
+    marketing.on_export(h.world, Event(due=h.world.now, priority=60, kind=marketing.EXPORT_KIND,
+                                       key=f"{marketing.EXPORT_KIND}:{d}", data={"date": d.isoformat()}))
+    (att,) = [r for r in h.dispatcher.batch.table("mkt.attributions").inserts.values() if r["order_ref"] == oid]
+    assert (att["channel"], att["influencer_code"], att["is_new_customer"]) == ("influencer", code, True)
+    assert att["customer_ref"] == keys.shop_customer_id(seed, c.customer_id)
+    usable = [cp for cp in marketing.active_campaigns(h.world, d)
+              if cp.channel == "influencer" and cp.influencer_code == code]
+    assert usable and att["campaign_id"] in {cp.campaign_id for cp in usable}
+
+
+def test_influencer_discount_not_combined_with_a_regular_code_promotion(monkeypatch):
+    h = Harness(monkeypatch, **_happy_cfg())
+    sku = _sku(h, min_price=10.0)
+    promo = Promotion(
+        promo_id=20250301, channel="web", name="Selected favourites 10% off", kind="code", code="GLOW10-2503",
+        discount_pct=0.10, free_shipping=False, sku_ids=[sku.sku_id], brand=None, start=START,
+        end=START + timedelta(days=7), announced_at=START,
+    )
+    h.s.promo_fn = _basket_promo(promo)
+    o = web.place_order(h.world, _influencer_customer(h), [(sku.sku_id, 3)], source="influencer")
+    assert o.promo_id == promo.promo_id and o.lines[0].discount_pct == 0.10
+    (row,) = h.dispatcher.batch.table("shop.orders").inserts.values()
+    assert row["promo_code"] == "GLOW10-2503"
+
+
+def test_no_influencer_discount_without_a_code(monkeypatch):
+    h = Harness(monkeypatch, **_happy_cfg())
+    sku = _sku(h, min_price=10.0)
+    for acq in ("direct", "paid_search", "social", "organic_search"):
+        c = h.customer(country="DE", acquisition=acq)
+        assert c.influencer_code is None
+        o = web.place_order(h.world, c, [(sku.sku_id, 3)], source=acq)
+        assert o.promo_id is None and o.lines[0].discount == 0.0
+
+
+def test_influencer_discount_switched_off(monkeypatch):
+    from cpgsim.domain import marketing
+
+    h = Harness(monkeypatch, marketing={"influencer_first_order_discount_pct": 0.0}, **_happy_cfg())
+    c = _influencer_customer(h)
+    assert marketing.influencer_promotion(h.world, c.influencer_code) is None
+    o = web.place_order(h.world, c, [(_sku(h, min_price=10.0).sku_id, 3)], source="influencer")
+    assert o.promo_id is None and o.lines[0].discount == 0.0
+    assert not h.dispatcher.batch.table("shop.promo_redemptions").inserts
+    h.run_until(START + timedelta(days=1))
+    assert [cond.ctype for cond in h.of(SalesDocCreated)[0].doc.items[0].conditions] == ["list_price", "tax"]
 
 
 # ---------------------------------------------------------------------------

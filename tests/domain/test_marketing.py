@@ -20,6 +20,7 @@ from cpgsim.domain.events import (
     InfluencerCodeRegistered,
     OrdersAttributed,
     PlantedEffect,
+    PromotionDefined,
     SessionsReported,
 )
 from cpgsim.domain.model import ENTITY_KINDS, Counters
@@ -36,8 +37,6 @@ UTC = timezone.utc
 BERLIN = ZoneInfo("Europe/Berlin")
 HS = datetime(2025, 1, 6, tzinfo=BERLIN).astimezone(UTC)  # Monday 00:00 local
 SOURCES = ("mkt.campaigns", "mkt.export")
-# Paid-channel CPMs calibrated so that mean paid conversion matches conversion_rates (see the WP4 report).
-CALIBRATED_PAID = {"paid_search": {"cpm_eur": 21.5}, "social": {"cpm_eur": 3.0}, "influencer": {"cpm_eur": 8.5}}
 
 _REF: dict = {}
 
@@ -300,6 +299,45 @@ def test_bootstrap_registers_codes_and_defines_running_campaigns():
     assert "PS-2025Q1-01" not in act
 
 
+def test_bootstrap_defines_one_first_order_promotion_per_influencer_code():
+    from cpgsim.writers import build_writers
+    from cpgsim.writers.base import Dispatcher, WriterContext
+
+    world, out = make_world()
+    mk.bootstrap_campaigns(world)
+    regs = {e.code: e for e in out if isinstance(e, InfluencerCodeRegistered)}
+    promos = {e.promotion.code: e.promotion for e in out if isinstance(e, PromotionDefined)}
+    assert sorted(promos) == sorted(world.cfg.customers.influencer_codes)
+    codes = sorted(world.cfg.customers.influencer_codes)
+    for code, p in promos.items():
+        assert p == mk.influencer_promotion(world, code)
+        assert p.promo_id == mk.INFLUENCER_PROMO_ID_BASE + codes.index(code) and mk.is_influencer_promo(p.promo_id)
+        assert (p.channel, p.kind, p.discount_pct, p.free_shipping, p.sku_ids, p.brand) == (
+            "web", "code", 0.15, False, [], None)
+        assert world.local_date(p.start) == regs[code].valid_from and p.announced_at == HS
+        assert world.local_date(p.end) == mk.INFLUENCER_PROMO_END and "first order" in p.name
+        # outside the promotion calendar: never offered to other customers, no demand lift
+        assert p.promo_id not in {x.promo_id for x in promotions.active_web_promos(world, HS + timedelta(days=3))}
+    assert not mk.is_influencer_promo(900_000) and not mk.is_influencer_promo(20250101)
+    assert mk.influencer_promotion(world, "NOSUCHCODE") is None and mk.influencer_promotion(world, None) is None
+    # shop.promotions: one code promotion row per influencer code
+    ctx = WriterContext(seed=world.seed, cfg=world.cfg, ref=world.ref, tz=world.tz)
+    d = Dispatcher(build_writers(ctx))
+    for e in out:
+        if isinstance(e, PromotionDefined):
+            d.dispatch(e)
+    rows = {r["code"]: r for r in d.batch.table("shop.promotions").inserts.values()}
+    assert sorted(rows) == codes
+    for code, r in rows.items():
+        assert r["promo_type"] == "code" and float(r["discount_pct"]) == 0.15 and r["skus"] == []
+        assert r["id"] == keys.shop_promotion_id(world.seed, promos[code].promo_id)
+    # switched off: no influencer promotions at all
+    world0, out0 = make_world(make_cfg(marketing={"influencer_first_order_discount_pct": 0}))
+    mk.bootstrap_campaigns(world0)
+    assert not [e for e in out0 if isinstance(e, PromotionDefined)]
+    assert mk.influencer_promotion(world0, codes[0]) is None
+
+
 def test_every_campaign_is_defined_once_before_its_status_changes():
     world, out = make_world(make_cfg([TRAP]))
     mk.bootstrap_campaigns(world)
@@ -508,9 +546,9 @@ def test_affiliate_metrics_are_consistent(monkeypatch):
             assert sum(r.orders for r in aff) <= sum(r.sessions for r in aff) <= max(clicks[e.session_date], 1) * 1.05
 
 
-def test_conversion_varies_and_matches_conversion_rates_with_calibrated_media(monkeypatch):
-    cfg = make_cfg(marketing={"paid": {k: {**Config().marketing.paid[k].model_dump(), **v}
-                                       for k, v in CALIBRATED_PAID.items()}})
+def test_conversion_varies_and_matches_conversion_rates_with_default_media(monkeypatch):
+    # the default paid CPM / CTR are calibrated so that mean paid conversion matches conversion_rates
+    cfg = make_cfg()
     world, out = make_world(cfg, hs=local(2025, 1, 1))
     mk.bootstrap_campaigns(world)
     rng = Rng(2, "orders")

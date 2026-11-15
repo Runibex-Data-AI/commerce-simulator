@@ -219,6 +219,27 @@ def test_first_order_on_a_duplicate_account_is_not_a_repeat(harness, monkeypatch
     assert h.store.get("customer", buyer.customer_id).orders == 4  # the person's history is kept
 
 
+def test_duplicate_account_of_an_influencer_customer_gets_no_first_order_discount(harness, monkeypatch):
+    """The influencer first-order discount is the person's: a duplicate account keeps the code, not the offer."""
+    from cpgsim.domain import marketing, promotions, web
+
+    h = harness(chaos_cfg(**ONLY_DUP))
+    code = sorted(h.world.cfg.customers.influencer_codes)[0]
+    assert marketing.influencer_promotion(h.world, code) is not None  # a fresh account would get it
+    c = _new(h, i=7)
+    c = h.store.mut("customer", c.customer_id)
+    c.acquisition, c.influencer_code, c.orders = "influencer", code, 1
+    _register_dup(h, c)
+    buyer = chaos.repeat_customer(h.world, h.store.get("customer", c.customer_id))
+    assert (buyer.acquisition, buyer.influencer_code) == ("influencer", code)
+    monkeypatch.setattr(promotions, "web_promo_for_basket", lambda world, t, sku_ids, rng: None)
+    monkeypatch.setattr(chaos, "on_order_placed", lambda w, o: None)
+    sku = h.world.ref.catalogue.skus[0].sku_id
+    first = web.place_order(h.world, buyer, [(sku, 2)], source="direct")
+    assert first.is_repeat is False and first.meta.get("person_repeat") is True  # the account's first order
+    assert first.promo_id is None and all(ln.discount == 0.0 for ln in first.lines)
+
+
 def test_original_with_open_orders_survives_the_hand_over(harness):
     h = harness(chaos_cfg(**ONLY_DUP))
     c = _new(h, i=4)

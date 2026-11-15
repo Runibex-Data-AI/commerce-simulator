@@ -109,7 +109,7 @@ Stateful business logic lives in `domain/`. Each module registers its handlers:
 | `retail` | Hidden retailer demand and inventory per DC (weekly sell-out, daily for the marketplace), order weekdays, event-aware order-up-to targets, `retailer_overstock` push mode, hero substitution on lost units, retailer POs, confirmation, delivery planning, invoicing after proof of delivery, payment net of deductions | none (hands each period to `feeds` and `deductions`) |
 | `feeds` | Feed accumulators per period (`feed_acc`), delivery at each sender's schedule (`feeds.delivery`), restatements as new loads | `record_sellout_week(world, channel, dc, week_start, sold, lost, demand, on_hand)`, `record_marketplace_day(world, channel, dc, day, sold, demand, on_hand, on_order)` |
 | `deductions` | Trade promotion agreements, retailer claims by kind, matching, disputes, short payment with partial taking, repayment (`deduction`, `deduction_book`, `promo_claim`) | `record_sellout(...)`, `record_pod(...)`, `record_cut(...)`, `take_on_payment(world, channel, billing_id, gross) -> float` (amount short-paid) |
-| `marketing` | Pure campaign calendar, spend-driven acquisition, attribution and the daily `mkt` export (`mkt_day`) | `new_customer_multiplier(world, t)`, `acquisition_mix(world, t)`, `pick_influencer_code(world, rng, t)`, `note_order(world, order, customer, source, new_customer)` |
+| `marketing` | Pure campaign calendar, spend-driven acquisition, attribution and the daily `mkt` export (`mkt_day`); influencer codes and their first-order promotion | `new_customer_multiplier(world, t)`, `acquisition_mix(world, t)`, `pick_influencer_code(world, rng, t)`, `note_order(world, order, customer, source, new_customer)`, `influencer_promotion(world, code)` |
 | `scenarios/manager` | Scenario windows from config and CLI (self-limiting windows end at `start + duration`), truth recording | `world.scenarios.active(scenario_id, t) -> list[ScenarioWindow]`, `factor(name, t, **ctx) -> float` (lifetime factors such as `repurchase` keep applying after the window to entities acquired inside it), `transfers(name, t, world=world, **ctx)` (hero substitution of expected units), `visible_from(window)`, `record_effect(...)` |
 | `chaos` (package) | Data quality defects (see Chaos below) | `hit(world, defect, *ids)`, `record(...)` and the seams called from customers, web, fulfilment, returns, masterdata and deductions |
 
@@ -265,6 +265,31 @@ UTC, statuses as lower-case words (the neutral vocabulary), money as
   `returned` order to `return_rejected` (no refund). Refunds are `issued`, then
   `completed` (`RefundChanged`) when the payment provider has paid out, by
   payment method hours to a week later (`returns.REFUND_COMPLETION_DAYS`).
+* Promotions: one per order (`orders.promotion_id`, `promo_code` for code
+  promotions, one `promo_redemptions` row). The best calendar promotion for the
+  basket wins (`promotions.web_promo_for_basket`). A customer acquired with an
+  influencer code (`customers.influencer_code`) gets
+  `marketing.influencer_first_order_discount_pct` (15 %) off the goods, not
+  shipping, of their first order, with the code as `promo_code`: one
+  `promotions` row per code (code promotion, sitewide, valid from the code's
+  `valid_from`, open ended to 2099-12-31, named "... off the first order"),
+  created at the history start. Ids `800_000 +` the code's position in the
+  sorted code list (`marketing.influencer_promotion`); the code promotions are
+  not in the promotion calendar (no demand lift, never offered to anyone else).
+  One code per order: when any other promotion takes effect on that first order
+  (a regular web promotion or the `promo_margin_trap` promotion, automatic or a
+  redeemed code), it applies alone and the influencer discount is dropped, not
+  carried over to a later order (it is a first-order offer). So every planted
+  scenario's redeemed orders and truth stay as they were. "First order" is the
+  person's first order (`Customer.orders == 0`): a chaos duplicate account's
+  first order does not get it, although the shop sees a new account with the
+  code (`is_repeat_customer` false). The free-shipping threshold is tested on
+  the goods before the code's discount (after it for every other promotion), so
+  the code never adds a shipping fee to a basket that ships free at list
+  prices. No rng draw is involved. The customer stays
+  attributed to the code either way (`signup_source = 'influencer'`,
+  `influencer_code` unchanged), even when `promo_code` / `promotion_id` carry
+  the other promotion.
 
 ### `wms` (warehouse and shipping)
 
@@ -324,7 +349,13 @@ So `vbak.netwr + sum(vbap.mwsbp)` equals the shop order total, the non-tax
 `konv` conditions of an item add up to `vbap.netwr`, and invoices minus
 credit memos equal the shop total for a fully shipped, non-returned order
 (`tests/e2e/test_reconciliation.py`). `ZPRO` carries the promotion's nominal
-rate in `kbetr`, the cent-rounded amount in `kwert`.
+rate in `kbetr`, the cent-rounded amount in `kwert`. An influencer code's
+first-order discount has a condition type of its own, `ZINF` (step 040, same
+rate/amount rule), not `ZPRO`: the sales order has no promotion reference, so
+the condition type is how finance tells an acquisition discount (paid for
+alongside the influencer's commission) from a calendar promotion, and `ZPRO`
+keeps meaning calendar promotions. One promotion per order, so an item carries
+`ZPRO` or `ZINF`, never both.
 
 Master data seeded at history start is back-dated: `mara.ersda` is the
 listing date (launch - 60 days, `SkuListed.listed_on`) so a delisting date
@@ -411,6 +442,27 @@ scenario campaigns switched on live. Spend flights drive new-customer
 acquisition through a multiplier normalised per calendar year (rate-weighted
 mean 1), so web volume and the value-share calibration hold.
 
+Influencer codes: a customer acquired with a code gets 15 % off the goods of
+the first order (`marketing.influencer_first_order_discount_pct`, 0 switches it
+off), with the code as the shop's `promo_code`, unless another promotion
+applies to that order (one code per order; see `shop` above). Attribution
+follows the customer's acquisition, never the order's promo code: such a first
+order is still attributed to `influencer` with the customer's code (and the
+code's campaign when one is usable, `is_new_customer` true), and the coupon-site
+intercept never takes it. The commission
+(`influencer_codes.commission_pct`) is paid on attributed net revenue, after
+that discount, and is part of the influencer campaigns' `spend_eur`.
+
+Paid media defaults (`marketing.paid`) are calibrated against the measured
+contribution per web order, about EUR 13.1 / 9.7 / 8.9 for a customer's orders
+1 / 2 / 3 (cumulative 13.1 / 22.8 / 31.7): paid search CAC EUR 22 (pays back
+with order 2), social EUR 29 (order 3), influencer EUR 14 (about EUR 16 with
+the commission: the cheapest CAC, but the worst lifetime value). CPM and CTR
+(search 16.0 / 3.5 %, social 4.5 / 1.3 %, influencer 4.9 / 1.5 %) are set so
+that the clicks implied by spend match the configured session conversion rates
+(`conversion_rates`, social 1.8 %): paid sessions = clicks x U(0.80, 0.92) +
+15 % of the expected sessions as organic.
+
 ### `truth`
 
 Ground truth for planted scenarios and data quality defects. Entity ids are
@@ -457,7 +509,7 @@ instance.
 | unmapped_article | `master` | a retailer article without `erp.knmt` row (about 95 % coverage); EDI order lines (`vbap.kdmat` + `matnr`) and `zkona_item` keep the pair, so the mapping is recoverable from history; `zdeduct_item.matnr` is NULL |
 | sellout_restatement | `domain/feeds.py` | a load under-reports one region; the next delivery restates the period as a new load |
 | free_text_return_reason | `logistics` | `wms.returns.reason_text` (German phrases, 10 % contradict the code) |
-| gdpr_erasure | `shop` | `shop.customers.status = 'anonymised'` and anonymised addresses; `wms` keeps the consignee name (deliberate cross-system disagreement) |
+| gdpr_erasure | `shop` | `shop.customers.status = 'anonymised'`, anonymised addresses and `influencer_code` cleared (`signup_source` and `mkt.attributions.influencer_code` keep the acquisition); `wms` keeps the consignee name (deliberate cross-system disagreement) |
 
 Exact-reconciliation e2e tests run with chaos off (`CHAOS_OFF`); determinism
 tests run with chaos on.

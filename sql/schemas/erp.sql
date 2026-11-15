@@ -281,9 +281,9 @@ CREATE TABLE IF NOT EXISTS erp.konv (
 );
 CREATE INDEX IF NOT EXISTS konv_updated_at_idx ON erp.konv (updated_at);
 COMMENT ON TABLE  erp.konv IS 'Pricing conditions of sales documents (SAP KONV; PRCD_ELEMENTS in S/4HANA). Join on vbak.knumv.';
-COMMENT ON COLUMN erp.konv.kschl IS 'Condition type: PR00 list price, K007 customer discount, ZPRO promotion discount, HD00 freight, MWST output tax.';
+COMMENT ON COLUMN erp.konv.kschl IS 'Condition type: PR00 list price, K007 customer discount, ZPRO promotion discount, ZINF influencer code first-order discount (web, never on the same order as ZPRO), HD00 freight, MWST output tax.';
 COMMENT ON COLUMN erp.konv.krech IS 'Calculation type: C quantity-based (kbetr per kpein kmein), A percentage (kbetr in %), B fixed amount.';
-COMMENT ON COLUMN erp.konv.kbetr IS 'Rate: unit price for PR00, percent for discounts and tax (negative for discounts; ZPRO carries the promotion''s nominal rate, kwert the cent-rounded amount), amount for freight (HD00 on the freight item 000900).';
+COMMENT ON COLUMN erp.konv.kbetr IS 'Rate: unit price for PR00, percent for discounts and tax (negative for discounts; ZPRO and ZINF carry the promotion''s nominal rate, kwert the cent-rounded amount), amount for freight (HD00 on the freight item 000900).';
 COMMENT ON COLUMN erp.konv.kwert IS 'Condition value for the item in document currency waers (discounts negative).';
 
 -- ---------------------------------------------------------------------------

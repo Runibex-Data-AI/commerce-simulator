@@ -101,4 +101,5 @@ COMMENT ON TABLE  mkt.attributions IS 'Single-touch last-click attribution, one 
 COMMENT ON COLUMN mkt.attributions.order_ref IS 'shop.orders.id (UUID text).';
 COMMENT ON COLUMN mkt.attributions.customer_ref IS 'shop.customers.id (UUID text).';
 COMMENT ON COLUMN mkt.attributions.campaign_id IS 'mkt.campaigns.campaign_id; NULL for organic, direct, app and marketplace spillover traffic.';
+COMMENT ON COLUMN mkt.attributions.influencer_code IS 'For channel = influencer: the influencer code the customer signed up with (shop.customers.influencer_code); NULL for other channels. Independent of shop.orders.promo_code / promotion_id: a first order on which another promotion replaced the code''s discount is still attributed here to the code (is_new_customer true).';
 COMMENT ON COLUMN mkt.attributions.attributed_revenue_eur IS 'Gross order value attributed, EUR.';
