@@ -11,6 +11,14 @@ Public API (called by ``domain/web.py`` and ``domain/customers.py``)::
     acquisition_mix(world, t) -> dict[str, float]
     pick_influencer_code(world, rng, t) -> str | None   # exactly one rng.random() draw
     note_order(world, order, customer, source, new_customer) -> None
+    influencer_promotion(world, code) -> Promotion | None   # first-order discount of an influencer code
+
+Influencer codes: registered at the history start (``mkt.influencer_codes``)
+together with their first-order promotion (``influencer_promotion``, one
+``shop.promotions`` code promotion per code). A customer acquired with a code
+gets ``influencer_first_order_discount_pct`` off the goods of the first order
+unless another promotion applies to it (one code per order, ``web.place_order``);
+the commission is paid on attributed net revenue, after that discount.
 
 Campaign calendar (pure)
 ------------------------
@@ -107,10 +115,11 @@ from .events import (
     CampaignStatusChanged,
     InfluencerCodeRegistered,
     OrdersAttributed,
+    PromotionDefined,
     SessionsReported,
     SessionsRow,
 )
-from .model import Campaign, MarketingDay
+from .model import Campaign, MarketingDay, Promotion
 
 demandplan = lazy("demandplan")
 promotions = lazy("promotions")
@@ -143,6 +152,8 @@ OPEN_ENDED_PROMO_DAYS = 28  # = promo_margin_trap.OPEN_ENDED_PROMO_DAYS
 INFLUENCER_PLATFORMS = {"short_video": 0.45, "photo_feed": 0.35, "blog": 0.12, "podcast": 0.08}
 _HANDLE_PATTERNS = ("{b}", "{b}.glow", "{b}_skin", "the.{b}", "{b}.beauty", "{b}.daily")
 WARM_HISTORY_DAYS = 730  # customers.WARM_HISTORY_DAYS: oldest warm-start registration
+INFLUENCER_PROMO_ID_BASE = 800_000  # influencer first-order promotions: + position in the sorted code list
+INFLUENCER_PROMO_END = date(2099, 12, 31)  # last day of an open-ended influencer code promotion
 
 # Reporting of non-paid channels (CPM in EUR per 1000 impressions or sends, click-through rate).
 OTHER_MEDIA = {"email": (1.2, 0.025), "affiliate": (2.5, 0.006)}
@@ -236,6 +247,7 @@ class _State:
         self.active: dict[tuple, list[Campaign]] = {}
         self.scen: tuple[Any, _Scen] | None = None
         self.terms: dict[str, dict[str, Any]] = {}
+        self.first_order: dict[str, Promotion | None] = {}
         self.expected: dict[tuple, dict[str, float]] = {}
 
 
@@ -350,6 +362,56 @@ def influencer_terms(world, code: str) -> dict[str, Any]:
     }
     st.terms[code] = hit
     return hit
+
+
+def is_influencer_promo(promo_id: int | None) -> bool:
+    """True for the id of an influencer first-order promotion (``influencer_promotion``)."""
+    return promo_id is not None and INFLUENCER_PROMO_ID_BASE <= int(promo_id) < SCENARIO_ID_BASE
+
+
+def influencer_promotion(world, code: str | None) -> Promotion | None:
+    """The shop promotion behind an influencer code's first-order discount (pure), or None.
+
+    None when the code is not configured or ``influencer_first_order_discount_pct``
+    is 0. One code promotion per configured code: id ``INFLUENCER_PROMO_ID_BASE``
+    + the code's position in the sorted code list, voucher code = the influencer
+    code, ``influencer_first_order_discount_pct`` off every item (sitewide, no
+    free shipping), valid from the code's ``valid_from`` (00:00 local) and open
+    ended (``INFLUENCER_PROMO_END``, as ``mkt.influencer_codes.valid_to`` is
+    NULL). It is not part of the promotion calendar: no demand lift, never
+    offered to other customers; ``web.place_order`` grants it on the first order
+    of a customer acquired with the code when no other promotion applies.
+    Defined in ``shop.promotions`` at the history start (``bootstrap_campaigns``).
+    """
+    cfg = world.cfg
+    pct = float(cfg.marketing.influencer_first_order_discount_pct)
+    if not code or pct <= 0:
+        return None
+    st = _state(world)
+    if code in st.first_order:
+        return st.first_order[code]
+    codes = _codes(cfg)
+    promo = None
+    if code in codes:
+        tm = influencer_terms(world, code)
+        hs = world.history_start
+        valid_from = world.local_date(hs) - timedelta(days=tm["valid_offset_days"])
+        promo = Promotion(
+            promo_id=INFLUENCER_PROMO_ID_BASE + codes.index(code),
+            channel="web",
+            name=f"{code}: {pct:g}% off the first order",
+            kind="code",
+            code=code,
+            discount_pct=round(pct / 100.0, 4),
+            free_shipping=False,
+            sku_ids=[],
+            brand=None,
+            start=world.at_local(valid_from, 0),
+            end=world.at_local(INFLUENCER_PROMO_END + _DAY, 0) - timedelta(seconds=1),
+            announced_at=hs,
+        )
+    st.first_order[code] = promo
+    return promo
 
 
 # ---------------------------------------------------------------------------
@@ -1008,6 +1070,9 @@ def bootstrap_campaigns(world) -> None:
             commission_pct=tm["commission_pct"], fixed_fee_eur=tm["fixed_fee_eur"],
             valid_from=hd - timedelta(days=tm["valid_offset_days"]),
         ))
+        promo = influencer_promotion(world, code)
+        if promo is not None:  # the code's first-order discount, a code promotion in shop.promotions
+            world.emit(PromotionDefined(at=hs, promotion=replace(promo, sku_ids=[])))
     seen: set[str] = set()
     camps = [c for y in (hd.year - 1, hd.year, hd.year + 1) for c in _year(world, y).campaigns]
     camps += _scenario(world).campaigns

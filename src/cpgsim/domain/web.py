@@ -376,38 +376,16 @@ def _scenario_window_id(world, promo) -> str | None:
     return wid
 
 
-def place_order(
-    world, customer: Customer, lines, source: str, subscription_id: int | None = None
-) -> WebOrder:
-    """Price and place a web order for ``lines`` ``[(sku_id, qty), ...]``.
+def _price_lines(world, merged: dict[int, int], currency: str, vat: float, promo):
+    """Order lines, goods total, shipping charged and waived, and the promotion that took effect (or None).
 
-    Gross prices in the order currency (rrp_eur, rrp_chf for CH), best web
-    promotion for the basket, shipping fee below the free-shipping threshold
-    (waived by free-shipping promotions). Emits ``WebOrderPlaced`` and
-    schedules the payment.
+    ``promo`` discounts its eligible lines and may waive the shipping fee; it
+    takes effect when it discounts a line or waives a fee.
     """
-    cfg = world.cfg
-    w = cfg.channels.web
-    c = world.store.mut("customer", customer.customer_id)
-    customers.order_opened(c)
-    now = world.now
-    oid = world.next_id("web_order")
-    rng = world.rng("web.order", oid)
-    country = c.country
-    currency = currency_of(country)
-    vat = w.vat[country]
+    w = world.cfg.channels.web
     cat = world.ref.catalogue
-
-    merged: dict[int, int] = {}
-    for s, q in lines:
-        s, q = int(s), int(q)
-        if q > 0:
-            merged[s] = merged.get(s, 0) + q
-    sku_ids = list(merged)
-    promo = promotions.web_promo_for_basket(world, now, sku_ids, rng) if sku_ids else None
-
     olines: list[OrderLine] = []
-    for i, s in enumerate(sku_ids, start=1):
+    for i, s in enumerate(merged, start=1):
         sku = cat.get(s)
         q = merged[s]
         price = unit_price(sku, currency)
@@ -427,6 +405,52 @@ def place_order(
         shipping, waived = 0.0, nominal_fee
     discount_total = round(sum(ln.discount for ln in olines), 2)
     applied = promo if promo is not None and (discount_total > 0 or waived > 0) else None
+    return olines, goods, shipping, waived, applied
+
+
+def place_order(
+    world, customer: Customer, lines, source: str, subscription_id: int | None = None
+) -> WebOrder:
+    """Price and place a web order for ``lines`` ``[(sku_id, qty), ...]``.
+
+    Gross prices in the order currency (rrp_eur, rrp_chf for CH), best web
+    promotion for the basket, shipping fee below the free-shipping threshold
+    (waived by free-shipping promotions). Emits ``WebOrderPlaced`` and
+    schedules the payment.
+
+    One promotion per order: the first order of a customer acquired with an
+    influencer code gets the code's first-order discount
+    (``marketing.influencer_promotion``) only when no other promotion takes
+    effect on it; the offer is not carried over to a later order.
+    """
+    cfg = world.cfg
+    w = cfg.channels.web
+    c = world.store.mut("customer", customer.customer_id)
+    customers.order_opened(c)
+    now = world.now
+    oid = world.next_id("web_order")
+    rng = world.rng("web.order", oid)
+    country = c.country
+    currency = currency_of(country)
+    vat = w.vat[country]
+
+    merged: dict[int, int] = {}
+    for s, q in lines:
+        s, q = int(s), int(q)
+        if q > 0:
+            merged[s] = merged.get(s, 0) + q
+    sku_ids = list(merged)
+    promo = promotions.web_promo_for_basket(world, now, sku_ids, rng) if sku_ids else None
+    olines, goods, shipping, waived, applied = _price_lines(world, merged, currency, vat, promo)
+    if applied is None and c.orders == 0 and c.influencer_code:
+        # One code per order: the influencer first-order discount only when no other promotion applies
+        # (no rng draw, so every other stream and every planted scenario stays as it was).
+        first = marketing.influencer_promotion(world, c.influencer_code)
+        if first is not None:
+            priced = _price_lines(world, merged, currency, vat, first)
+            if priced[4] is not None:
+                olines, goods, shipping, waived, applied = priced
+    discount_total = round(sum(ln.discount for ln in olines), 2)
 
     # The shop's repeat flag counts the account's own orders: a duplicate account
     # (chaos duplicate_customer) starts at the person's earlier count.
@@ -705,9 +729,11 @@ def _sales_item(world, o: WebOrder, ln: OrderLine, d: date) -> SalesItem:
     conds = [Condition("list_price", unit_net, list_net)]
     if ln.discount > 0:
         # The condition rate is the promotion's nominal rate (like a condition
-        # record); the amount is the cent-rounded discount actually granted.
+        # record); the amount is the cent-rounded discount actually granted. An
+        # influencer code's first-order discount has a condition type of its own.
         pct = ln.discount_pct or (ln.discount / list_gross if list_gross else 0.0)
-        conds.append(Condition("promo_discount", round(pct, 4), round(net - list_net, 2)))
+        ctype = "influencer_discount" if marketing.is_influencer_promo(o.promo_id) else "promo_discount"
+        conds.append(Condition(ctype, round(pct, 4), round(net - list_net, 2)))
     cost = round(masterdata.std_cost(world, ln.sku_id, d) * ln.qty, 2)
     return SalesItem(
         item_no=ln.line_no * 10,

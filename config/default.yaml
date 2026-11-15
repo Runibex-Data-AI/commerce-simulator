@@ -207,6 +207,7 @@ deductions:
 marketing:
   response_elasticity: 0.7      # new customers respond to spend flights with this elasticity
   tracking_share: 0.92          # shop orders tracked by web analytics (consent)
+  influencer_first_order_discount_pct: 15.0   # off an influencer customer's first order (not combinable; 0 = off)
 
 # Data quality noise (spec default rates). Set a rate to 0 to switch a defect off.
 chaos:

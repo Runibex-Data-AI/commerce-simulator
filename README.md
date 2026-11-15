@@ -41,7 +41,7 @@ That role can read the business schemas and nothing else.
 | `shop` | Web shop platform: customers, addresses, orders, order lines, payments, refunds, promotions, subscriptions | UUID keys, `timestamptz` in UTC, statuses as words |
 | `wms` | Warehouse and shipping: shipments, carrier events, returns, daily stock levels, stock movements | Integer keys, two-letter status codes, local Berlin time without time zone |
 | `erp` | SAP-style ERP: `mara`, `makt`, `mbew`, `kna1`, `knmt`, `tcurr`, `vbak`/`vbap`, `konv`, `likp`/`lips`, `vbrk`/`vbrp`, trade promotion agreements `kona`/`zkona_item`, deductions `zdeduct`/`zdeduct_item`/`zdeduct_clr` | Ten-digit document numbers, SAP field names, amounts in document currency plus EUR |
-| `mkt` | Marketing stack: campaigns, daily spend, web sessions, last-click attributions, influencer codes | Text keys, dates; daily facts exported once a day after the day closes |
+| `mkt` | Marketing stack: campaigns, daily spend, web sessions, last-click attributions, influencer codes (15 % off a customer's first web order, never combined with another promotion) | Text keys, dates; daily facts exported once a day after the day closes |
 | `feeds` | Retailer sell-out (weekly; the perfumery per retail month), marketplace daily sales, traffic and inventory, feed loads | Flat file-like rows in each sender's own codes and layout, a load id per delivery, insert-only (restatements are new loads) |
 | `shelf` | Digital shelf | Arrives in phase 3 |
 | `sim`, `truth` | Simulator state and ground truth for planted scenarios | Never granted to `bi_reader` |

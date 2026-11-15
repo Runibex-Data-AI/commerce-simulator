@@ -97,6 +97,48 @@ def test_pricing_conditions_add_up(run):
     assert retail_rates and retail_rates <= funded, retail_rates - funded
 
 
+def test_influencer_first_order_discount_one_code_per_order(run):
+    """Influencer code orders: shop order, lines, redemption and ERP ZINF agree; never with another promotion."""
+    orders = run.execute("""
+        SELECT o.id, o.promo_code, c.influencer_code, o.is_repeat_customer, p.code, p.discount_pct,
+               o.discount_total, r.discount_amount, r.code,
+               (SELECT sum(l.discount_amount) FROM shop.order_lines l WHERE l.order_id = o.id),
+               (SELECT max(abs(l.discount_amount - round(l.unit_price * l.quantity * p.discount_pct, 2)))
+                FROM shop.order_lines l WHERE l.order_id = o.id)
+        FROM shop.orders o JOIN shop.customers c ON c.id = o.customer_id
+        JOIN shop.promotions p ON p.id = o.promotion_id
+        LEFT JOIN shop.promo_redemptions r ON r.order_id = o.id AND r.promotion_id = o.promotion_id
+        WHERE p.code IN (SELECT code FROM mkt.influencer_codes)
+    """).fetchall()
+    assert len(orders) > 30
+    bad = [r for r in orders if not (
+        r[1] == r[2] == r[4] == r[8] and not r[3] and r[5] == Decimal("0.1500")
+        and r[6] == r[7] == r[9] > 0 and r[10] <= Decimal("0.01"))]
+    assert not bad, bad[:5]
+    # an influencer customer's first order without any promotion would have been granted the discount
+    missing = run.execute("""
+        SELECT count(*) FROM shop.orders o JOIN shop.customers c ON c.id = o.customer_id
+        WHERE c.influencer_code IS NOT NULL AND NOT o.is_repeat_customer AND o.promotion_id IS NULL
+    """).fetchone()[0]
+    assert missing == 0
+    # first orders of influencer customers that another promotion took (Black Week code, regular promotions)
+    other = run.execute("""
+        SELECT count(*) FROM shop.orders o JOIN shop.customers c ON c.id = o.customer_id
+        JOIN shop.promotions p ON p.id = o.promotion_id
+        WHERE c.influencer_code IS NOT NULL AND NOT o.is_repeat_customer AND p.code IS DISTINCT FROM c.influencer_code
+    """).fetchone()[0]
+    assert other > 0
+    # ERP: ZINF exactly on the influencer code orders' items, never together with ZPRO
+    erp = run.execute("""
+        SELECT h.bstnk, bool_or(k.kschl = 'ZINF'), bool_or(k.kschl = 'ZPRO'), array_agg(DISTINCT k.kbetr)
+                 FILTER (WHERE k.kschl = 'ZINF')
+        FROM erp.vbak h JOIN erp.konv k ON k.knumv = h.knumv
+        WHERE h.auart = 'ZWEB' GROUP BY h.bstnk HAVING bool_or(k.kschl = 'ZINF')
+    """).fetchall()
+    assert {r[0] for r in erp} == {str(r[0]) for r in orders}
+    assert all(not r[2] and r[3] == [Decimal("-15.000")] for r in erp), [r for r in erp if r[2]][:5]
+
+
 def test_invoices_minus_credit_memos_equal_shop_total(run):
     rows = run.execute(f"""
         WITH o AS ({WEB_ORDERS}),

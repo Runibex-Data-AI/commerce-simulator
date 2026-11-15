@@ -148,6 +148,7 @@ CONDITIONS: dict[str, tuple[str, str, str]] = {
     "list_price": ("PR00", "010", "C"),
     "customer_discount": ("K007", "020", "A"),
     "promo_discount": ("ZPRO", "030", "A"),
+    "influencer_discount": ("ZINF", "040", "A"),  # influencer code first-order discount (never with ZPRO)
     "shipping": ("HD00", "050", "B"),
     "tax": ("MWST", "900", "A"),
 }

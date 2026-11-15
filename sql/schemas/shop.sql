@@ -81,7 +81,7 @@ CREATE TABLE IF NOT EXISTS shop.promotions (
 CREATE INDEX IF NOT EXISTS promotions_updated_at_idx ON shop.promotions (updated_at);
 CREATE INDEX IF NOT EXISTS promotions_code_idx ON shop.promotions (code);
 
-COMMENT ON TABLE shop.promotions IS 'Web shop promotions (retailer promotions are not in this system). Created when announced, before starts_at.';
+COMMENT ON TABLE shop.promotions IS 'Web shop promotions (retailer promotions are not in this system). Created when announced, before starts_at. Also one code promotion per influencer code: its first-order discount (code = the influencer code, valid for a customer''s first order only, open ended).';
 COMMENT ON COLUMN shop.promotions.promo_type IS 'code (customer enters a voucher code) or automatic (applied to qualifying baskets).';
 COMMENT ON COLUMN shop.promotions.code IS 'Voucher code for promo_type = code; NULL for automatic promotions.';
 COMMENT ON COLUMN shop.promotions.discount_pct IS 'Discount on qualifying items as a fraction, e.g. 0.2500 = 25 % off.';
@@ -171,8 +171,8 @@ COMMENT ON COLUMN shop.orders.discount_total IS 'Sum of line discounts (gross).'
 COMMENT ON COLUMN shop.orders.shipping_fee IS 'Shipping fee charged, gross; 0 above the free-shipping threshold or with a free-shipping promotion.';
 COMMENT ON COLUMN shop.orders.tax_total IS 'VAT contained in total_amount: line taxes plus VAT on the shipping fee at the order''s standard rate.';
 COMMENT ON COLUMN shop.orders.total_amount IS 'Amount charged to the customer: items_subtotal - discount_total + shipping_fee (gross).';
-COMMENT ON COLUMN shop.orders.promo_code IS 'Voucher code entered (code promotions only).';
-COMMENT ON COLUMN shop.orders.promotion_id IS 'Promotion applied to the order (code or automatic), if any.';
+COMMENT ON COLUMN shop.orders.promo_code IS 'Voucher code entered (code promotions only); an influencer code on the first order of a customer acquired with it. One code per order: never combined with another promotion.';
+COMMENT ON COLUMN shop.orders.promotion_id IS 'Promotion applied to the order (code or automatic), if any; at most one per order.';
 COMMENT ON COLUMN shop.orders.source IS 'Traffic source of the order session (utm-like word, e.g. organic_search, paid_search, social, influencer, direct, subscription).';
 COMMENT ON COLUMN shop.orders.subscription_id IS 'Set for orders placed by a subscription cycle.';
 COMMENT ON COLUMN shop.orders.is_repeat_customer IS 'True if the customer had ordered before this order.';

@@ -241,7 +241,7 @@ class Payment:
 class Condition:
     """One pricing condition on a sales document item (feeds erp.konv)."""
 
-    ctype: str  # list_price | customer_discount | promo_discount | shipping | tax
+    ctype: str  # list_price | customer_discount | promo_discount | influencer_discount | shipping | tax
     rate: float  # percentage as fraction for discounts/tax, unit price for list_price
     amount: float  # signed value for the item in document currency (discounts negative)
 

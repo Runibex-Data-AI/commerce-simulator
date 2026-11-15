@@ -445,28 +445,48 @@ class MarketingCfg(_M):
     """Marketing stack: campaign calendar, spend-driven acquisition, daily exports."""
 
     response_elasticity: float = 0.7  # new customers respond to spend flights with this elasticity
+    # Paid media calibration. Measured contribution per web order is about EUR 13.1 / 9.7 / 8.9 for a
+    # customer's orders 1 / 2 / 3 (cumulative 13.1 / 22.8 / 31.7). Paid CAC lies above the first-order
+    # margin and pays back within two to three orders (search about EUR 21: order 2; social about
+    # EUR 28: order 3). Influencer is the cheapest CAC (about EUR 16 including the commission) but
+    # buys the worst lifetime value. CPM and CTR are set so that the clicks implied by spend match the
+    # configured session conversion rates (sessions = clicks x 0.80-0.92 + 15 % organic).
     paid: dict[str, PaidChannelCfg] = Field(
         default_factory=lambda: {
             "paid_search": PaidChannelCfg(
-                cac_eur=28.0, always_on_share=0.8, flights_per_quarter=1.0, cpm_eur=9.0, ctr=0.035
+                cac_eur=22.0, always_on_share=0.8, flights_per_quarter=1.0, cpm_eur=16.0, ctr=0.035
             ),
-            "social": PaidChannelCfg(cac_eur=35.0, always_on_share=0.4, flights_per_quarter=2.0, cpm_eur=5.5, ctr=0.011),
+            "social": PaidChannelCfg(
+                cac_eur=29.0, always_on_share=0.4, flights_per_quarter=2.0, cpm_eur=4.5, ctr=0.013
+            ),
             "influencer": PaidChannelCfg(
-                cac_eur=45.0, always_on_share=0.5, flights_per_quarter=1.5, cpm_eur=4.0, ctr=0.008
+                cac_eur=14.0, always_on_share=0.5, flights_per_quarter=1.5, cpm_eur=4.9, ctr=0.015
             ),
         }
     )
     conversion_rates: dict[str, float] = Field(
         default_factory=lambda: {
-            "organic_search": 0.024, "paid_search": 0.031, "social": 0.011, "influencer": 0.020,
+            "organic_search": 0.024, "paid_search": 0.031, "social": 0.018, "influencer": 0.020,
             "marketplace_spillover": 0.018, "direct": 0.035, "email": 0.042, "app": 0.050, "deal_site": 0.060,
         }
     )  # orders per session, by traffic source
     tracking_share: float = 0.92  # share of shop orders tracked by web analytics (consent)
     device_mix: dict[str, float] = Field(default_factory=lambda: {"mobile": 0.62, "desktop": 0.31, "tablet": 0.07})
-    influencer_commission_pct: float = 12.0
+    influencer_commission_pct: float = 12.0  # on attributed net revenue (after the first-order discount)
+    # A customer acquired through an influencer code gets this percentage off the goods (not shipping)
+    # of their first order, with the code as the voucher code (0 switches it off). One code per order:
+    # if any other web promotion applies to that order (regular or scenario, automatic or code), it
+    # applies instead and the influencer discount is not granted, nor carried over to a later order.
+    influencer_first_order_discount_pct: float = 15.0
     deal_site_commission_pct: float = 8.0
     newsletter_cost_eur: float = 180.0
+
+    @field_validator("influencer_first_order_discount_pct")
+    @classmethod
+    def _first_order_discount(cls, v: float) -> float:
+        if not 0.0 <= v <= 100.0:
+            raise ValueError(f"influencer_first_order_discount_pct must lie in [0, 100], got {v}")
+        return v
 
 
 class ChaosCfg(_M):
