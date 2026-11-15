@@ -383,8 +383,9 @@ rows for that period, so a consumer takes the latest load per
 ### `mkt` (marketing stack)
 
 Text keys (`PS-2026Q1-01`, `ATT-NV-10004711`), dates rather than timestamps
-for daily facts. `campaigns` and `influencer_codes` are updated as their
-status moves (planned, active, ended); `campaign_spend_daily`,
+for daily facts. `campaigns` are updated as their status moves (planned,
+active, ended); `influencer_codes` is written once per code at the history
+start and not updated afterwards; `campaign_spend_daily`,
 `sessions_daily` and `attributions` are written once per day after the day
 closes (04:00-05:00 local), like real marketing exports. Attribution is
 single-touch last click, one row per tracked web order (92 %: consent loss)

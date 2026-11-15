@@ -445,7 +445,7 @@ CREATE INDEX IF NOT EXISTS vbrp_updated_at_idx ON erp.vbrp (updated_at);
 CREATE INDEX IF NOT EXISTS vbrp_aubel_idx ON erp.vbrp (aubel, aupos);
 COMMENT ON TABLE  erp.vbrp IS 'Billing document items (SAP VBRP).';
 COMMENT ON COLUMN erp.vbrp.vgbel IS 'Reference document: the delivery (vgtyp J) for invoices, the original invoice (vgtyp M) for credit memos.';
-COMMENT ON COLUMN erp.vbrp.vgpos IS 'Reference item. Not populated in phase 1: to find the delivery item of an invoice item join erp.lips on lips.vbeln = vbrp.vgbel AND lips.vgpos = vbrp.aupos.';
+COMMENT ON COLUMN erp.vbrp.vgpos IS 'Reference item: the delivery item (erp.lips.posnr with vbrp.vgbel) for invoices, the original invoice item (erp.vbrp.posnr with vbrp.vgbel) for credit memos; NULL when there is none, such as the web shipping charge.';
 COMMENT ON COLUMN erp.vbrp.wavwr IS 'Cost (standard cost x quantity) in document currency.';
 COMMENT ON COLUMN erp.vbrp.aupos IS 'Sales document item billed; 000900 (matnr SHIPPING) is the web shipping charge, billed on the first invoice of the order.';
 
