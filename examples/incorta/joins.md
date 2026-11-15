@@ -1,11 +1,16 @@
 # Joins within each system
 
-This page lists every join between two tables of the same Postgres schema, for the business
-schemas that `bi_reader` can read: `shop`, `wms`, `erp`, `mkt` and `feeds`. `shelf` has no
-tables yet. The DDL declares no foreign keys, so each join below comes from the DDL in
-[sql/schemas](../../sql/schemas), its column comments and the writer code in
+This page lists the joins to define in Incorta between two tables of the same Postgres schema,
+for the business schemas that `bi_reader` can read: `shop`, `wms`, `erp`, `mkt` and `feeds`.
+`shelf` has no tables yet. The DDL declares no foreign keys, so each join below comes from the
+DDL in [sql/schemas](../../sql/schemas), its column comments and the writer code in
 [src/cpgsim/writers](../../src/cpgsim/writers). Joins between schemas are in
 [Join keys between systems](README.md#join-keys-between-systems) in the loading guide.
+
+The set is chosen so that **every table and alias is reached by exactly one join path** from
+any table. Where a second path would exist, either the second role gets its own alias table
+(role alias) or the derivable join is not defined. Each schema section ends with the joins that
+are deliberately not defined and why.
 
 ## How to read the tables
 
@@ -23,47 +28,55 @@ tables yet. The DDL declares no foreign keys, so each join below comes from the 
   ([SPEC](../../docs/SPEC.md#data-quality-noise)).
 - **Optional** means the From column is NULL on some rows by design. The note says on which
   rows. A row with a NULL value has no parent; it is not a broken key.
-- A join on two columns, for example `erp.lips.vgbel`, `vgpos`, is a single join that uses both
-  column pairs.
+- A join on two columns, for example `erp.lips.vgbel`, `vgpos`, is a single join with two
+  conditions.
 - Some To columns are unique but are not the table's primary key: `erp.vbak.knumv` and
   `wms.shipments.delivery_no`. Every other To column is the primary key of its table.
-- **Second roles and self-joins need alias tables.** An alias is Incorta's documented way to
-  handle two foreign keys to the same parent. Create one alias per extra role and join the child
-  to the alias: for example `erp.vbak.kunnr` to `erp.kna1` (sold-to) and `erp.vbak.zzkunwe` to
-  an alias of `erp.kna1` (ship-to). An alias inherits the joins in which the original table is
-  the child (its joins to its own parents), but not the joins in which it is the parent, so
-  define each role's join to the alias yourself. Incorta's own [alias
-  example](https://docs.incorta.com/5.1/concepts-alias) shows this: after creating the alias it
-  re-creates the join from Orders to the alias by hand, because a join in which the original
-  table is the parent is not carried over; the alias's joins as a child are. Here that means:
-  create the `erp.kna1` alias, then add the join from `erp.vbak.zzkunwe` to it yourself (and the
-  same for every other ship-to or payer column you model against the alias). The same applies to
-  the self-joins on `erp.vbrp` (credit memo item to invoice item) and `feeds.feed_loads`
-  (restatement to restated load): join the table to an alias of itself.
-- **Avoid cyclic joins.** A self-join defined on the table itself is a cycle; use the alias
-  above. Where this page lists a header join and an item join between the same pair of tables
-  (for example `erp.vbrp.aubel` to `erp.vbak` and `erp.vbrp.aubel`, `aupos` to `erp.vbap`,
-  which itself joins `erp.vbak`), define only the joins your analysis needs, so that no table
-  is reached by two join paths that form a loop.
+- **Role aliases.** An alias is Incorta's documented way to handle a second foreign key to the
+  same parent ([Alias](https://docs.incorta.com/5.1/concepts-alias)). Every alias on this page is
+  a role of a table that has no parent joins of its own (`erp.kna1`, `erp.mara`,
+  `shop.addresses`, `shop.customers`), so it inherits no joins and adds no second path. An alias
+  of a table that does have parents would inherit the original's joins as a child (pointing to
+  the same parent objects), and anything reaching both the original and the alias would reach
+  those parents twice. That is why this page defines no self-joins and no aliases of document
+  tables.
+- **One path to each object.** Where two joins would reach the same table, a query from the
+  child could take either route. The shared dimensions `erp.kna1` and `erp.mara` are reached
+  from many document tables, so each document role has its own alias (see the `erp` section).
+  Elsewhere the page keeps the join a dashboard would use from the main fact table and drops
+  the shortcut that the remaining joins already give.
 
 ## `shop`
 
+Aliases:
+
+| Alias | Of | Role |
+| --- | --- | --- |
+| `addresses_billing` | `shop.addresses` | Billing address of an order |
+| `customers_subscriber` | `shop.customers` | Customer of a subscription |
+
 | From | To | Cardinality | Notes |
 | --- | --- | --- | --- |
-| `shop.addresses.customer_id` | `shop.customers.id` | many-to-one | Complete. The writer creates one address per customer (`address_type = 'shipping'`), so in practice the relationship is one-to-one. |
-| `shop.subscriptions.customer_id` | `shop.customers.id` | many-to-one | Complete. |
 | `shop.orders.customer_id` | `shop.customers.id` | many-to-one | Complete. A duplicate customer record (noise) has its own `id`, and the person's later orders can be placed on it. Anonymised customers keep their row. |
 | `shop.orders.shipping_address_id` | `shop.addresses.id` | many-to-one | Complete. |
-| `shop.orders.billing_address_id` | `shop.addresses.id` | many-to-one | Complete. Always the same value as `shipping_address_id`, so one join to `addresses` is enough. |
+| `shop.orders.billing_address_id` | `addresses_billing.id` | many-to-one | Complete. Always the same value as `shipping_address_id` today; the alias keeps the billing role separate. |
 | `shop.orders.promotion_id` | `shop.promotions.id` | many-to-one | Optional: NULL when no promotion was applied. The parent can be soft-deleted, because a withdrawn promotion gets `is_deleted = true`. Use this column rather than `promo_code`, which is set for code promotions only. |
 | `shop.orders.subscription_id` | `shop.subscriptions.id` | many-to-one | Optional: set only on orders placed by a subscription cycle. |
+| `shop.subscriptions.customer_id` | `customers_subscriber.id` | many-to-one | Complete. Through the alias, so that a subscription keeps its customer (also one that never ordered) without a second path from `orders` to `customers`. |
 | `shop.order_lines.order_id` | `shop.orders.id` | many-to-one | Complete. `(order_id, line_no)` is unique. |
 | `shop.payments.order_id` | `shop.orders.id` | many-to-one | Complete. One row per payment attempt (`attempt_no`). |
 | `shop.refunds.order_id` | `shop.orders.id` | many-to-one | Complete. |
-| `shop.refunds.payment_id` | `shop.payments.id` | many-to-one | Optional: NULL when the refund was paid outside the original payment. |
 | `shop.promo_redemptions.order_id` | `shop.orders.id` | one-to-one | Complete. One row for each order that has `promotion_id` set. |
-| `shop.promo_redemptions.promotion_id` | `shop.promotions.id` | many-to-one | Complete. The parent can be soft-deleted (a withdrawn promotion). |
-| `shop.promo_redemptions.customer_id` | `shop.customers.id` | many-to-one | Complete. Same customer as the order. |
+
+Not defined:
+
+| Join | Why |
+| --- | --- |
+| `shop.addresses.customer_id` to `shop.customers.id` | Second path from `orders` to `customers`. The address's customer is the order's customer (checked: identical on every order). |
+| `shop.subscriptions.customer_id` to `shop.customers.id` | Replaced by the join to `customers_subscriber`: joined to `customers` itself it would be a second path from `orders`. |
+| `shop.promo_redemptions.promotion_id` to `shop.promotions.id` | Derivable: always equal to `orders.promotion_id` of the redemption's order (checked on every row). |
+| `shop.promo_redemptions.customer_id` to `shop.customers.id` | Derivable: always the order's customer (checked on every row). |
+| `shop.refunds.payment_id` to `shop.payments.id` | Second path from `refunds` to `orders`. `payment_id` is NULL when a refund was paid outside the original payment, while `order_id` is always set; the payment's order is the refund's order. |
 
 `shop` has no product table. `order_lines.sku`, `promotions.skus` and `subscriptions.skus` are
 SKU codes, not keys. Product attributes come from `erp.mara` through `ean`, across systems.
@@ -76,13 +89,38 @@ SKU codes, not keys. Product attributes come from `erp.mara` through `ean`, acro
 | `wms.carrier_events.shipment_id` | `wms.shipments.shipment_id` | many-to-one | Complete. A duplicate scan (noise) is an extra row with its own `scan_seq`; its parent still exists. |
 | `wms.returns.shipment_id` | `wms.shipments.shipment_id` | many-to-one | Complete. `returns.delivery_no` = `shipments.delivery_no` reaches the same row. |
 | `wms.return_lines.return_id` | `wms.returns.return_id` | many-to-one | Complete. `line_no` is the return's own numbering, not the shipment line number. |
-| `wms.stock_movements.return_id` | `wms.returns.return_id` | many-to-one | Optional: set on `RT` and `SC` postings that belong to a customer return (RMA). NULL on returned-to-sender parcels booked back to stock (`RT` with `delivery_no` only), on scrap postings that are not returns (write-offs of delisted items, recalls) and on all other movement codes. |
 | `wms.stock_movements.delivery_no` | `wms.shipments.delivery_no` | many-to-one | Optional: set on goods issues (`GI`) and on return postings (`RT`, and `SC` when a returned item is scrapped), where it is the original delivery. NULL on goods receipts (`GR`), adjustments (`AD`) and scrap postings that are not returns. The To column has a unique index but is not the key. |
+
+Not defined:
+
+| Join | Why |
+| --- | --- |
+| `wms.stock_movements.return_id` to `wms.returns.return_id` | Second path from `stock_movements` to `shipments`. Every movement with a `return_id` also has a `delivery_no` that reaches the same shipment, and `delivery_no` covers goods issues as well. `return_id` stays a column; return details for a movement need a lookup or a bridge. |
 
 `wms.stock_levels_daily` has no parent in `wms`, because the schema has no item or warehouse
 table. Its `item_code` joins `erp.mara` across systems.
 
 ## `erp`
+
+Aliases (one per document role of the shared dimensions, so that no table reaches `kna1` or
+`mara` twice):
+
+| Alias | Of | Role |
+| --- | --- | --- |
+| `kna1_va_soldto` | `erp.kna1` | Sold-to party of a sales document (`vbak.kunnr`) |
+| `kna1_va_shipto` | `erp.kna1` | Ship-to party of a sales document (`vbak.zzkunwe`) |
+| `kna1_vl_soldto` | `erp.kna1` | Sold-to party of a delivery (`likp.kunag`) |
+| `kna1_vl_shipto` | `erp.kna1` | Ship-to party of a delivery (`likp.kunnr`) |
+| `kna1_vf_soldto` | `erp.kna1` | Sold-to party of a billing document (`vbrk.kunag`) |
+| `kna1_vf_payer` | `erp.kna1` | Payer of a billing document (`vbrk.kunrg`) |
+| `kna1_kona` | `erp.kna1` | Retailer of a promotion agreement (`kona.kunnr`) |
+| `mara_vl` | `erp.mara` | Material of a delivery item (`lips.matnr`) |
+| `mara_vf` | `erp.mara` | Material of a billing item (`vbrp.matnr`) |
+
+`erp.kna1` itself serves `knmt.kunnr` and `zdeduct.kunnr`; `erp.mara` itself serves `makt`,
+`mbew`, `knmt`, `vbap`, `zkona_item` and `zdeduct_item`. Each alias is needed: `zdeduct` reaches
+`kna1` directly and through `kona`, `likp` and `vbak`, and `zdeduct_clr` also through `vbrk`;
+`lips` and `vbrp` reach `mara` directly and through `vbap`.
 
 | From | To | Cardinality | Notes |
 | --- | --- | --- | --- |
@@ -90,40 +128,44 @@ table. Its `item_code` joins `erp.mara` across systems.
 | `erp.mbew.matnr` | `erp.mara.matnr` | one-to-one | One row per material (`bwkey` `1000`). The service material `SHIPPING` has no `mbew` row, so a cost lookup for it finds nothing. |
 | `erp.knmt.matnr` | `erp.mara.matnr` | many-to-one | Complete. |
 | `erp.knmt.kunnr` | `erp.kna1.kunnr` | many-to-one | Complete. The retailer's sold-to account. Not every retailer article has a `knmt` row (about 95 % do); see [Retailer article numbers](#retailer-article-numbers). |
-| `erp.vbak.kunnr` | `erp.kna1.kunnr` | many-to-one | Complete. Sold-to party: the retailer's sold-to account, or the country's collective web customer. |
-| `erp.vbak.zzkunwe` | `erp.kna1.kunnr` | many-to-one | Complete. Ship-to party: a retailer distribution centre, or the collective web customer. A second role of `kna1`. |
+| `erp.vbak.kunnr` | `kna1_va_soldto.kunnr` | many-to-one | Complete. Sold-to party: the retailer's sold-to account, or the country's collective web customer. |
+| `erp.vbak.zzkunwe` | `kna1_va_shipto.kunnr` | many-to-one | Complete. Ship-to party: a retailer distribution centre, or the collective web customer. |
 | `erp.vbap.vbeln` | `erp.vbak.vbeln` | many-to-one | Complete. |
 | `erp.vbap.matnr` | `erp.mara.matnr` | many-to-one | Complete, including the freight item `000900` (`matnr = 'SHIPPING'`). |
 | `erp.konv.knumv` | `erp.vbak.knumv` | many-to-one | Complete. `knumv` is unique on `vbak` but is not its key. Only sales documents have pricing conditions; billing documents have none. |
-| `erp.konv.knumv`, `kposn` | `erp.vbap.vbeln`, `posnr` (through `erp.vbak`) | many-to-one | Complete. `konv` has no `vbeln` column. Resolve `knumv` to `vbak.vbeln`, then match `kposn` = `vbap.posnr`. Each item has several rows, one per condition. `vbeln` has to come from `erp.vbak`: join `konv` to `vbak` on `knumv` and reach `vbap` through the header, or add `vbeln` to both `konv` queries with a SQL join to `erp.vbak` on `knumv`. |
-| `erp.likp.kunnr` | `erp.kna1.kunnr` | many-to-one | Complete. Ship-to party. |
-| `erp.likp.kunag` | `erp.kna1.kunnr` | many-to-one | Complete. Sold-to party. |
+| `erp.likp.kunag` | `kna1_vl_soldto.kunnr` | many-to-one | Complete. Sold-to party. |
+| `erp.likp.kunnr` | `kna1_vl_shipto.kunnr` | many-to-one | Complete. Ship-to party. |
 | `erp.lips.vbeln` | `erp.likp.vbeln` | many-to-one | Complete. A cancelled delivery is soft-deleted on the header and on its items in the same commit. |
-| `erp.lips.vgbel` | `erp.vbak.vbeln` | many-to-one | Complete. Delivery item to sales document header. |
-| `erp.lips.vgbel`, `vgpos` | `erp.vbap.vbeln`, `posnr` | many-to-one | Complete. A sales item has several delivery items when it is delivered in parts. Items of cancelled deliveries still point to their sales item, so filter on `likp.is_deleted`. |
-| `erp.lips.matnr` | `erp.mara.matnr` | many-to-one | Complete. |
-| `erp.vbrk.kunrg` | `erp.kna1.kunnr` | many-to-one | Complete. Payer. |
-| `erp.vbrk.kunag` | `erp.kna1.kunnr` | many-to-one | Complete. Sold-to party. |
+| `erp.lips.vgbel`, `vgpos` | `erp.vbap.vbeln`, `posnr` | many-to-one | Complete. A sales item has several delivery items when it is delivered in parts. Items of cancelled deliveries still point to their sales item, so filter on `likp.is_deleted`. The sales header is reached through `vbap`. |
+| `erp.lips.matnr` | `mara_vl.matnr` | many-to-one | Complete. |
+| `erp.vbrk.kunag` | `kna1_vf_soldto.kunnr` | many-to-one | Complete. Sold-to party. |
+| `erp.vbrk.kunrg` | `kna1_vf_payer.kunnr` | many-to-one | Complete. Payer. |
 | `erp.vbrp.vbeln` | `erp.vbrk.vbeln` | many-to-one | Complete. |
-| `erp.vbrp.aubel` | `erp.vbak.vbeln` | many-to-one | Complete for invoices and credit memos. Billing item to sales document header. |
-| `erp.vbrp.aubel`, `aupos` | `erp.vbap.vbeln`, `posnr` | many-to-one | Complete for invoices and credit memos. `aupos = '000900'` is the web shipping charge. |
-| `erp.vbrp.vgbel` | `erp.likp.vbeln` | many-to-one | Invoice items only (`vgtyp = 'J'`). NULL on invoice items billed without a delivery. The number ranges do not overlap (deliveries `0080...`, billing documents `0090...`), so a plain join matches only delivery references. |
-| `erp.vbrp.vgbel`, `vgpos` | `erp.lips.vbeln`, `posnr` | many-to-one | Invoice item to delivery item. `vgpos` is NULL on items without a delivery line, such as the shipping charge `000900`. Alternative for invoices: `vbrp.vgbel`, `aupos` to `lips.vbeln`, `vgpos`. |
-| `erp.vbrp.vgbel` | `erp.vbrk.vbeln` | many-to-one | Credit memo items only (`vgtyp = 'M'`): points to the original invoice. |
-| `erp.vbrp.vgbel`, `vgpos` | `erp.vbrp.vbeln`, `posnr` | many-to-one | Credit memo item to the original invoice item (a self-join). Credit memos only. |
-| `erp.vbrp.matnr` | `erp.mara.matnr` | many-to-one | Complete. |
-| `erp.kona.kunnr` | `erp.kna1.kunnr` | many-to-one | Complete. The retailer's sold-to account. |
+| `erp.vbrp.aubel`, `aupos` | `erp.vbap.vbeln`, `posnr` | many-to-one | Complete for invoices and credit memos: the sales document and item billed. `aupos = '000900'` is the web shipping charge. The sales header is reached through `vbap`. |
+| `erp.vbrp.vgbel` | `erp.likp.vbeln` | many-to-one | Invoice items only (`vgtyp = 'J'`), header only. NULL on invoice items billed without a delivery. The number ranges do not overlap (deliveries `0080...`, billing documents `0090...`), so the join matches only delivery references; on credit memo items `vgbel` is a billing document and finds no delivery. |
+| `erp.vbrp.matnr` | `mara_vf.matnr` | many-to-one | Complete. |
+| `erp.kona.kunnr` | `kna1_kona.kunnr` | many-to-one | Complete. The retailer's sold-to account. |
 | `erp.zkona_item.knuma` | `erp.kona.knuma` | many-to-one | Complete. |
 | `erp.zkona_item.matnr` | `erp.mara.matnr` | many-to-one | Complete. |
 | `erp.zdeduct.kunnr` | `erp.kna1.kunnr` | many-to-one | Complete. Payer: the retailer's sold-to account. |
 | `erp.zdeduct.knuma` | `erp.kona.knuma` | many-to-one | Optional: set on `ZP01` and `ZX99`, and on per-promotion `ZW01` for retailers that have promotion agreements. NULL otherwise. When set, the agreement always exists. |
 | `erp.zdeduct.vbeln_vl` | `erp.likp.vbeln` | many-to-one | Optional: shortage claims (`ZS01`) only. |
 | `erp.zdeduct.vbeln_va` | `erp.vbak.vbeln` | many-to-one | Optional: service penalties (`ZL01`) only. |
-| `erp.zdeduct.vbeln_vf` | `erp.vbrk.vbeln` | many-to-one | Optional: co-op (`ZK01`) and invoice-based advertising (`ZW01`) only. |
 | `erp.zdeduct_item.belnr` | `erp.zdeduct.belnr` | many-to-one | Complete. Only `ZP01`, `ZX99` and `ZS01` claims have items. |
 | `erp.zdeduct_item.matnr` | `erp.mara.matnr` | many-to-one | Optional: NULL when the retailer article has no `knmt` row. |
 | `erp.zdeduct_clr.belnr` | `erp.zdeduct.belnr` | many-to-one | Complete. |
-| `erp.zdeduct_clr.vbeln_vf` | `erp.vbrk.vbeln` | many-to-one | Optional: set on short payments (`zzkind = 'T'`), NULL on repayments (`P`). |
+| `erp.zdeduct_clr.vbeln_vf` | `erp.vbrk.vbeln` | many-to-one | Optional: the invoice short-paid, set on short payments (`zzkind = 'T'`), NULL on repayments (`P`). |
+
+Not defined:
+
+| Join | Why |
+| --- | --- |
+| `erp.lips.vgbel` to `erp.vbak.vbeln` | Second path from `lips` to `vbak`; reached through `vbap`. |
+| `erp.vbrp.aubel` to `erp.vbak.vbeln` | Second path from `vbrp` to `vbak`; reached through `vbap`. |
+| `erp.vbrp.vgbel`, `vgpos` to `erp.lips.vbeln`, `posnr` | Second path from `vbrp` to `vbap` (`lips` joins `vbap`). An alias of `lips` would not help: it would inherit the join to `vbap`. It also misses the freight item and credit memos. For invoice-to-delivery-item analysis, add a bridge (an Incorta SQL table or materialized view). |
+| `erp.vbrp.vgbel` to `erp.vbrk.vbeln` (credit memo to original invoice) and `erp.vbrp.vgbel`, `vgpos` to `erp.vbrp.vbeln`, `posnr` (credit memo item to original invoice item) | Both need an alias of a document table (`vbrk`, `vbrp`) that has parent joins of its own; the alias inherits them, so `vbrp` would reach `vbrk`, `vbap`, `likp` and their `kna1` and `mara` roles twice. Add a bridge (an Incorta SQL table or materialized view) if credit memos must be linked to their invoices. |
+| `erp.konv.knumv`, `kposn` to `erp.vbap.vbeln`, `posnr` | `konv` has no `vbeln` column, so there is no column pair to join on. Resolve `knumv` to `vbak.vbeln` through the `konv` to `vbak` join, or add `vbeln` to both `konv` queries with a SQL join to `erp.vbak` on `knumv`. |
+| `erp.zdeduct.vbeln_vf` to `erp.vbrk.vbeln` | Second path from `zdeduct_clr` to `vbrk` and its `kna1` roles. The clearing entry's invoice is kept, because 273 of 1,041 short payments reference an invoice their deduction does not (types `ZL01`, `ZP01`, `ZS01`, `ZX99`, `ZP05` and some `ZW01`). `zdeduct.vbeln_vf` (co-op `ZK01` and invoice-based advertising `ZW01`) stays a column. |
 
 **Exchange rates.** `erp.tcurr` is a lookup by currency and month, not a key join. Match
 `fcurr` = `waerk`, `tcurr` = `'EUR'` and `gdatu` = the first day of the month as `YYYYMMDD`. Only
@@ -158,7 +200,12 @@ through the sender's sold-to account and is listed in
 | `mkt.campaigns.influencer_code` | `mkt.influencer_codes.code` | many-to-one | Optional: set on influencer campaigns only. Complete when set. |
 | `mkt.campaign_spend_daily.campaign_id` | `mkt.campaigns.campaign_id` | many-to-one | Complete. One row per campaign and day. |
 | `mkt.attributions.campaign_id` | `mkt.campaigns.campaign_id` | many-to-one | Optional: NULL for organic, direct, app and marketplace spillover traffic, and when no campaign of the order's channel was running. |
-| `mkt.attributions.influencer_code` | `mkt.influencer_codes.code` | many-to-one | Optional: set on influencer-sourced orders only. Complete when set. |
+
+Not defined:
+
+| Join | Why |
+| --- | --- |
+| `mkt.attributions.influencer_code` to `mkt.influencer_codes.code` | Derivable: `attributions.influencer_code` is set only together with a campaign and always equals that campaign's `influencer_code` (checked on every row), so the code is reached through `campaigns`. |
 
 `mkt.sessions_daily` has no key to the other `mkt` tables. Compare it with them only as
 aggregates by date and channel. In the same way, `campaign_spend_daily.platform_conversions`
@@ -172,7 +219,12 @@ compares with a count of `attributions` rows by `campaign_id` and `spend_date` =
 | `feeds.retailer_sellout.load_id` | `feeds.feed_loads.load_id` | many-to-one | Complete. A load and its rows are written together. |
 | `feeds.marketplace_sales_daily.load_id` | `feeds.feed_loads.load_id` | many-to-one | Complete. |
 | `feeds.marketplace_inventory_daily.load_id` | `feeds.feed_loads.load_id` | many-to-one | Complete. |
-| `feeds.feed_loads.restates_load_id` | `feeds.feed_loads.load_id` | many-to-one | Optional: set on restatements only (a self-join). |
+
+Not defined:
+
+| Join | Why |
+| --- | --- |
+| `feeds.feed_loads.restates_load_id` to `feeds.feed_loads.load_id` (restatement to restated load) | A self-join needs an alias of `feed_loads`, and the alias would inherit the self-join (a join from the alias onto itself). Add a bridge (an Incorta SQL table or materialized view) if restatements must be linked to the load they replace; for reading the latest load per period no join is needed (below). |
 
 Every `feeds` table is insert-only, and a restated period arrives as a new load. Before
 aggregating, keep the latest load per period on `feed_loads` (latest `delivered_at`, then
