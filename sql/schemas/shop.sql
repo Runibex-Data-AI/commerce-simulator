@@ -33,7 +33,7 @@ CREATE INDEX IF NOT EXISTS customers_email_idx ON shop.customers (email);
 
 COMMENT ON TABLE shop.customers IS 'Registered web shop customers. A GDPR erasure anonymises personal data in place (status anonymised); the row and its orders are kept.';
 COMMENT ON COLUMN shop.customers.signup_source IS 'Acquisition channel at registration: organic_search, paid_search, social, influencer, marketplace_spillover, direct, or deal_site (deal-site shoppers during a promo_margin_trap promotion).';
-COMMENT ON COLUMN shop.customers.influencer_code IS 'Influencer code used at sign-up, if any.';
+COMMENT ON COLUMN shop.customers.influencer_code IS 'Influencer code used at sign-up, if any (signup_source = influencer). The customer stays attributed to it for good: derive influencer customers from this column (or mkt.attributions.influencer_code), not from shop.orders.promo_code, which is NULL or another promotion''s code when another promotion took the first order.';
 COMMENT ON COLUMN shop.customers.status IS 'active or anonymised (personal data erased on request).';
 COMMENT ON COLUMN shop.customers.anonymised_at IS 'When personal data was erased; NULL for active customers.';
 
@@ -81,7 +81,7 @@ CREATE TABLE IF NOT EXISTS shop.promotions (
 CREATE INDEX IF NOT EXISTS promotions_updated_at_idx ON shop.promotions (updated_at);
 CREATE INDEX IF NOT EXISTS promotions_code_idx ON shop.promotions (code);
 
-COMMENT ON TABLE shop.promotions IS 'Web shop promotions (retailer promotions are not in this system). Created when announced, before starts_at. Also one code promotion per influencer code: its first-order discount (code = the influencer code, valid for a customer''s first order only, open ended).';
+COMMENT ON TABLE shop.promotions IS 'Web shop promotions (retailer promotions are not in this system). Created when announced, before starts_at. Also one code promotion per influencer code: its first-order discount (code = the influencer code, valid for a customer''s first order only, open ended). "First order" is the person''s first order: the code is not granted again on the first order of a duplicate account of the same person. Never combined with another promotion: when one applies to that first order it applies alone and the code''s discount is dropped, not carried over.';
 COMMENT ON COLUMN shop.promotions.promo_type IS 'code (customer enters a voucher code) or automatic (applied to qualifying baskets).';
 COMMENT ON COLUMN shop.promotions.code IS 'Voucher code for promo_type = code; NULL for automatic promotions.';
 COMMENT ON COLUMN shop.promotions.discount_pct IS 'Discount on qualifying items as a fraction, e.g. 0.2500 = 25 % off.';
@@ -168,10 +168,10 @@ COMMENT ON COLUMN shop.orders.order_number IS 'Human-facing order number shown t
 COMMENT ON COLUMN shop.orders.status IS 'created, payment_failed, authorised, released, cancelled, partially_shipped, shipped, delivered, delivery_exception, returned_to_sender, lost, return_requested, returned, return_rejected, partially_refunded or refunded. return_rejected: the returned goods failed inspection, nothing is refunded and the goods go back to the customer.';
 COMMENT ON COLUMN shop.orders.items_subtotal IS 'Sum of quantity x unit_price over all lines, gross, before discounts.';
 COMMENT ON COLUMN shop.orders.discount_total IS 'Sum of line discounts (gross).';
-COMMENT ON COLUMN shop.orders.shipping_fee IS 'Shipping fee charged, gross; 0 above the free-shipping threshold or with a free-shipping promotion.';
+COMMENT ON COLUMN shop.orders.shipping_fee IS 'Shipping fee charged, gross; 0 above the free-shipping threshold or with a free-shipping promotion. The threshold applies to the goods after discount, except for an influencer code''s first-order discount, where it applies to the goods before it (the code never adds a fee).';
 COMMENT ON COLUMN shop.orders.tax_total IS 'VAT contained in total_amount: line taxes plus VAT on the shipping fee at the order''s standard rate.';
 COMMENT ON COLUMN shop.orders.total_amount IS 'Amount charged to the customer: items_subtotal - discount_total + shipping_fee (gross).';
-COMMENT ON COLUMN shop.orders.promo_code IS 'Voucher code entered (code promotions only); an influencer code on the first order of a customer acquired with it. One code per order: never combined with another promotion.';
+COMMENT ON COLUMN shop.orders.promo_code IS 'Voucher code entered (code promotions only); an influencer code on the first order of a customer acquired with it, unless another promotion took that order. One code per order: never combined with another promotion, so an influencer customer''s first order may carry NULL (automatic promotion) or another promotion''s code here. Not an attribution field: the customer stays attributed to its code via shop.customers.influencer_code and mkt.attributions.influencer_code.';
 COMMENT ON COLUMN shop.orders.promotion_id IS 'Promotion applied to the order (code or automatic), if any; at most one per order.';
 COMMENT ON COLUMN shop.orders.source IS 'Traffic source of the order session (utm-like word, e.g. organic_search, paid_search, social, influencer, direct, subscription).';
 COMMENT ON COLUMN shop.orders.subscription_id IS 'Set for orders placed by a subscription cycle.';

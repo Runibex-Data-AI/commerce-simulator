@@ -385,7 +385,7 @@ def influencer_promotion(world, code: str | None) -> Promotion | None:
     """
     cfg = world.cfg
     pct = float(cfg.marketing.influencer_first_order_discount_pct)
-    if not code or pct <= 0:
+    if not code or round(pct / 100.0, 4) <= 0:  # a rate that rounds to 0 could never be redeemed: off
         return None
     st = _state(world)
     if code in st.first_order:

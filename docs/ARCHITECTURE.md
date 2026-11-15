@@ -282,7 +282,11 @@ UTC, statuses as lower-case words (the neutral vocabulary), money as
   carried over to a later order (it is a first-order offer). So every planted
   scenario's redeemed orders and truth stay as they were. "First order" is the
   person's first order (`Customer.orders == 0`): a chaos duplicate account's
-  first order does not get it. No rng draw is involved. The customer stays
+  first order does not get it, although the shop sees a new account with the
+  code (`is_repeat_customer` false). The free-shipping threshold is tested on
+  the goods before the code's discount (after it for every other promotion), so
+  the code never adds a shipping fee to a basket that ships free at list
+  prices. No rng draw is involved. The customer stays
   attributed to the code either way (`signup_source = 'influencer'`,
   `influencer_code` unchanged), even when `promo_code` / `promotion_id` carry
   the other promotion.

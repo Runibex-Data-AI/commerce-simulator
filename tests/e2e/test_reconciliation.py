@@ -115,7 +115,17 @@ def test_influencer_first_order_discount_one_code_per_order(run):
         r[1] == r[2] == r[4] == r[8] and not r[3] and r[5] == Decimal("0.1500")
         and r[6] == r[7] == r[9] > 0 and r[10] <= Decimal("0.01"))]
     assert not bad, bad[:5]
-    # an influencer customer's first order without any promotion would have been granted the discount
+    # the code never costs the free shipping: the threshold applies to the goods before its discount
+    web = small_cfg(**CHAOS_OFF).channels.web
+    fee_added = run.execute("""
+        SELECT count(*) FROM shop.orders o JOIN shop.promotions p ON p.id = o.promotion_id
+        WHERE p.code IN (SELECT code FROM mkt.influencer_codes) AND o.shipping_fee > 0
+          AND o.items_subtotal >= CASE o.currency WHEN 'CHF' THEN %s ELSE %s END
+    """, (web.free_shipping_chf, web.free_shipping_eur)).fetchone()[0]
+    assert fee_added == 0
+    # an influencer customer's first order without any promotion would have been granted the discount.
+    # Holds with chaos off only: a duplicate account of an influencer customer keeps the code on its shop
+    # record, but its first order is the person's repeat order and never gets the discount.
     missing = run.execute("""
         SELECT count(*) FROM shop.orders o JOIN shop.customers c ON c.id = o.customer_id
         WHERE c.influencer_code IS NOT NULL AND NOT o.is_repeat_customer AND o.promotion_id IS NULL

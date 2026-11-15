@@ -850,6 +850,42 @@ def test_influencer_discount_only_on_the_first_order(monkeypatch):
     assert o2.promo_id is None and o2.lines[0].discount == 0.0 and h.of(WebOrderPlaced)[1].promotion is None
 
 
+def _basket_between(h, low, high, currency):
+    """A one-SKU basket whose list value lies in [low, high)."""
+    for sku in h.world.ref.catalogue.active(h.world.local_date()):
+        price = web.unit_price(sku, currency)
+        for q in range(1, 8):
+            if low <= round(price * q, 2) < high:
+                return [(sku.sku_id, q)], round(price * q, 2)
+    raise AssertionError("no basket")
+
+
+def test_influencer_discount_never_costs_the_free_shipping(monkeypatch):
+    """A basket that ships free at list prices still ships free after the code's 15 % (threshold before discount)."""
+    from cpgsim.domain import marketing
+
+    h = Harness(monkeypatch, **_happy_cfg())
+    w = h.cfg.channels.web
+    for country, threshold in (("DE", w.free_shipping_eur), ("CH", w.free_shipping_chf)):
+        currency = web.currency_of(country)
+        lines, listed = _basket_between(h, threshold, round(threshold / 0.85, 2) - 0.01, currency)
+        c = h.customer(country=country, acquisition="influencer")
+        o = web.place_order(h.world, c, lines, source="influencer")
+        assert marketing.is_influencer_promo(o.promo_id) and o.lines[0].discount_pct == 0.15
+        assert o.goods_gross < threshold <= listed  # below the threshold after the discount ...
+        assert o.shipping_fee == 0.0 and o.total == o.goods_gross < listed  # ... yet free shipping
+    # a calendar promotion keeps testing the threshold on the goods after its discount (unchanged)
+    lines, _ = _basket_between(h, w.free_shipping_eur, round(w.free_shipping_eur / 0.85, 2) - 0.01, "EUR")
+    promo = Promotion(
+        promo_id=20250302, channel="web", name="Everything 15% off", kind="code", code="ALL15-2503",
+        discount_pct=0.15, free_shipping=False, sku_ids=[], brand=None, start=START,
+        end=START + timedelta(days=7), announced_at=START,
+    )
+    h.s.promo_fn = _basket_promo(promo)
+    o = web.place_order(h.world, h.customer(country="DE", acquisition="direct"), lines, source="direct")
+    assert o.promo_id == promo.promo_id and o.shipping_fee == w.shipping_fee_eur
+
+
 def test_influencer_discount_not_combined_with_the_margin_trap_promotion(monkeypatch):
     """One code per order: a qualifying promo_margin_trap basket keeps the trap promotion only."""
     from cpgsim.domain import marketing

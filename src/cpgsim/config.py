@@ -477,6 +477,9 @@ class MarketingCfg(_M):
     # of their first order, with the code as the voucher code (0 switches it off). One code per order:
     # if any other web promotion applies to that order (regular or scenario, automatic or code), it
     # applies instead and the influencer discount is not granted, nor carried over to a later order.
+    # "First order" is the person's first order (a chaos duplicate account's first order does not get
+    # it). The free-shipping threshold is tested on the goods before this discount, so the code never
+    # adds a shipping fee. The customer stays attributed to the code even when another promotion wins.
     influencer_first_order_discount_pct: float = 15.0
     deal_site_commission_pct: float = 8.0
     newsletter_cost_eur: float = 180.0
@@ -486,6 +489,8 @@ class MarketingCfg(_M):
     def _first_order_discount(cls, v: float) -> float:
         if not 0.0 <= v <= 100.0:
             raise ValueError(f"influencer_first_order_discount_pct must lie in [0, 100], got {v}")
+        if 0.0 < v < 0.01:  # shop.promotions.discount_pct holds 4 decimals of the fraction: 0.01 % is the least
+            raise ValueError(f"influencer_first_order_discount_pct must be 0 (off) or at least 0.01, got {v}")
         return v
 
 

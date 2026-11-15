@@ -376,11 +376,14 @@ def _scenario_window_id(world, promo) -> str | None:
     return wid
 
 
-def _price_lines(world, merged: dict[int, int], currency: str, vat: float, promo):
+def _price_lines(world, merged: dict[int, int], currency: str, vat: float, promo, threshold_on_list: bool = False):
     """Order lines, goods total, shipping charged and waived, and the promotion that took effect (or None).
 
     ``promo`` discounts its eligible lines and may waive the shipping fee; it
-    takes effect when it discounts a line or waives a fee.
+    takes effect when it discounts a line or waives a fee. The free-shipping
+    threshold applies to the goods after discount, or before it with
+    ``threshold_on_list`` (the influencer first-order code: 15 % off the goods
+    must never add a shipping fee to a basket that ships free at list prices).
     """
     w = world.cfg.channels.web
     cat = world.ref.catalogue
@@ -399,7 +402,8 @@ def _price_lines(world, merged: dict[int, int], currency: str, vat: float, promo
     goods = round(sum(ln.gross for ln in olines), 2)
     threshold = w.free_shipping_chf if currency == "CHF" else w.free_shipping_eur
     fee = w.shipping_fee_chf if currency == "CHF" else w.shipping_fee_eur
-    nominal_fee = round(fee, 2) if goods < threshold else 0.0
+    basis = round(sum(ln.unit_price * ln.qty for ln in olines), 2) if threshold_on_list else goods
+    nominal_fee = round(fee, 2) if basis < threshold else 0.0
     shipping, waived = nominal_fee, 0.0
     if promo is not None and promo.free_shipping and nominal_fee > 0:
         shipping, waived = 0.0, nominal_fee
@@ -421,7 +425,10 @@ def place_order(
     One promotion per order: the first order of a customer acquired with an
     influencer code gets the code's first-order discount
     (``marketing.influencer_promotion``) only when no other promotion takes
-    effect on it; the offer is not carried over to a later order.
+    effect on it; the offer is not carried over to a later order. "First
+    order" is the person's (``Customer.orders == 0``), so a chaos duplicate
+    account's first order does not get it. The code's discount never costs
+    the free shipping: the threshold is tested on the goods before it.
     """
     cfg = world.cfg
     w = cfg.channels.web
@@ -447,7 +454,7 @@ def place_order(
         # (no rng draw, so every other stream and every planted scenario stays as it was).
         first = marketing.influencer_promotion(world, c.influencer_code)
         if first is not None:
-            priced = _price_lines(world, merged, currency, vat, first)
+            priced = _price_lines(world, merged, currency, vat, first, threshold_on_list=True)
             if priced[4] is not None:
                 olines, goods, shipping, waived, applied = priced
     discount_total = round(sum(ln.discount for ln in olines), 2)
