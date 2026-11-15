@@ -9,8 +9,12 @@ tables yet. The DDL declares no foreign keys, so each join below comes from the 
 
 ## How to read the tables
 
-- **From** is the child (many) side and **To** is the parent (one) side. **Not confirmed:**
-  that an Incorta join is defined from the child table to the parent table, as listed here.
+- **From** is the child (many) side and **To** is the parent (one) side. Define each join in
+  Incorta in this direction: the child is the left table and the parent the right table.
+  Incorta runs a join as a left outer join, so child rows without a parent are kept with empty
+  parent columns. If a child row matches several parent rows, Incorta uses one of them, so the
+  To columns must be unique. All To columns on this page are unique (see the bullet on unique To
+  columns below).
 - **Complete** means every non-NULL From value finds a row in To. This holds only if
   soft-deleted rows are loaded as well, as the loading guide does (see **Soft-deleted and
   cancelled rows** under
@@ -23,12 +27,19 @@ tables yet. The DDL declares no foreign keys, so each join below comes from the 
   column pairs.
 - Some To columns are unique but are not the table's primary key: `erp.vbak.knumv` and
   `wms.shipments.delivery_no`. Every other To column is the primary key of its table.
-- **Not confirmed:** whether Incorta accepts more than one join between the same two tables, or
-  a join from a table to itself, and whether an alias table for the second role is the way to
-  model them. Both occur below: `erp.kna1` in several roles, the self-joins on `erp.vbrp` and
-  `feeds.feed_loads`, and `vbrp.vgbel` pointing at both `likp` and `vbrk`. Check this on your
-  cluster. These points are also in the Not confirmed list under
-  [Version notes](README.md#version-notes).
+- **Second roles and self-joins need alias tables.** An alias is Incorta's documented way to
+  handle two foreign keys to the same parent. Create one alias per extra role and join the
+  child to the alias: for example `erp.vbak.kunnr` to `erp.kna1` (sold-to) and
+  `erp.vbak.zzkunwe` to an alias of `erp.kna1` (ship-to). An alias inherits the joins in which
+  the original table is the child (its joins to its own parents), but not the joins in which
+  it is the parent, so define each role's join to the alias yourself. The same applies to the
+  self-joins on `erp.vbrp` (credit memo item to invoice item) and `feeds.feed_loads`
+  (restatement to restated load): join the table to an alias of itself.
+- **Avoid cyclic joins.** A self-join defined on the table itself is a cycle; use the alias
+  above. Where this page lists a header join and an item join between the same pair of tables
+  (for example `erp.vbrp.aubel` to `erp.vbak` and `erp.vbrp.aubel`, `aupos` to `erp.vbap`,
+  which itself joins `erp.vbak`), define only the joins your analysis needs, so that no table
+  is reached by two join paths that form a loop.
 
 ## `shop`
 
@@ -92,7 +103,7 @@ table. Its `item_code` joins `erp.mara` across systems.
 | `erp.vbrp.aubel` | `erp.vbak.vbeln` | many-to-one | Complete for invoices and credit memos. Billing item to sales document header. |
 | `erp.vbrp.aubel`, `aupos` | `erp.vbap.vbeln`, `posnr` | many-to-one | Complete for invoices and credit memos. `aupos = '000900'` is the web shipping charge. |
 | `erp.vbrp.vgbel` | `erp.likp.vbeln` | many-to-one | Invoice items only (`vgtyp = 'J'`). NULL on invoice items billed without a delivery. The number ranges do not overlap (deliveries `0080...`, billing documents `0090...`), so a plain join matches only delivery references. |
-| `erp.vbrp.vgbel`, `vgpos` | `erp.lips.vbeln`, `posnr` | many-to-one | Invoice item to delivery item. `vgpos` is NULL on items without a delivery line, such as the shipping charge `000900`. The column comment in the DDL still says `vgpos` is not populated; the writer fills it, so check `SELECT count(*) FROM erp.vbrp WHERE vgpos IS NOT NULL` before modelling it. Alternative for invoices: `vbrp.vgbel`, `aupos` to `lips.vbeln`, `vgpos`. |
+| `erp.vbrp.vgbel`, `vgpos` | `erp.lips.vbeln`, `posnr` | many-to-one | Invoice item to delivery item. `vgpos` is NULL on items without a delivery line, such as the shipping charge `000900`. Alternative for invoices: `vbrp.vgbel`, `aupos` to `lips.vbeln`, `vgpos`. |
 | `erp.vbrp.vgbel` | `erp.vbrk.vbeln` | many-to-one | Credit memo items only (`vgtyp = 'M'`): points to the original invoice. |
 | `erp.vbrp.vgbel`, `vgpos` | `erp.vbrp.vbeln`, `posnr` | many-to-one | Credit memo item to the original invoice item (a self-join). Credit memos only. |
 | `erp.vbrp.matnr` | `erp.mara.matnr` | many-to-one | Complete. |

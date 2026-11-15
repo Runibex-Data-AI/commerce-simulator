@@ -1506,8 +1506,8 @@ with cardinality and the rows where a key is NULL by design, is listed in
 | `wms.stock_movements.delivery_no`, `return_id` | `erp.likp.vbeln`, `wms.returns.return_id` | `delivery_no` on goods issues (`GI`) and on return postings (`RT`, and `SC` for scrapped returns), where it is the original delivery; `return_id` on `RT` and `SC` postings of a customer return (RMA), NULL on returned-to-sender parcels. See [joins.md](joins.md#wms) |
 | `erp.vbrp.aubel`, `aupos` | `erp.vbap.vbeln`, `posnr` | Billing item to sales item; `000900` is the web shipping charge |
 | `erp.vbrp.vgbel` | `erp.likp.vbeln` (`vgtyp = 'J'`) or the original invoice `erp.vbrk.vbeln` (`vgtyp = 'M'`) | Invoices reference the delivery, credit memos the invoice |
-| `erp.vbrp.vgbel`, `vgpos` | `erp.lips.vbeln`, `posnr` (`vgtyp = 'J'`) or `erp.vbrp.vbeln`, `posnr` of the original invoice (`vgtyp = 'M'`) | Billing item to delivery item, or credit memo item to invoice item. `vgpos` is NULL on items without a delivery line, such as the shipping charge `000900`. Alternative for invoices: `vbrp.vgbel`, `aupos` to `lips.vbeln`, `vgpos`. Taken from the writer code; check `SELECT count(*) FROM erp.vbrp WHERE vgpos IS NOT NULL` on a backfilled database before modelling it. |
-| `wms.*.item_code` | `erp.mara.matnr` | `matnr = lpad(item_code, 18, '0')` |
+| `erp.vbrp.vgbel`, `vgpos` | `erp.lips.vbeln`, `posnr` (`vgtyp = 'J'`) or `erp.vbrp.vbeln`, `posnr` of the original invoice (`vgtyp = 'M'`) | Billing item to delivery item, or credit memo item to invoice item. `vgpos` is NULL on items without a delivery line, such as the shipping charge `000900`. Alternative for invoices: `vbrp.vgbel`, `aupos` to `lips.vbeln`, `vgpos`. |
+| `wms.*.item_code` | `erp.mara.matnr` | `matnr = lpad(item_code, 18, '0')`: a formula column on the WMS (child) side joins plain `matnr`, see below |
 | `shop.order_lines.ean`, `wms.*.ean` | `erp.mara.ean11` | |
 | `erp.vbak.kunnr`, `zzkunwe`; `erp.likp.kunnr`; `erp.vbrk.kunrg`; `erp.kona.kunnr`; `erp.zdeduct.kunnr`; `wms.shipments.consignee_no` | `erp.kna1.kunnr` | Web customers are one collective account per country. `kona` and `zdeduct` hold the retailer's sold-to account. |
 | `erp.zkona_item.knuma`; `erp.zdeduct.knuma` | `erp.kona.knuma` | Agreement items to header; on `zdeduct`, set for promotion (`ZP01`), unexplained (`ZX99`) and per-promotion advertising (`ZW01`) claims |
@@ -1522,11 +1522,19 @@ with cardinality and the rows where a key is NULL by design, is listed in
 | `feeds.feed_loads.source`, `feeds.retailer_sellout.retailer` | `erp.kna1.sortl` (with `kna1.ktokd = 'Z001'`) | The sender's sold-to account: `sortl` is `KRANZ`, `MYLO`, `SHOPNOVA` or `BELLE` on the sold-to rows (`Z001`). `kna1.konzs` does not match (`DROGERIE_K` for Kranz) |
 | `feeds.retailer_sellout.article_no`; `feeds.marketplace_sales_daily.product_code`; `feeds.marketplace_inventory_daily.product_code` | `erp.knmt.kdmat`, with `erp.knmt.kunnr` = the sender's sold-to `kunnr` (row above) | Then `knmt.matnr` to `erp.mara.matnr`. About 95 % of articles have a `knmt` row; see [joins.md](joins.md#retailer-article-numbers) for the rest. Marketplace codes are never EANs |
 
-A join on an expression such as the `lpad` above needs a derived column, for example
-`lpad(item_code, 18, '0') AS matnr` added to both queries of the WMS tables, or a formula column
-in Incorta. The same applies to the `feeds` article mapping, which needs the sender's `kunnr`
-on the feed rows (or a small lookup of the four senders) before it can join `erp.knmt` on two
-columns.
+A join on an expression such as the `lpad` above needs the expression as a column on the child
+side. Incorta advises against joining on a formula column in another schema, so never add the
+formula to `erp.mara`: add a formula column with `lpad(item_code, 18, '0')` to
+`wms.shipment_lines` (and to the other WMS tables you join), and join it to the plain
+`erp.mara.matnr`. Adding `lpad(item_code, 18, '0') AS matnr` to both queries of the WMS table
+gives the same join key as a physical column. In the same way, the `feeds` article mapping needs
+the sender's `kunnr` on the feed rows (or a small lookup of the four senders) before it can join
+`erp.knmt` on two columns; `kunnr` and `kdmat` together are unique in `erp.knmt`, because each
+retailer has one article number per material.
+
+Every parent in these joins must be unique on its join columns, because Incorta uses one parent
+row when a child row matches several (see [How to read the tables](joins.md#how-to-read-the-tables)
+for join direction, alias tables and cycles).
 
 Some phase 2 facts have no key between them and compare only as aggregates: `mkt.sessions_daily`
 against `shop.orders` by date and `source`/`channel` (the shop's `deal_site` source is the
@@ -1544,8 +1552,9 @@ Incorta 8.2.2 is release **v8.2.2-2026.8**, Service Pack 16 of v8.2.0, released 
 2026. Service packs carry only bug and security fixes, so 8.2.2 has the features of v8.2.0.
 Incorta publishes no separate documentation tree for 8.x; the `latest` documentation covers it.
 Later 8.2 service packs (8.2.3 to 8.2.6, SP17 to SP20) also exist and share these pages, so a
-page may describe a fix made after 8.2.2. The statements in this guide are confirmed in these
-pages:
+page may describe a fix made after 8.2.2. The three statements on joins, aliases and join
+conditions come from the 5.1 and 5.2 documentation pages and an Incorta Community article. The
+statements in this guide are confirmed in these pages:
 
 | Statement | Source |
 | --- | --- |
@@ -1561,6 +1570,9 @@ pages:
 | Table-level scheduling and the same schema or table in several load groups within one load plan (v8.0.0) | [Release notes v8.0.0](https://docs.incorta.com/latest/release-notes-v8-0-0-2026-8) |
 | Schema load endpoint with `loadSource` FULL (v8.1.0), optional `tables` list; HTTP 500 `INC_05270502` while a load of the same schema is running | [Release notes v8.1.0](https://docs.incorta.com/latest/release-notes-v8-1-0-2026-8), [Load schema tables endpoint](https://docs.incorta.com/latest/references-api-load-schema-tables-endpoint-v2) |
 | A running load plan cannot be started again (`INC_05290501`) | [Execute load plan endpoint](https://docs.incorta.com/latest/references-api-execute-load-plan-endpoint-v2) |
+| Joins run from the child (left) to the parent (right) as left outer joins; with several parent matches Incorta uses one row, so parent join columns must be unique | [Joins (5.2 documentation)](https://docs.incorta.com/5.2/concepts-join); Incorta Community article "Data Engineering & Enrichment" |
+| Aliases are the way to handle two foreign keys to the same parent; an alias inherits the original table's joins as a child but not its joins as a parent; avoid cyclic joins | [Alias (5.1 documentation)](https://docs.incorta.com/5.1/concepts-alias) |
+| Do not join on a formula column in another schema | [Join condition (5.1 documentation)](https://docs.incorta.com/5.1/concepts-join-condition) |
 
 Not confirmed in the documentation, and marked as such above:
 
@@ -1574,10 +1586,6 @@ Not confirmed in the documentation, and marked as such above:
   both Maximum Value of a Column and Last Successful Extract Time);
 - how Incorta maps the Postgres `uuid`, array and `time` types (the queries cast them to text);
 - that the weekday of a weekly schedule follows its start date;
-- three join modelling points in [joins.md](joins.md#how-to-read-the-tables): that a join is
-  defined from the child table to the parent table, whether more than one join between the
-  same two tables or a join from a table to itself is accepted, and whether an alias table for
-  the second role is the way to model them.
 
 Our own suggestions rather than Incorta recommendations: the connection pool of 10, the six
 schema names, the plan names and times, and the millisecond truncation of `updated_at` in the
