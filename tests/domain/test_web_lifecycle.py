@@ -889,6 +889,44 @@ def test_influencer_discount_not_combined_with_the_margin_trap_promotion(monkeyp
     assert "promo_discount" in ctypes and "influencer_discount" not in ctypes
 
 
+def test_trap_order_of_an_influencer_customer_stays_attributed_to_the_code(monkeypatch):
+    """The trap promotion wins the order, but the customer and the order stay attributed to the influencer code."""
+    from cpgsim.domain import marketing
+    from cpgsim.engine.queue import Event
+    from cpgsim.writers import keys
+
+    h = Harness(monkeypatch, marketing={"tracking_share": 1.0}, **_happy_cfg())
+    trap = _trap_promo(h)
+    h.s.promo_fn = _basket_promo(trap)
+    c = _influencer_customer(h)
+    code = c.influencer_code
+    o = web.place_order(h.world, c, [(_sku(h, "mass", max_price=8.0).sku_id, 1)], source="influencer")
+    # the order carries the trap promotion only: no influencer discount, no voucher code
+    assert o.promo_id == trap.promo_id and not marketing.is_influencer_promo(o.promo_id)
+    assert o.lines[0].discount_pct == 0.25
+    seed = h.world.seed
+    oid = keys.shop_order_id(seed, o.order_id)
+    (row,) = _shop_rows(h, "shop.orders", id=oid)
+    assert (row["promo_code"], row["promotion_id"]) == (None, keys.shop_promotion_id(seed, trap.promo_id))
+    (red,) = _shop_rows(h, "shop.promo_redemptions", order_id=oid)
+    assert red["promotion_id"] == keys.shop_promotion_id(seed, trap.promo_id) and red["code"] != code
+    # the customer keeps the signup source and the code it signed up with
+    (cust,) = _shop_rows(h, "shop.customers", id=keys.shop_customer_id(seed, c.customer_id))
+    assert (cust["signup_source"], cust["influencer_code"]) == ("influencer", code)
+    # mkt: attributed to the influencer channel and the code (never to the trap's promotion or a coupon site)
+    h.run_until(START + timedelta(days=1))
+    d = h.world.local_date(START)
+    h.world.now = h.world.at_local(d + timedelta(days=1), 6)
+    marketing.on_export(h.world, Event(due=h.world.now, priority=60, kind=marketing.EXPORT_KIND,
+                                       key=f"{marketing.EXPORT_KIND}:{d}", data={"date": d.isoformat()}))
+    (att,) = [r for r in h.dispatcher.batch.table("mkt.attributions").inserts.values() if r["order_ref"] == oid]
+    assert (att["channel"], att["influencer_code"], att["is_new_customer"]) == ("influencer", code, True)
+    assert att["customer_ref"] == keys.shop_customer_id(seed, c.customer_id)
+    usable = [cp for cp in marketing.active_campaigns(h.world, d)
+              if cp.channel == "influencer" and cp.influencer_code == code]
+    assert usable and att["campaign_id"] in {cp.campaign_id for cp in usable}
+
+
 def test_influencer_discount_not_combined_with_a_regular_code_promotion(monkeypatch):
     h = Harness(monkeypatch, **_happy_cfg())
     sku = _sku(h, min_price=10.0)

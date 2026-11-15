@@ -282,7 +282,10 @@ UTC, statuses as lower-case words (the neutral vocabulary), money as
   carried over to a later order (it is a first-order offer). So every planted
   scenario's redeemed orders and truth stay as they were. "First order" is the
   person's first order (`Customer.orders == 0`): a chaos duplicate account's
-  first order does not get it. No rng draw is involved.
+  first order does not get it. No rng draw is involved. The customer stays
+  attributed to the code either way (`signup_source = 'influencer'`,
+  `influencer_code` unchanged), even when `promo_code` / `promotion_id` carry
+  the other promotion.
 
 ### `wms` (warehouse and shipping)
 
@@ -438,7 +441,11 @@ mean 1), so web volume and the value-share calibration hold.
 Influencer codes: a customer acquired with a code gets 15 % off the goods of
 the first order (`marketing.influencer_first_order_discount_pct`, 0 switches it
 off), with the code as the shop's `promo_code`, unless another promotion
-applies to that order (one code per order; see `shop` above). The commission
+applies to that order (one code per order; see `shop` above). Attribution
+follows the customer's acquisition, never the order's promo code: such a first
+order is still attributed to `influencer` with the customer's code (and the
+code's campaign when one is usable, `is_new_customer` true), and the coupon-site
+intercept never takes it. The commission
 (`influencer_codes.commission_pct`) is paid on attributed net revenue, after
 that discount, and is part of the influencer campaigns' `spend_eur`.
 
