@@ -2,12 +2,13 @@
 
 How to connect an Incorta cluster to the simulator's Postgres database and keep it current with
 query-based incremental loads on `updated_at`. Written for Incorta **8.2.2** (release
-v8.2.2-2026.8, a service pack of v8.2.0) and simulator **v0.1.0** (phase 1: `shop`, `wms`, `erp`).
+v8.2.2-2026.8, a service pack of v8.2.0) and simulator **v0.2.0** (phase 2: `shop`, `wms`, `erp`,
+`mkt`, `feeds`). The joins inside each system are listed in [joins.md](joins.md).
 
 Statements about Incorta behaviour are taken from the Incorta documentation and linked in
 [Version notes](#version-notes). Anything the documentation does not confirm is marked
 **Not confirmed** and should be checked on your cluster. All SQL below has been run against the
-v0.1.0 DDL on PostgreSQL 16.
+v0.2.0 DDL on PostgreSQL 16.
 
 ## Before you start
 
@@ -32,15 +33,18 @@ v0.1.0 DDL on PostgreSQL 16.
 | `shop` | 9 | Incremental on `updated_at` |
 | `wms` | 6 | Incremental on `updated_at` |
 | `wms` | `stock_levels_daily` | Full load only, once a day |
-| `erp` | 13 | Incremental on `updated_at` |
-| `mkt`, `feeds`, `shelf` | none yet | Empty in v0.1.0; tables arrive in phases 2 and 3 |
+| `erp` | 18 | Incremental on `updated_at` |
+| `mkt` | 5 | Incremental on `updated_at` |
+| `feeds` | 4 | Full load only, once a day |
+| `shelf` | none yet | Empty in v0.2.0; tables arrive in phase 3 |
 | `sim`, `truth` | | Not granted to `bi_reader`; cannot be loaded |
 
 The simulator guarantees one loading contract for every business table (see the
 [README](../../README.md#loading-it-into-a-bi-tool) and
 [SPEC](../../docs/SPEC.md#loading-contract-for-bi-tools)): a primary key, `created_at` and
 `updated_at` on every row with `updated_at` indexed and moved on every change, no hard deletes,
-and insert-only snapshot tables. That is what makes the plain query-based setup below complete.
+and insert-only snapshot and feed tables. That is what makes the plain query-based setup below
+complete.
 
 ## 1. Data source
 
@@ -93,20 +97,22 @@ allows 100 connections by default, and the generator needs only a few.
 
 ## 2. Incorta schemas and tables
 
-Create four Incorta schemas:
+Create six Incorta schemas:
 
 | Incorta schema | Postgres tables | Why separate |
 | --- | --- | --- |
 | `cpgsim_shop` | all of `shop` | |
 | `cpgsim_wms` | all of `wms` except `stock_levels_daily` | |
 | `cpgsim_erp` | all of `erp` | |
+| `cpgsim_mkt` | all of `mkt` | |
 | `cpgsim_wms_snapshots` | `wms.stock_levels_daily` | Full load only, on its own schedule |
+| `cpgsim_feeds` | all of `feeds` | Full load only, on its own schedule |
 
 An incremental load job fully reloads every table in the schema that has incremental load
 disabled. Keeping the snapshot table in `cpgsim_wms` would therefore re-extract it completely on
-every 15-minute run. A separate schema keeps it in its own daily plan using only documented
-load plan features. Table-level scheduling is the alternative (see
-[Load plans](#3-load-plans)).
+every 15-minute run, and the same would happen to the `feeds` tables in any incremental
+schema. Separate schemas keep them in their own daily plan using only documented load plan
+features. Table-level scheduling is the alternative (see [Load plans](#3-load-plans)).
 
 ### Settings for every incremental table
 
@@ -186,7 +192,8 @@ both; the pairs below follow that.
 **Soft-deleted and cancelled rows.** Nothing is ever deleted at the source, so load every row,
 including `is_deleted = true`, and filter `is_deleted = false` in the business layer
 (business schema views or insights). Cancellations and rejections are states, not deletions:
-`shop.orders.status`, `erp.vbap.abgru`, `wms.shipments.status_code = 'CX'`. A cancelled ERP
+`shop.orders.status`, `erp.vbap.abgru`, `wms.shipments.status_code = 'CX'`,
+`erp.zdeduct.zzstatus = 'R'` (a reversed deduction). A cancelled ERP
 delivery is soft-deleted on `erp.likp` and on its `erp.lips` rows in the same commit, so both
 arrive in the same incremental run; filtering delivery items through their header as well is
 still a safe habit. A GDPR erasure is an update (`shop.customers.anonymised_at`)
@@ -542,6 +549,11 @@ WHERE updated_at > ?
 | `lips` | `vbeln`, `posnr` | Incremental |
 | `vbrk` | `vbeln` | Incremental |
 | `vbrp` | `vbeln`, `posnr` | Incremental |
+| `kona` | `knuma` | Incremental |
+| `zkona_item` | `knuma`, `posnr` | Incremental |
+| `zdeduct` | `belnr` | Incremental |
+| `zdeduct_item` | `belnr`, `posnr` | Incremental |
+| `zdeduct_clr` | `belnr`, `buzei` | Incremental |
 
 #### `erp.mara`
 
@@ -786,15 +798,325 @@ FROM erp.vbrp
 WHERE updated_at > ?
 ```
 
-### Snapshot table: `wms.stock_levels_daily`
+#### `erp.kona`
 
-`wms.stock_levels_daily` is insert-only: the end-of-day stock per item, taken at 23:55
-Europe/Berlin. A restatement arrives as new rows with a higher `load_id`, never as an update.
-In schema `cpgsim_wms_snapshots`, set **Incremental** off, leave Update Query empty, and set the
-four key columns (`snapshot_date`, `warehouse_code`, `item_code`, `load_id`, the Postgres
-primary key; Enforce Primary Key Constraint stays off here too). The table is small (one row per item a day, on the order of 130,000 rows after
-a 24-month backfill), so a daily full load is cheap and picks up restatements without any
-special handling.
+Trade promotion agreements: one row per retailer promotion the brand co-funds, written when the
+promotion is agreed, about six weeks before it starts. Insert-only: rows are never updated or
+soft-deleted.
+
+```sql
+-- Query
+SELECT
+  knuma, boart, kunnr, botext, datab, datbi, zzdisc_pct, zzofi_pct, zzscan_pct, zzwkz_eur,
+  erdat, ernam, created_at, date_trunc('milliseconds', updated_at) AS updated_at, is_deleted,
+  deleted_at
+FROM erp.kona
+
+-- Update Query
+SELECT
+  knuma, boart, kunnr, botext, datab, datbi, zzdisc_pct, zzofi_pct, zzscan_pct, zzwkz_eur,
+  erdat, ernam, created_at, date_trunc('milliseconds', updated_at) AS updated_at, is_deleted,
+  deleted_at
+FROM erp.kona
+WHERE updated_at > ?
+```
+
+#### `erp.zkona_item`
+
+The promoted materials of an agreement, with the agreed scan-back amount per unit sold
+(`zzscan_eur`, net of VAT). Written in the same commit as the `erp.kona` header. Insert-only.
+
+```sql
+-- Query
+SELECT
+  knuma, posnr, matnr, kdmat, zzscan_eur, created_at, date_trunc('milliseconds', updated_at)
+  AS updated_at, is_deleted, deleted_at
+FROM erp.zkona_item
+
+-- Update Query
+SELECT
+  knuma, posnr, matnr, kdmat, zzscan_eur, created_at, date_trunc('milliseconds', updated_at)
+  AS updated_at, is_deleted, deleted_at
+FROM erp.zkona_item
+WHERE updated_at > ?
+```
+
+#### `erp.zdeduct`
+
+Retailer deductions: one row per claim that a trade customer raises and short-pays from its
+invoices. The row is inserted with the status the case has when it is claimed. Two kinds of
+change update it later and move `updated_at`:
+
+- A status change: `zzstatus` (O claimed, M matched, D disputed, A accepted, R reversed),
+  together with `zzmatch_date`, `zzdisp_date`, `zzdisp_reason`, `zzres_date` and `zzaccepted`
+  as they apply. Closing the case sets `zzclose_date`.
+- A clearing: each new `erp.zdeduct_clr` row updates the running totals `zztaken` and
+  `zzrepaid` in the same commit, so the header and its clearing item arrive in the same
+  incremental run.
+
+No credit memo is booked for an accepted deduction. The accepted trade funding is
+`zzaccepted`, and `erp.vbrk` revenue of trade customers is gross of it.
+
+```sql
+-- Query
+SELECT
+  belnr, bukrs, gjahr, kunnr, zztype, xblnr, bldat, budat, wrbtr, waers, dmbtr, knuma,
+  zzpromo_text, zzperiod_from, zzperiod_to, vbeln_vl, vbeln_va, vbeln_vf, zzstatus,
+  zzmatch_date, zzdisp_date, zzdisp_reason, zzres_date, zzaccepted, zztaken, zzrepaid,
+  zzclose_date, erdat, erzet::text AS erzet, ernam, created_at, date_trunc('milliseconds',
+  updated_at) AS updated_at, is_deleted, deleted_at
+FROM erp.zdeduct
+
+-- Update Query
+SELECT
+  belnr, bukrs, gjahr, kunnr, zztype, xblnr, bldat, budat, wrbtr, waers, dmbtr, knuma,
+  zzpromo_text, zzperiod_from, zzperiod_to, vbeln_vl, vbeln_va, vbeln_vf, zzstatus,
+  zzmatch_date, zzdisp_date, zzdisp_reason, zzres_date, zzaccepted, zztaken, zzrepaid,
+  zzclose_date, erdat, erzet::text AS erzet, ernam, created_at, date_trunc('milliseconds',
+  updated_at) AS updated_at, is_deleted, deleted_at
+FROM erp.zdeduct
+WHERE updated_at > ?
+```
+
+#### `erp.zdeduct_item`
+
+The articles and units a retailer claims, at a net rate per unit (`zzrate`); `wrbtr` is the
+gross item amount. Written in the same commit as the `erp.zdeduct` header. Insert-only. `matnr`
+is NULL when the retailer's article (`kdmat`) has no `erp.knmt` mapping.
+
+```sql
+-- Query
+SELECT
+  belnr, posnr, kdmat, matnr, zzunits, zzrate, wrbtr, created_at, date_trunc('milliseconds',
+  updated_at) AS updated_at, is_deleted, deleted_at
+FROM erp.zdeduct_item
+
+-- Update Query
+SELECT
+  belnr, posnr, kdmat, matnr, zzunits, zzrate, wrbtr, created_at, date_trunc('milliseconds',
+  updated_at) AS updated_at, is_deleted, deleted_at
+FROM erp.zdeduct_item
+WHERE updated_at > ?
+```
+
+#### `erp.zdeduct_clr`
+
+One row per amount cleared against a deduction. `zzkind` is T for an amount taken by
+short-paying an invoice (`vbeln_vf` set) or P for an amount the customer repaid (`vbeln_vf`
+NULL). `dmbtr` is in EUR and always positive. A claim larger than one invoice is split across
+several T rows. Insert-only; each row also updates `erp.zdeduct` in the same commit (see
+above).
+
+```sql
+-- Query
+SELECT
+  belnr, buzei, zzkind, vbeln_vf, augdt, dmbtr, created_at, date_trunc('milliseconds',
+  updated_at) AS updated_at, is_deleted, deleted_at
+FROM erp.zdeduct_clr
+
+-- Update Query
+SELECT
+  belnr, buzei, zzkind, vbeln_vf, augdt, dmbtr, created_at, date_trunc('milliseconds',
+  updated_at) AS updated_at, is_deleted, deleted_at
+FROM erp.zdeduct_clr
+WHERE updated_at > ?
+```
+
+### `mkt`
+
+| Table | Key columns | Load |
+| --- | --- | --- |
+| `influencer_codes` | `code` | Incremental |
+| `campaigns` | `campaign_id` | Incremental |
+| `campaign_spend_daily` | `campaign_id`, `spend_date` | Incremental |
+| `sessions_daily` | `session_date`, `channel`, `country`, `device` | Incremental |
+| `attributions` | `attribution_id` | Incremental |
+
+The `mkt` tables have no `uuid`, array or `time` columns, so the queries need no casts.
+`order_ref`, `customer_ref` and `promo_ref` already hold UUIDs as text, in the same form as the
+`id::text` columns of `shop`. The simulator never soft-deletes an `mkt` row, but the queries
+keep `is_deleted` and `deleted_at` like every other table.
+
+**Which tables change after insert.** Only `mkt.campaigns`. A campaign row is inserted when
+the campaign is set up. Regular campaigns are set up at 09:00 Europe/Berlin, 14 days before
+they start. Promotion email campaigns (`EM-P…`) are set up when the web promotion is announced,
+3 days before it starts, in the morning. Scenario campaigns (`EM-X…`, `AF-X…`) are set up 14
+days before they start, or when the scenario window becomes visible if that is later.
+Campaigns set up before the history start that are still running or upcoming are written at
+the history start. A campaign's `status` moves from `planned` to `active` at 00:05 on the
+start date (a campaign set up on or
+after that moment is inserted as `active`), and to `ended` at 00:05 the day after the end date,
+when `end_date` is written again. While the `influencer_cohort_churn` scenario runs,
+`daily_budget_eur` of the affected influencer campaigns is raised, and set back after the
+window if the campaign still runs, in the daily export commit (below). Incorta keeps only the
+current value; the history of these budget changes is in `truth`, which `bi_reader` cannot
+read. The other four tables are insert-only in practice: `mkt.influencer_codes` is written
+once at the history start (its `status` stays `active` and `valid_to` stays NULL), and the
+daily tables are never rewritten. They still load incrementally on `updated_at`; with no
+updates, each run only appends.
+
+**Daily export timing.** `mkt.campaign_spend_daily`, `mkt.sessions_daily` and
+`mkt.attributions` are written by one daily export per local day. The export for day D runs
+once, on D+1 at a random minute between 04:00 and 05:00 Europe/Berlin, and writes all spend,
+session and attribution rows of D (plus any budget updates on `mkt.campaigns`) in one commit.
+A day is never exported twice and its rows are never updated afterwards. For the 15-minute
+plan this means:
+
+- The first incremental run after the export commit picks up the whole previous day, so it
+  arrives in Incorta between about 04:00 and 05:15 plus the run time. All other runs of the
+  day read nothing from these three tables; the `updated_at` index keeps that cheap.
+- Today never has rows in these three tables, and yesterday has none until the export has run.
+  Shop orders of those days are already loaded, so restrict any comparison of marketing facts
+  with `shop` (attributed orders against orders, spend against new customers) to days up to
+  the latest `session_date` in `mkt.sessions_daily`.
+- `mkt.attributions` holds one row per tracked web order, dated by `attribution_date` (the
+  local date the payment was authorised), not by `shop.orders.placed_at`. Orders whose payment
+  fails never appear; an order cancelled later stays attributed.
+- In the [freshness check](#row-counts-and-freshness), an `age` of up to about 25 hours is
+  normal for these three tables. Their `max(updated_at)` in Incorta should still equal the
+  Postgres value once the first run after the export has finished.
+
+#### `mkt.influencer_codes`
+
+```sql
+-- Query
+SELECT
+  code, influencer_handle, audience_platform, commission_pct, fixed_fee_eur, valid_from,
+  valid_to, status, created_at, date_trunc('milliseconds', updated_at) AS updated_at,
+  is_deleted, deleted_at
+FROM mkt.influencer_codes
+
+-- Update Query
+SELECT
+  code, influencer_handle, audience_platform, commission_pct, fixed_fee_eur, valid_from,
+  valid_to, status, created_at, date_trunc('milliseconds', updated_at) AS updated_at,
+  is_deleted, deleted_at
+FROM mkt.influencer_codes
+WHERE updated_at > ?
+```
+
+#### `mkt.campaigns`
+
+```sql
+-- Query
+SELECT
+  campaign_id, campaign_name, channel, objective, influencer_code, promo_ref, start_date,
+  end_date, daily_budget_eur, status, created_date, created_at, date_trunc('milliseconds',
+  updated_at) AS updated_at, is_deleted, deleted_at
+FROM mkt.campaigns
+
+-- Update Query
+SELECT
+  campaign_id, campaign_name, channel, objective, influencer_code, promo_ref, start_date,
+  end_date, daily_budget_eur, status, created_date, created_at, date_trunc('milliseconds',
+  updated_at) AS updated_at, is_deleted, deleted_at
+FROM mkt.campaigns
+WHERE updated_at > ?
+```
+
+#### `mkt.campaign_spend_daily`
+
+`platform_conversions` is what the ad platform reports; it over-attributes compared with
+`mkt.attributions`.
+
+```sql
+-- Query
+SELECT
+  campaign_id, spend_date, impressions, clicks, spend_eur, platform_conversions, created_at,
+  date_trunc('milliseconds', updated_at) AS updated_at, is_deleted, deleted_at
+FROM mkt.campaign_spend_daily
+
+-- Update Query
+SELECT
+  campaign_id, spend_date, impressions, clicks, spend_eur, platform_conversions, created_at,
+  date_trunc('milliseconds', updated_at) AS updated_at, is_deleted, deleted_at
+FROM mkt.campaign_spend_daily
+WHERE updated_at > ?
+```
+
+#### `mkt.sessions_daily`
+
+About 92 % of shop orders are tracked (consent), so `orders` and `revenue_eur` stay below the
+shop totals. `channel` uses the shop's source words, except that the shop's `deal_site` source
+is `affiliate`, as in `mkt.campaigns`.
+
+```sql
+-- Query
+SELECT
+  session_date, channel, country, device, sessions, users, new_users, orders, revenue_eur,
+  created_at, date_trunc('milliseconds', updated_at) AS updated_at, is_deleted, deleted_at
+FROM mkt.sessions_daily
+
+-- Update Query
+SELECT
+  session_date, channel, country, device, sessions, users, new_users, orders, revenue_eur,
+  created_at, date_trunc('milliseconds', updated_at) AS updated_at, is_deleted, deleted_at
+FROM mkt.sessions_daily
+WHERE updated_at > ?
+```
+
+#### `mkt.attributions`
+
+```sql
+-- Query
+SELECT
+  attribution_id, order_ref, customer_ref, attribution_date, channel, campaign_id,
+  influencer_code, model, is_new_customer, attributed_revenue_eur, created_at,
+  date_trunc('milliseconds', updated_at) AS updated_at, is_deleted, deleted_at
+FROM mkt.attributions
+
+-- Update Query
+SELECT
+  attribution_id, order_ref, customer_ref, attribution_date, channel, campaign_id,
+  influencer_code, model, is_new_customer, attributed_revenue_eur, created_at,
+  date_trunc('milliseconds', updated_at) AS updated_at, is_deleted, deleted_at
+FROM mkt.attributions
+WHERE updated_at > ?
+```
+
+### Insert-only tables (full load only)
+
+`wms.stock_levels_daily` and the four `feeds` tables are insert-only: rows are never updated or
+deleted, and a restatement arrives as new rows with a new `load_id`. They have no `is_deleted`
+or `deleted_at`.
+
+| Table | Key columns | Load |
+| --- | --- | --- |
+| `wms.stock_levels_daily` | `snapshot_date`, `warehouse_code`, `item_code`, `load_id` | Full only, in `cpgsim_wms_snapshots` |
+| `feeds.feed_loads` | `load_id` | Full only, in `cpgsim_feeds` |
+| `feeds.retailer_sellout` | `load_id`, `line_no` | Full only, in `cpgsim_feeds` |
+| `feeds.marketplace_sales_daily` | `report_date`, `product_code`, `load_id` | Full only, in `cpgsim_feeds` |
+| `feeds.marketplace_inventory_daily` | `report_date`, `product_code`, `load_id` | Full only, in `cpgsim_feeds` |
+
+For each of these tables, set **Incremental** off, leave Update Query empty, set **Function**
+to **key** on the key columns above (the Postgres primary key), and leave Enforce Primary Key
+Constraint off here too.
+
+Do not switch on **Disable Full Load** for these tables. That setting is for incremental tables
+that must never be fully reloaded; it does not make a table full-load-only. Leaving Incremental
+off does.
+
+**Why no incremental.** The simulator's loading contract for these tables is "load them in
+full, or append by `load_id`". Restatements come in as new rows, so a daily full load picks
+them up with no special handling and no watermark to check. The tables are small: about
+130,000 rows in `wms.stock_levels_daily` (one row per item a day) and about 0.3 million rows in
+`feeds` after a 24-month backfill. Because every load stays in Incorta, row counts match
+Postgres directly, and you choose the current load in the business layer.
+
+**When feed files arrive.** All times are Europe/Berlin:
+
+- Kranz: Monday, 06:00 to 09:00.
+- Mylo: Monday, 10:00 to 14:00.
+- Belle: the Wednesday after each retail month, 08:00 to 12:00.
+- Shopnova: daily reports for the previous day, 07:00 to 09:00.
+
+3 % of retailer files arrive one or two days late; `feeds.feed_loads.delivered_at` shows when
+they arrived. With the 12:30 AM plan, a file reaches Incorta the night after it arrives.
+
+#### `wms.stock_levels_daily`
+
+The end-of-day stock per item, taken at 23:55 Europe/Berlin. A restatement arrives as new rows
+with a higher `load_id`.
 
 ```sql
 -- Query
@@ -806,9 +1128,124 @@ FROM wms.stock_levels_daily
 
 For analysis, use the highest `load_id` per `snapshot_date`, `warehouse_code` and `item_code`.
 
-Do not switch on **Disable Full Load** for this table. That setting is for incremental tables
-that must never be fully reloaded; it does not make a table full-load-only. Leaving Incremental
-off does.
+#### `feeds.feed_loads`
+
+One row per delivered file: the sender (`source`: `KRANZ`, `MYLO`, `SHOPNOVA`, `BELLE`), the
+feed type (`sellout_weekly`, `sellout_monthly`, `mp_sales_daily`, `mp_inventory_daily`), the
+reported period (`period_end` is inclusive), the file name in the sender's convention,
+`delivered_at` and `row_count`. A `load_id` is made of the sender prefix, the feed type, the
+period start and a run number, for example `KRZ_SO_20260302_01`. Run `01` is the original file
+and run `02` a restatement, which has `is_restatement = true` and names the replaced load in
+`restates_load_id`. This is the table that tells you which load of a period is current.
+
+```sql
+-- Query
+SELECT
+  load_id, source, feed_type, period_start, period_end, file_name, delivered_at, row_count,
+  is_restatement, restates_load_id, created_at, updated_at
+FROM feeds.feed_loads
+```
+
+#### `feeds.retailer_sellout`
+
+The retailers' sell-out: one row per period, sales region (the region one retailer DC serves),
+sales channel and article. `line_no` is the row number within the file. Store rows are present
+for every listed article, including weeks with 0 units sold, and `stock_units` holds the
+region's stock at period end; on online rows it is NULL. `sales_value` is net or gross of VAT
+depending on the retailer (`value_basis`), so convert it before you add values across
+retailers. Kranz and Mylo report ISO weeks (`period_type = 'W'`); Belle reports retail months
+of a 4-4-5 calendar of ISO weeks (`period_type = 'M'`).
+
+| `retailer` | `period_label` | `region_code` | `sales_channel` (store / online) | `value_basis` | `article_no` |
+| --- | --- | --- | --- | --- | --- |
+| `KRANZ` | `2026-W10` | `VZ` + first three letters of the DC city (`VZERF`) | `STORE` / `ONLINE` | `NET` | six digits |
+| `MYLO` | `KW10/2026` | region name per DC (`OST`, `SUED`, `WEST`, `NORDOST`, `SUEDWEST`, `NORD`) | `F` / `O` | `GROSS` | `MY` + seven digits |
+| `BELLE` | `2026P03` | `BL-` + federal state of the DC (`BL-HE`) | `FIL` / `ECOM` | `GROSS` | `BL` + six digits |
+
+`article_no` maps to `matnr` through `erp.knmt.kdmat` for the sender's sold-to account; about
+95 % of articles have a record. See
+[Join keys between systems](#join-keys-between-systems) for the join and
+[joins.md](joins.md#retailer-article-numbers) for recovering the missing 5 %.
+
+```sql
+-- Query
+SELECT
+  load_id, line_no, retailer, period_type, period_start, period_end, period_label,
+  region_code, sales_channel, article_no, article_text, units_sold, stock_units, sales_value,
+  value_basis, currency, created_at, updated_at
+FROM feeds.retailer_sellout
+```
+
+Restatements: by default 10 % of retailer periods are restated. In those periods, run `01`
+under-reports the store rows of one region; run `02` comes with the retailer's next regular
+delivery and contains the whole period again. Use only the latest load of each period (see
+[Reading feed restatements](#reading-feed-restatements)). Adding run `01` and run `02` together
+counts the period twice.
+
+#### `feeds.marketplace_sales_daily`
+
+Shopnova's vendor sales and traffic report: one row per day and product, only for products
+with units ordered or page views that day. `ordered_revenue` is gross, at the marketplace's
+consumer price. `glance_views` counts product detail page views; views with 0 units point to
+out-of-stock days. Each report day is one load (`SNV_SALES_<yyyymmdd>_01`). `product_code` is
+the marketplace's own code (`SNV` + eight digits), never an EAN; it maps to `matnr` through
+`erp.knmt.kdmat` in the same way as retailer articles.
+
+```sql
+-- Query
+SELECT
+  report_date, product_code, load_id, product_title, units_ordered, ordered_revenue,
+  currency, glance_views, created_at, updated_at
+FROM feeds.marketplace_sales_daily
+```
+
+Restatements: the simulator currently restates retailer periods only, so each report day has
+one load. Apply the latest-load rule anyway, with the report day as the period
+(`feed_loads.period_start = report_date`), so the model stays correct if a day is ever re-sent.
+
+#### `feeds.marketplace_inventory_daily`
+
+Shopnova's vendor inventory report: the end-of-day position per listed product that has stock
+or inbound units. `sellable_on_hand` is the total across all fulfilment centres;
+`inbound_quantity` is confirmed purchase-order units not yet received. Each report day is one
+load (`SNV_INV_<yyyymmdd>_01`), separate from the sales load of the same day. Codes, mapping
+and restatements are as in `feeds.marketplace_sales_daily`.
+
+```sql
+-- Query
+SELECT
+  report_date, product_code, load_id, sellable_on_hand, inbound_quantity, created_at,
+  updated_at
+FROM feeds.marketplace_inventory_daily
+```
+
+#### Reading feed restatements
+
+Load every row and pick the current load in the business layer (business schema views or
+insights), the same way `is_deleted` is filtered on the incremental tables. The current load of
+a period is the `feed_loads` row with the latest `delivered_at`, then the highest `load_id`,
+among the rows with the same `source`, `feed_type` and `period_start`. Join a data table to
+that `load_id` and leave out its other loads. Because both loads stay in Incorta, you can still
+put the original next to the restated file.
+
+```sql
+SELECT s.retailer, s.period_label, s.region_code, s.sales_channel, s.article_no,
+       s.units_sold, s.stock_units, s.sales_value, s.value_basis
+FROM feeds.retailer_sellout s
+JOIN (
+  SELECT
+    load_id,
+    row_number() OVER (
+      PARTITION BY source, feed_type, period_start
+      ORDER BY delivered_at DESC, load_id DESC
+    ) AS rn
+  FROM feeds.feed_loads
+) l ON l.load_id = s.load_id AND l.rn = 1
+```
+
+A simpler rule gives the same result in the current simulator, because each restatement names
+the load it replaces: drop every load whose `load_id` appears in another row's
+`restates_load_id`. Until a restatement arrives, the original load is the current one.
 
 ### Fallback: Last Successful Extract Time
 
@@ -859,7 +1296,7 @@ before a schema change, instead of relying on timing.
 
 ### First load
 
-Before you schedule anything, run a full load of each of the four schemas once (Schema Designer,
+Before you schedule anything, run a full load of each of the six schemas once (Schema Designer,
 **Load > Full Load**). Maximum Value of a Column takes its watermark from the data already in
 Incorta, so incremental runs start from there.
 
@@ -867,18 +1304,20 @@ Incorta, so incremental runs start from there.
 
 | Plan | Schemas | Default load type | Schedule |
 | --- | --- | --- | --- |
-| `cpgsim_incremental_15m` | `cpgsim_shop`, `cpgsim_wms`, `cpgsim_erp` | Incremental Load | **Recur Every** 15 minutes, **Does not end** |
-| `cpgsim_snapshots_daily` | `cpgsim_wms_snapshots` | Full Load | **Recur Every** 1 day, **At** 12:30 AM, time zone Europe/Berlin |
-| `cpgsim_full_weekly` (optional) | `cpgsim_shop`, `cpgsim_wms`, `cpgsim_erp` | Full Load | **Schedule later** (Not Scheduled); run by hand, see below |
+| `cpgsim_incremental_15m` | `cpgsim_shop`, `cpgsim_wms`, `cpgsim_erp`, `cpgsim_mkt` | Incremental Load | **Recur Every** 15 minutes, **Does not end** |
+| `cpgsim_snapshots_daily` | `cpgsim_wms_snapshots`, `cpgsim_feeds` | Full Load | **Recur Every** 1 day, **At** 12:30 AM, time zone Europe/Berlin |
+| `cpgsim_full_weekly` (optional) | all six schemas | Full Load | **Schedule later** (Not Scheduled); run by hand, see below |
 
 **Incremental, every 15 minutes.** One load group is enough: schemas in one group load
 concurrently in a single load job. In an Incremental Load, only tables with Incremental on load
-incrementally and every other table loads fully, which is why the snapshot table lives in its
-own schema. At the default volume the simulator writes 11,000 to 13,000 rows a day, about 115
-to 135 rows per 15 minutes on average, so each run is short. The data an insight sees is at
-most one 30-second generator tick plus 15 minutes plus the run time behind the simulator. To
-limit loads to working hours, use **Recur Every** 1 day with **Between** a start and end time
-and **Every** 15 minutes instead.
+incrementally and every other table loads fully, which is why the insert-only tables live in
+their own schemas. At the default volume the simulator writes about 13,000 rows a day in an
+ordinary month and 14,600 a day averaged over a year, about 135 to 150 rows per 15 minutes on
+average, so each run is short. The data an insight sees is at most one 30-second generator
+tick plus 15 minutes plus the run time behind the simulator. The exception is the three daily
+`mkt` tables: the previous day's spend, sessions and attributions arrive in one commit between
+04:00 and 05:00 (see [`mkt`](#mkt)). To limit loads to working hours, use **Recur Every** 1
+day with **Between** a start and end time and **Every** 15 minutes instead.
 
 **Overlapping loads.** Documented: a running plan cannot be started a second time by hand
 (**Execute Load Plan**, or the API with `INC_05290501`), and a schema load through the Public
@@ -890,26 +1329,28 @@ of the same plan, or another load of the same schema, is still running. An Incor
 FAQ says the run is skipped, but no official documentation page says so. Check the load job
 history after the first full day.
 
-**Snapshots, daily.** The snapshot for a day is written at 23:55 Europe/Berlin; 12:30 AM leaves
-a margin. Incorta's scheduler documentation notes that a scheduled job should run at least once
-before a daylight saving change, and that `Etc/GMT+x` time zones have the opposite sign of
-`GMT+x:00`; use a named zone such as Europe/Berlin.
+**Snapshots and feeds, daily.** The snapshot for a day is written at 23:55 Europe/Berlin; 12:30
+AM leaves a margin. Feed files arrive in the morning (see
+[Insert-only tables](#insert-only-tables-full-load-only)), so each file is loaded the night
+after it arrives. Incorta's scheduler documentation notes that a scheduled job should run at
+least once before a daylight saving change, and that `Etc/GMT+x` time zones have the opposite
+sign of `GMT+x:00`; use a named zone such as Europe/Berlin.
 
 **Weekly full reload (optional).** The loading contract makes the incremental load complete,
 so a weekly full reload is a safety net against problems on the Incorta side or manual changes
-in Postgres that bypassed `updated_at`. It re-extracts the whole database (about 9.3 million
-rows, 2.7 GB of business data after a 24-month backfill, growing by about 1.5 GB a year in live
-mode) from a small VM, and it would compete with the 15-minute plan on the same schemas. A
-cheaper safety net is to run the row count check below once a week and reload fully only when
-counts drift. If you keep the weekly reload, create `cpgsim_full_weekly` with **Schedule
-later** and run it by hand in the quietest hour:
+in Postgres that bypassed `updated_at`. It re-extracts the whole database (about 10.4 million
+rows; the business schemas take 3.0 GB including indexes after a 24-month backfill, and the
+database grows by about 1.6 GB a year in live mode) from a small VM, and it would compete with
+the 15-minute plan on the same schemas. A cheaper safety net is to run the row count check
+below once a week and reload fully only when counts drift. If you keep the weekly reload,
+create `cpgsim_full_weekly` with **Schedule later** and run it by hand in the quietest hour:
 
-1. Suspend `cpgsim_incremental_15m` and wait until no run of it is listed as running under
-   **Schema Manager > Load Jobs**.
+1. Suspend `cpgsim_incremental_15m` and `cpgsim_snapshots_daily` and wait until no run of
+   them is listed as running under **Schema Manager > Load Jobs**.
 2. Select **Execute Load Plan** on `cpgsim_full_weekly` and wait for it to finish.
-3. Activate `cpgsim_incremental_15m` again.
+3. Activate `cpgsim_incremental_15m` and `cpgsim_snapshots_daily` again.
 
-A scheduled weekly plan cannot suspend the 15-minute plan, so it would rely on the scheduler's
+A scheduled weekly plan cannot suspend the other plans, so it would rely on the scheduler's
 undocumented behaviour for overlapping triggers (see **Overlapping loads** above). If you
 schedule it anyway (**Recur Every** 1 week, **At** 3:00 AM, Europe/Berlin), check the load job
 history after its first run; the weekday of a weekly schedule presumably follows its start
@@ -918,13 +1359,14 @@ date (**From**), which is **not confirmed**.
 **Alternative: table-level scheduling.** The v8.0.0 release notes announce granular table
 scheduling in load plans (individual tables of a schema instead of the whole schema) and the
 same schema or table in several load groups within a single load plan. With that,
-`wms.stock_levels_daily` could stay in `cpgsim_wms` and be scheduled on its own. Other pages of
+`wms.stock_levels_daily` could stay in `cpgsim_wms` and be scheduled on its own, and the same
+goes for the `feeds` tables. Other pages of
 the same documentation still contradict it: the Scheduler page says a schema can be added only
 once per plan, **Concepts > Full Load** says object full load jobs are available only on
 demand, and **Data Ingestion and Loading** says a load job for a physical schema object can only
 be on-demand, full or from staging. Neither the UI controls nor how two plans that share a
 schema behave are documented, so try the feature on your cluster before relying on it, and
-keep the separate schema above as the recommended setup. The documented per-table route in 8.2
+keep the separate schemas above as the recommended setup. The documented per-table route in 8.2
 is the Public API: `"tables": [...]` in the body of the schema load endpoint.
 
 ### After `sim reset`
@@ -941,12 +1383,12 @@ applies after any `sim backfill` on a database Incorta has already loaded (see
    is listed as running under **Schema Manager > Load Jobs**.
 2. Run `sim reset` and wait until the backfill has finished and the generator runs live
    (`sim status`). Incorta keeps showing the old data meanwhile.
-3. Run a full load of all four schemas, from the Schema Designer (**Load > Full Load**), with
-   **Execute Load Plan** on `cpgsim_full_weekly` plus a full load of `cpgsim_wms_snapshots`, or
-   with the Public API (`POST /incorta/api/v2/{tenant}/schema/{schemaName}/load` with
-   `"loadSource": "FULL"`, available since v8.1.0; see the endpoint documentation for
-   authentication). The API call fails with HTTP 500 and `INC_05270502` while any load of that
-   schema is running; wait and retry on that error.
+3. Run a full load of all six schemas, from the Schema Designer (**Load > Full Load**), with
+   **Execute Load Plan** on `cpgsim_full_weekly`, or with the Public API
+   (`POST /incorta/api/v2/{tenant}/schema/{schemaName}/load` with `"loadSource": "FULL"`,
+   available since v8.1.0; see the endpoint documentation for authentication). The API call
+   fails with HTTP 500 and `INC_05270502` while any load of that schema is running; wait and
+   retry on that error.
 4. Activate the plans you suspended in step 1.
 5. Run the checks in the next section.
 
@@ -954,8 +1396,11 @@ Do the same after a new simulator version changes a table's columns: in Incorta,
 removing columns, changing data types, the query or the key columns all require a full load.
 Suspend the plans and wait for running loads to finish before you change the Incorta schema
 (Incorta does not recommend model changes during loads), make the change, run the full load,
-then activate the plans again. New tables (phase 2 adds `mkt` and `feeds`) need their own
-Incorta tables, added to the plans.
+then activate the plans again. New tables need their own Incorta tables, added to the plans.
+Coming from a v0.1.0 setup: v0.2.0 leaves the columns of every v0.1.0 table unchanged and adds
+the five `erp` tables, `mkt` and `feeds`. Add the five tables to `cpgsim_erp`, create
+`cpgsim_mkt` and `cpgsim_feeds`, run a full load of the three schemas and add them to the plans
+as above. Phase 3 adds `shelf`.
 
 ## 4. Checks after the first load
 
@@ -998,6 +1443,20 @@ FROM (
   UNION ALL SELECT 'erp.lips', count(*), max(updated_at) FROM erp.lips
   UNION ALL SELECT 'erp.vbrk', count(*), max(updated_at) FROM erp.vbrk
   UNION ALL SELECT 'erp.vbrp', count(*), max(updated_at) FROM erp.vbrp
+  UNION ALL SELECT 'erp.kona', count(*), max(updated_at) FROM erp.kona
+  UNION ALL SELECT 'erp.zkona_item', count(*), max(updated_at) FROM erp.zkona_item
+  UNION ALL SELECT 'erp.zdeduct', count(*), max(updated_at) FROM erp.zdeduct
+  UNION ALL SELECT 'erp.zdeduct_item', count(*), max(updated_at) FROM erp.zdeduct_item
+  UNION ALL SELECT 'erp.zdeduct_clr', count(*), max(updated_at) FROM erp.zdeduct_clr
+  UNION ALL SELECT 'mkt.influencer_codes', count(*), max(updated_at) FROM mkt.influencer_codes
+  UNION ALL SELECT 'mkt.campaigns', count(*), max(updated_at) FROM mkt.campaigns
+  UNION ALL SELECT 'mkt.campaign_spend_daily', count(*), max(updated_at) FROM mkt.campaign_spend_daily
+  UNION ALL SELECT 'mkt.sessions_daily', count(*), max(updated_at) FROM mkt.sessions_daily
+  UNION ALL SELECT 'mkt.attributions', count(*), max(updated_at) FROM mkt.attributions
+  UNION ALL SELECT 'feeds.feed_loads', count(*), max(updated_at) FROM feeds.feed_loads
+  UNION ALL SELECT 'feeds.retailer_sellout', count(*), max(updated_at) FROM feeds.retailer_sellout
+  UNION ALL SELECT 'feeds.marketplace_sales_daily', count(*), max(updated_at) FROM feeds.marketplace_sales_daily
+  UNION ALL SELECT 'feeds.marketplace_inventory_daily', count(*), max(updated_at) FROM feeds.marketplace_inventory_daily
 ) t
 ORDER BY tbl;
 ```
@@ -1009,11 +1468,18 @@ catches up on its own.
 
 For freshness, `age` in Postgres shows how recently each table changed. On busy tables
 (`shop.orders`, `erp.vbak`, `wms.carrier_events`) it stays within minutes in live mode;
-master data (`erp.mara`, `erp.makt`, `erp.mbew`, `erp.tcurr`, `shop.promotions`) changes
-rarely, and a large age there is normal. Do this comparison after the first two incremental
-runs and again after the first daylight saving change; it is the check for the unconfirmed
-binding of `?`. In Incorta, `max(updated_at)` of each table should
-trail the Postgres value by no more than one schedule interval plus the run time. If an
+master data (`erp.mara`, `erp.makt`, `erp.mbew`, `erp.tcurr`, `shop.promotions`,
+`mkt.influencer_codes`) changes rarely, and a large age there is normal. The three daily `mkt`
+tables reach an age of up to about 25 hours before each export (see [`mkt`](#mkt)). The
+insert-only tables change only when a snapshot is taken or a file arrives:
+`wms.stock_levels_daily`, `feeds.feed_loads` and the two marketplace tables once a day, and
+`feeds.retailer_sellout` once or twice a week, so an age of up to about a week is normal there;
+compare their counts with Incorta after the daily plan has run.
+
+Do this comparison after the first two incremental runs and again after the first daylight
+saving change; it is the check for the unconfirmed binding of `?`. In Incorta, `max(updated_at)`
+of each incremental table should trail the Postgres value by no more than one schedule interval
+plus the run time. If an
 incremental table stays behind while Postgres moves, the watermark is not bound as expected:
 run a full load of that schema and switch the table to the
 [fallback](#fallback-last-successful-extract-time) until the cause is found.
@@ -1021,11 +1487,13 @@ run a full load of that schema and switch the table to the
 ### Join keys between systems
 
 The systems do not share keys; these are the joins to model, taken from the DDL and its column
-comments in [sql/schemas](../../sql/schemas).
+comments in [sql/schemas](../../sql/schemas). Every join between two tables of the same system,
+with cardinality and the rows where a key is NULL by design, is listed in
+[joins.md](joins.md).
 
 | From | To | Notes |
 | --- | --- | --- |
-| `shop.orders.id` (as text) | `erp.vbak.bstnk` | Web orders only (`vbak.auart = 'ZWEB'`). For retailer orders (`ZEDI`) `bstnk` holds the retailer PO number. Free text, not a key. |
+| `shop.orders.id` (as text) | `erp.vbak.bstnk` | Web orders only (`vbak.auart = 'ZWEB'`). For retailer orders (`ZEDI`) `bstnk` holds the retailer PO number. Free text, not a key. About 1 % of web sales documents have `bstnk` NULL or cut to its first 18 characters (data quality noise), so those orders do not match on the full UUID; a truncated reference can still be matched as a prefix of `shop.orders.id`. |
 | `erp.vbap.vbeln` | `erp.vbak.vbeln` | Item to header |
 | `erp.konv.knumv`, `kposn` | `erp.vbak.knumv`, `erp.vbap.posnr` | Pricing conditions per item |
 | `erp.lips.vgbel`, `vgpos` | `erp.vbap.vbeln`, `posnr` | Delivery item to sales item |
@@ -1035,19 +1503,42 @@ comments in [sql/schemas](../../sql/schemas).
 | `wms.carrier_events.shipment_id` | `wms.shipments.shipment_id` | |
 | `wms.returns.shipment_id`, `delivery_no` | `wms.shipments.shipment_id`, `erp.likp.vbeln` | |
 | `wms.return_lines.return_id` | `wms.returns.return_id` | |
-| `wms.stock_movements.delivery_no`, `return_id` | `erp.likp.vbeln`, `wms.returns.return_id` | `delivery_no` on goods issues, `return_id` on return and scrap postings |
+| `wms.stock_movements.delivery_no`, `return_id` | `erp.likp.vbeln`, `wms.returns.return_id` | `delivery_no` on goods issues (`GI`) and on return postings (`RT`, and `SC` for scrapped returns), where it is the original delivery; `return_id` on `RT` and `SC` postings of a customer return (RMA), NULL on returned-to-sender parcels. See [joins.md](joins.md#wms) |
 | `erp.vbrp.aubel`, `aupos` | `erp.vbap.vbeln`, `posnr` | Billing item to sales item; `000900` is the web shipping charge |
 | `erp.vbrp.vgbel` | `erp.likp.vbeln` (`vgtyp = 'J'`) or the original invoice `erp.vbrk.vbeln` (`vgtyp = 'M'`) | Invoices reference the delivery, credit memos the invoice |
 | `erp.vbrp.vgbel`, `vgpos` | `erp.lips.vbeln`, `posnr` (`vgtyp = 'J'`) or `erp.vbrp.vbeln`, `posnr` of the original invoice (`vgtyp = 'M'`) | Billing item to delivery item, or credit memo item to invoice item. `vgpos` is NULL on items without a delivery line, such as the shipping charge `000900`. Alternative for invoices: `vbrp.vgbel`, `aupos` to `lips.vbeln`, `vgpos`. Taken from the writer code; check `SELECT count(*) FROM erp.vbrp WHERE vgpos IS NOT NULL` on a backfilled database before modelling it. |
 | `wms.*.item_code` | `erp.mara.matnr` | `matnr = lpad(item_code, 18, '0')` |
 | `shop.order_lines.ean`, `wms.*.ean` | `erp.mara.ean11` | |
-| `erp.vbak.kunnr`, `zzkunwe`; `erp.likp.kunnr`; `erp.vbrk.kunrg`; `wms.shipments.consignee_no` | `erp.kna1.kunnr` | Web customers are one collective account per country |
+| `erp.vbak.kunnr`, `zzkunwe`; `erp.likp.kunnr`; `erp.vbrk.kunrg`; `erp.kona.kunnr`; `erp.zdeduct.kunnr`; `wms.shipments.consignee_no` | `erp.kna1.kunnr` | Web customers are one collective account per country. `kona` and `zdeduct` hold the retailer's sold-to account. |
+| `erp.zkona_item.knuma`; `erp.zdeduct.knuma` | `erp.kona.knuma` | Agreement items to header; on `zdeduct`, set for promotion (`ZP01`), unexplained (`ZX99`) and per-promotion advertising (`ZW01`) claims |
+| `erp.zdeduct_item.belnr`; `erp.zdeduct_clr.belnr` | `erp.zdeduct.belnr` | Claim items and clearing items to the deduction |
+| `erp.zdeduct.vbeln_vf`; `erp.zdeduct_clr.vbeln_vf` | `erp.vbrk.vbeln` | On `zdeduct`: the invoice a co-op (`ZK01`) or invoice-based advertising (`ZW01`) claim refers to. On `zdeduct_clr`: the invoice short-paid (`zzkind = 'T'`), NULL for repayments (`P`) |
+| `erp.zdeduct.vbeln_vl`; `erp.zdeduct.vbeln_va` | `erp.likp.vbeln`; `erp.vbak.vbeln` | Shortage claims (`ZS01`) name the delivery, which reaches `wms.shipments.delivery_no`; service penalties (`ZL01`) name the sales order |
+| `erp.zkona_item.kdmat`; `erp.zdeduct_item.kdmat` | `erp.knmt.kdmat`, with `erp.knmt.kunnr` = `kona.kunnr` or `zdeduct.kunnr` | Retailer article numbers. `zkona_item.matnr` is always set; `zdeduct_item.matnr` is NULL when the article has no `knmt` row |
+| `mkt.attributions.order_ref` | `shop.orders.id` (as text) | One row per tracked web order (about 92 %); orders whose payment failed have none |
+| `mkt.attributions.customer_ref` | `shop.customers.id` (as text) | |
+| `mkt.campaigns.promo_ref` | `shop.promotions.id` (as text) | Promotion campaigns only |
+| `shop.customers.influencer_code` | `mkt.influencer_codes.code` | Customers who signed up with an influencer code; `mkt.campaigns.influencer_code` and `mkt.attributions.influencer_code` hold the same codes |
+| `feeds.feed_loads.source`, `feeds.retailer_sellout.retailer` | `erp.kna1.sortl` (with `kna1.ktokd = 'Z001'`) | The sender's sold-to account: `sortl` is `KRANZ`, `MYLO`, `SHOPNOVA` or `BELLE` on the sold-to rows (`Z001`). `kna1.konzs` does not match (`DROGERIE_K` for Kranz) |
+| `feeds.retailer_sellout.article_no`; `feeds.marketplace_sales_daily.product_code`; `feeds.marketplace_inventory_daily.product_code` | `erp.knmt.kdmat`, with `erp.knmt.kunnr` = the sender's sold-to `kunnr` (row above) | Then `knmt.matnr` to `erp.mara.matnr`. About 95 % of articles have a `knmt` row; see [joins.md](joins.md#retailer-article-numbers) for the rest. Marketplace codes are never EANs |
 
 A join on an expression such as the `lpad` above needs a derived column, for example
 `lpad(item_code, 18, '0') AS matnr` added to both queries of the WMS tables, or a formula column
-in Incorta.
+in Incorta. The same applies to the `feeds` article mapping, which needs the sender's `kunnr`
+on the feed rows (or a small lookup of the four senders) before it can join `erp.knmt` on two
+columns.
+
+Some phase 2 facts have no key between them and compare only as aggregates: `mkt.sessions_daily`
+against `shop.orders` by date and `source`/`channel` (the shop's `deal_site` source is the
+`affiliate` channel), and `feeds.retailer_sellout` region codes, which name the region a
+retailer DC serves but are not `kna1` accounts.
 
 ## Version notes
+
+The guide follows simulator v0.2.0. Compared with v0.1.0, v0.2.0 adds the `mkt` and `feeds`
+schemas and five `erp` tables (`kona`, `zkona_item`, `zdeduct`, `zdeduct_item`,
+`zdeduct_clr`); the columns of the v0.1.0 tables are unchanged (see
+[After `sim reset`](#after-sim-reset) for adding the new tables to an existing setup).
 
 Incorta 8.2.2 is release **v8.2.2-2026.8**, Service Pack 16 of v8.2.0, released on 16 October
 2026. Service packs carry only bug and security fixes, so 8.2.2 has the features of v8.2.0.
@@ -1082,9 +1573,13 @@ Not confirmed in the documentation, and marked as such above:
 - how the `?` watermark is bound against `timestamptz` with regard to time zones (applies to
   both Maximum Value of a Column and Last Successful Extract Time);
 - how Incorta maps the Postgres `uuid`, array and `time` types (the queries cast them to text);
-- that the weekday of a weekly schedule follows its start date.
+- that the weekday of a weekly schedule follows its start date;
+- three join modelling points in [joins.md](joins.md#how-to-read-the-tables): that a join is
+  defined from the child table to the parent table, whether more than one join between the
+  same two tables or a join from a table to itself is accepted, and whether an alias table for
+  the second role is the way to model them.
 
-Our own suggestions rather than Incorta recommendations: the connection pool of 10, the four
+Our own suggestions rather than Incorta recommendations: the connection pool of 10, the six
 schema names, the plan names and times, and the millisecond truncation of `updated_at` in the
 query (Incorta recommends millisecond precision at the source; the truncation is how this guide
 achieves it).
