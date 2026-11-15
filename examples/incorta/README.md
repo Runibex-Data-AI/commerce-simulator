@@ -1311,8 +1311,8 @@ Incorta, so incremental runs start from there.
 **Incremental, every 15 minutes.** One load group is enough: schemas in one group load
 concurrently in a single load job. In an Incremental Load, only tables with Incremental on load
 incrementally and every other table loads fully, which is why the insert-only tables live in
-their own schemas. At the default volume the simulator writes about 13,000 rows a day in an
-ordinary month and 14,600 a day averaged over a year, about 135 to 150 rows per 15 minutes on
+their own schemas. At the default volume the simulator writes about 13,800 rows a day in an
+ordinary month and 15,300 a day averaged over a year, about 145 to 160 rows per 15 minutes on
 average, so each run is short. The data an insight sees is at most one 30-second generator
 tick plus 15 minutes plus the run time behind the simulator. The exception is the three daily
 `mkt` tables: the previous day's spend, sessions and attributions arrive in one commit between
@@ -1338,8 +1338,8 @@ sign of `GMT+x:00`; use a named zone such as Europe/Berlin.
 
 **Weekly full reload (optional).** The loading contract makes the incremental load complete,
 so a weekly full reload is a safety net against problems on the Incorta side or manual changes
-in Postgres that bypassed `updated_at`. It re-extracts the whole database (about 10.4 million
-rows; the business schemas take 3.0 GB including indexes after a 24-month backfill, and the
+in Postgres that bypassed `updated_at`. It re-extracts the whole database (about 10.9 million
+rows; the business schemas take 3.1 GB including indexes after a 24-month backfill, and the
 database grows by about 1.6 GB a year in live mode) from a small VM, and it would compete with
 the 15-minute plan on the same schemas. A cheaper safety net is to run the row count check
 below once a week and reload fully only when counts drift. If you keep the weekly reload,
