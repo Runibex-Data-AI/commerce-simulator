@@ -28,12 +28,17 @@ tables yet. The DDL declares no foreign keys, so each join below comes from the 
 - Some To columns are unique but are not the table's primary key: `erp.vbak.knumv` and
   `wms.shipments.delivery_no`. Every other To column is the primary key of its table.
 - **Second roles and self-joins need alias tables.** An alias is Incorta's documented way to
-  handle two foreign keys to the same parent. Create one alias per extra role and join the
-  child to the alias: for example `erp.vbak.kunnr` to `erp.kna1` (sold-to) and
-  `erp.vbak.zzkunwe` to an alias of `erp.kna1` (ship-to). An alias inherits the joins in which
-  the original table is the child (its joins to its own parents), but not the joins in which
-  it is the parent, so define each role's join to the alias yourself. The same applies to the
-  self-joins on `erp.vbrp` (credit memo item to invoice item) and `feeds.feed_loads`
+  handle two foreign keys to the same parent. Create one alias per extra role and join the child
+  to the alias: for example `erp.vbak.kunnr` to `erp.kna1` (sold-to) and `erp.vbak.zzkunwe` to
+  an alias of `erp.kna1` (ship-to). An alias inherits the joins in which the original table is
+  the child (its joins to its own parents), but not the joins in which it is the parent, so
+  define each role's join to the alias yourself. Incorta's own [alias
+  example](https://docs.incorta.com/5.1/concepts-alias) shows this: after creating the alias it
+  re-creates the join from Orders to the alias by hand, because a join in which the original
+  table is the parent is not carried over; the alias's joins as a child are. Here that means:
+  create the `erp.kna1` alias, then add the join from `erp.vbak.zzkunwe` to it yourself (and the
+  same for every other ship-to or payer column you model against the alias). The same applies to
+  the self-joins on `erp.vbrp` (credit memo item to invoice item) and `feeds.feed_loads`
   (restatement to restated load): join the table to an alias of itself.
 - **Avoid cyclic joins.** A self-join defined on the table itself is a cycle; use the alias
   above. Where this page lists a header join and an item join between the same pair of tables
