@@ -587,25 +587,39 @@ def outbound_freight_eur(cfg) -> dict[str, float]:
     return out
 
 
-#: Per paid channel: realised CAC (whole-run spend / last-click attributed new customers) and the mean
-#: contribution within the horizon of the customers acquired through it (``signup_source``), registered on
-#: or after the run start with a first order at least one horizon before its end. Customers a planted
-#: scenario acquired are left out: every customer a non-chaos scenario recorded in truth (the
-#: influencer_cohort_churn window cohort); promo_margin_trap's deal-site customers are no paid channel.
+#: Paid channel payback: per paid channel the realised CAC (spend / last-click attributed new customers) and
+#: the mean contribution within the horizon of the customers acquired through it (``signup_source``), both
+#: over the same acquisition period: spend dates, attribution dates and the customers' first orders from
+#: the run start to one horizon before its end (so every customer has a full horizon of data). Planted
+#: scenarios are left out on both sides: days inside a planted (non-chaos) scenario window are skipped for
+#: the channels the scenario moves (``SCENARIO_CHANNELS``; any other scenario moves every paid channel),
+#: and every customer a planted scenario recorded in truth (the influencer_cohort_churn window cohort) is
+#: left out of the value cohort. promo_margin_trap's deal-site customers are no paid channel, but its extra
+#: web demand lowers every paid channel's CAC while it runs. The value is also given per customer country
+#: (``shop.customers.country``) against the channel's CAC.
 #: Contribution per order (payment_failed and cancelled orders left out): net revenue ex VAT including the
 #: shipping fee (CHF at the mean erp.tcurr rate), minus the standard cost of the quantity not cancelled
 #: (erp.mbew via mara.ean11), minus the expected outbound parcel cost per country (config), minus
 #: completed refunds ex VAT, plus the standard cost of returned units.
 PAYBACK_SQL = """
 WITH ch AS (SELECT unnest(%(channels)s::text[]) AS channel),
+skip AS (SELECT * FROM unnest(%(skip_channel)s::text[], %(skip_from)s::date[], %(skip_to)s::date[])
+         AS s(channel, d0, d1)),
 spend AS (
     SELECT c.channel, sum(d.spend_eur) AS spend
     FROM mkt.campaign_spend_daily d JOIN mkt.campaigns c USING (campaign_id)
     WHERE NOT d.is_deleted AND c.channel IN (SELECT channel FROM ch)
+      AND d.spend_date >= %(start_d)s AND d.spend_date < %(cutoff_d)s
+      AND NOT EXISTS (SELECT 1 FROM skip s WHERE s.channel = c.channel
+                      AND d.spend_date >= s.d0 AND d.spend_date < s.d1)
     GROUP BY 1),
 acq AS (
-    SELECT channel, count(*) AS new_customers FROM mkt.attributions
-    WHERE NOT is_deleted AND is_new_customer AND model = 'last_click' AND channel IN (SELECT channel FROM ch)
+    SELECT a.channel, count(*) AS new_customers FROM mkt.attributions a
+    WHERE NOT a.is_deleted AND a.is_new_customer AND a.model = 'last_click'
+      AND a.channel IN (SELECT channel FROM ch)
+      AND a.attribution_date >= %(start_d)s AND a.attribution_date < %(cutoff_d)s
+      AND NOT EXISTS (SELECT 1 FROM skip s WHERE s.channel = a.channel
+                      AND a.attribution_date >= s.d0 AND a.attribution_date < s.d1)
     GROUP BY 1),
 fx AS (SELECT coalesce(avg(ukurs), 1) AS r FROM erp.tcurr WHERE fcurr = 'CHF' AND tcurr = 'EUR'),
 freight AS (SELECT * FROM unnest(%(countries)s::text[], %(freight)s::float8[]) AS f(country, eur)),
@@ -617,14 +631,15 @@ planted AS (
     FROM truth.planted_effects e JOIN truth.scenario_windows w USING (window_id)
     WHERE e.entity_type = 'customer' AND w.source <> 'chaos' AND e.system_refs->>'shop_customer_id' IS NOT NULL),
 signed AS (
-    SELECT cu.id, cu.signup_source AS channel, EXISTS (SELECT 1 FROM planted p WHERE p.id = cu.id) AS planted
+    SELECT cu.id, cu.signup_source AS channel, coalesce(cu.country, '?') AS country,
+           EXISTS (SELECT 1 FROM planted p WHERE p.id = cu.id) AS planted
     FROM shop.customers cu
     WHERE cu.signup_source IN (SELECT channel FROM ch) AND cu.registered_at >= %(start)s),
-cohort AS (SELECT id, channel FROM signed WHERE NOT planted),
 ord AS (
-    SELECT o.id, o.customer_id, c.channel, o.placed_at, o.country, o.total_amount, o.tax_total,
+    SELECT o.id, o.customer_id, c.channel, c.country AS customer_country, c.planted, o.placed_at, o.country,
+           o.total_amount, o.tax_total,
            CASE WHEN o.currency = 'CHF' THEN (SELECT r FROM fx) ELSE 1 END AS f
-    FROM shop.orders o JOIN cohort c ON c.id = o.customer_id
+    FROM shop.orders o JOIN signed c ON c.id = o.customer_id
     WHERE o.status NOT IN ('payment_failed', 'cancelled')),
 lines AS (
     SELECT l.order_id,
@@ -637,7 +652,7 @@ refunds AS (
     FROM shop.refunds r JOIN ord o ON o.id = r.order_id WHERE r.status = 'completed'
     GROUP BY 1),
 contrib AS (
-    SELECT o.customer_id, o.channel, o.placed_at,
+    SELECT o.customer_id, o.channel, o.customer_country, o.planted, o.placed_at,
            min(o.placed_at) OVER (PARTITION BY o.customer_id) AS first_at,
            (o.total_amount - o.tax_total) * o.f
            - coalesce(li.cogs, 0)
@@ -649,30 +664,46 @@ contrib AS (
     FROM ord o LEFT JOIN lines li ON li.order_id = o.id LEFT JOIN refunds rf ON rf.order_id = o.id
     LEFT JOIN freight fr ON fr.country = o.country),
 per_customer AS (
-    SELECT customer_id, channel, min(first_at) AS first_at,
+    SELECT customer_id, channel, customer_country AS country, bool_or(planted) AS planted,
+           min(first_at) AS first_at,
            sum(contrib) FILTER (WHERE placed_at < first_at + %(horizon)s * interval '1 day') AS value
-    FROM contrib GROUP BY 1, 2),
+    FROM contrib GROUP BY 1, 2, 3),
+period AS (
+    SELECT p.*, EXISTS (SELECT 1 FROM skip s WHERE s.channel = p.channel
+                        AND (p.first_at AT TIME ZONE 'Europe/Berlin')::date >= s.d0
+                        AND (p.first_at AT TIME ZONE 'Europe/Berlin')::date < s.d1) AS skipped
+    FROM per_customer p WHERE p.first_at < %(cutoff)s),
 val AS (
-    SELECT channel, count(*) AS customers, avg(value) AS value
-    FROM per_customer WHERE first_at < %(cutoff)s GROUP BY 1),
-excl AS (SELECT channel, count(*) FILTER (WHERE planted) AS excluded FROM signed GROUP BY 1)
-SELECT ch.channel, coalesce(s.spend, 0), coalesce(a.new_customers, 0), coalesce(v.customers, 0), v.value,
-       coalesce(x.excluded, 0)
+    SELECT channel, country, count(*) FILTER (WHERE NOT planted AND NOT skipped) AS customers,
+           avg(value) FILTER (WHERE NOT planted AND NOT skipped) AS value,
+           count(*) FILTER (WHERE skipped AND NOT planted) AS skipped
+    FROM period GROUP BY GROUPING SETS ((channel), (channel, country))),
+excl AS (
+    SELECT channel, country, count(*) FILTER (WHERE planted) AS excluded
+    FROM signed GROUP BY GROUPING SETS ((channel), (channel, country)))
+SELECT ch.channel, v.country, coalesce(s.spend, 0), coalesce(a.new_customers, 0), coalesce(v.customers, 0),
+       v.value, coalesce(x.excluded, 0), coalesce(v.skipped, 0)
 FROM ch LEFT JOIN spend s USING (channel) LEFT JOIN acq a USING (channel) LEFT JOIN val v USING (channel)
-LEFT JOIN excl x USING (channel)
-ORDER BY 1"""
+LEFT JOIN excl x ON x.channel = ch.channel AND x.country IS NOT DISTINCT FROM v.country
+ORDER BY 1, 2 NULLS FIRST"""
+
+#: Paid channels a planted scenario's window moves; a scenario not listed moves every paid channel.
+#: influencer_cohort_churn boosts one code's spend: the other channels' new customers do not change.
+SCENARIO_CHANNELS = {"influencer_cohort_churn": ("influencer",)}
 
 
 @dataclass(frozen=True)
 class Payback:
-    """One paid channel's realised CAC against the value of the customers it acquired."""
+    """One paid channel's realised CAC against the value of the customers it acquired (one country or all)."""
 
     channel: str
-    spend_eur: float
-    new_customers: int  # last-click attributed new customers, whole run
-    cohort: int  # customers in the value cohort (scenario-acquired customers left out)
+    spend_eur: float  # acquisition period, planted scenario days left out
+    new_customers: int  # last-click attributed new customers, same days
+    cohort: int  # customers in the value cohort
     value_eur: float | None  # mean contribution per cohort customer within the horizon
-    excluded: int  # customers of the channel left out because a planted scenario acquired them
+    excluded: int  # customers registered from the run start that a planted scenario acquired (truth), left out
+    skipped: int = 0  # other customers left out because their first order fell on a skipped scenario day
+    country: str | None = None  # None: all countries
 
     @property
     def cac_eur(self) -> float | None:
@@ -684,41 +715,75 @@ class Payback:
         return self.value_eur / cac if cac and self.value_eur is not None else None
 
 
-def paid_channel_payback(conn, cfg, start: date, until: date, horizon_days: int = 365,
-                         channels: tuple[str, ...] = PAID_CHANNELS) -> dict[str, Payback]:
-    """Realised CAC and ``horizon_days`` customer value per paid channel (see ``PAYBACK_SQL``).
+def scenario_skips(conn, channels: tuple[str, ...] = PAID_CHANNELS) -> list[tuple[str, date, date]]:
+    """(channel, first local day, first local day after) of every planted scenario window, per channel moved."""
+    rows = conn.execute(
+        "SELECT scenario_id, start_at, end_at FROM truth.scenario_windows WHERE source <> 'chaos'"
+        " ORDER BY start_at").fetchall()
+    out = []
+    for sid, s, e in rows:
+        d0 = _local_date(s) or date.min
+        d1 = date.max if e is None else (e - timedelta(microseconds=1)).astimezone(BERLIN).date() + timedelta(days=1)
+        for ch in SCENARIO_CHANNELS.get(sid, channels):
+            if ch in channels:
+                out.append((ch, d0, d1))
+    return out
 
-    The value cohort registered on or after ``start`` (local) and placed its first order at least
-    ``horizon_days`` before ``until`` (local), so every customer has a full horizon of data.
+
+def paid_channel_payback_by_country(conn, cfg, start: date, until: date, horizon_days: int = 365,
+                                    channels: tuple[str, ...] = PAID_CHANNELS) -> list[Payback]:
+    """Realised CAC and ``horizon_days`` customer value per paid channel, all countries and per customer country.
+
+    Acquisition period: ``start`` (local) to ``until - horizon_days``, so every customer in the value
+    cohort has a full horizon of data (see ``PAYBACK_SQL``).
     """
     freight = outbound_freight_eur(cfg)
+    cutoff = until - timedelta(days=horizon_days)
+    skips = scenario_skips(conn, channels)
     params = {
         "channels": list(channels),
         "countries": list(freight),
         "freight": [freight[k] for k in freight],
         "start": datetime.combine(start, datetime.min.time(), BERLIN),
-        "cutoff": datetime.combine(until - timedelta(days=horizon_days), datetime.min.time(), BERLIN),
+        "cutoff": datetime.combine(cutoff, datetime.min.time(), BERLIN),
+        "start_d": start,
+        "cutoff_d": cutoff,
         "horizon": horizon_days,
+        "skip_channel": [s[0] for s in skips],
+        "skip_from": [s[1] for s in skips],
+        "skip_to": [s[2] for s in skips],
     }
-    out = {}
-    for ch, spend, newc, n, value, excluded in conn.execute(PAYBACK_SQL, params).fetchall():
-        out[ch] = Payback(ch, float(spend), int(newc), int(n), None if value is None else float(value), int(excluded))
-    return out
+    return [
+        Payback(ch, float(spend), int(newc), int(n), None if value is None else float(value), int(excluded),
+                int(skipped), country)
+        for ch, country, spend, newc, n, value, excluded, skipped in conn.execute(PAYBACK_SQL, params).fetchall()
+    ]
+
+
+def paid_channel_payback(conn, cfg, start: date, until: date, horizon_days: int = 365,
+                         channels: tuple[str, ...] = PAID_CHANNELS) -> dict[str, Payback]:
+    """Per paid channel, all countries (see ``paid_channel_payback_by_country``)."""
+    return {p.channel: p for p in paid_channel_payback_by_country(conn, cfg, start, until, horizon_days, channels)
+            if p.country is None}
 
 
 def payback_checks(conn, cfg, start: date, until: date, horizon_days: int = 365) -> list[Check]:
-    """One check per paid channel: the cohort's ``horizon_days`` value exceeds the realised CAC."""
+    """Per paid channel, and per paid channel and customer country: the ``horizon_days`` value exceeds the
+    channel's realised CAC."""
     out = []
-    for ch, p in paid_channel_payback(conn, cfg, start, until, horizon_days).items():
+    for p in paid_channel_payback_by_country(conn, cfg, start, until, horizon_days):
         cac = p.cac_eur
+        where = p.channel if p.country is None else f"{p.channel} {p.country}"
         value = (f"CAC {cac:.2f} EUR (spend {p.spend_eur:.0f} / {p.new_customers} new)" if cac is not None
                  else f"no CAC (spend {p.spend_eur:.0f}, no attributed new customers)")
         if p.ratio is not None:
-            value += (f", {horizon_days}-day value {p.value_eur:.2f} EUR (n={p.cohort}, {p.excluded}"
-                      f" scenario-acquired left out), value/CAC {p.ratio:.3f}")
+            value += f", {horizon_days}-day value {p.value_eur:.2f} EUR (n={p.cohort}"
+            if p.country is None:
+                value += f", {p.excluded} scenario-acquired and {p.skipped} on scenario days left out"
+            value += f"), value/CAC {p.ratio:.3f}"
         else:
             value += f", no value (n={p.cohort})"
-        out.append(Check(f"{ch}: {horizon_days}-day customer value above realised CAC", value,
+        out.append(Check(f"{where}: {horizon_days}-day customer value above realised CAC", value,
                          p.ratio is not None and p.ratio > 1.0, PAYBACK_SQL))
     return out
 

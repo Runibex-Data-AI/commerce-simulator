@@ -300,25 +300,28 @@ class CarrierCfg(_M):
 
 
 class CarriersCfg(_M):
+    # Austrian parcels cost about EUR 0.20 more than German ones: the shop charges the same EUR fee and
+    # free-shipping threshold in both, and Austrian customers pay back like German ones (paid media
+    # design rule, MarketingCfg).
     parcel: dict[str, CarrierCfg] = Field(
         default_factory=lambda: {
             "Paketblitz": CarrierCfg(
                 share={"DE": 0.45, "AT": 0.35, "CH": 0.30},
                 median_days={"default": 1.3, "DE-BY": 1.5, "AT": 2.1, "CH": 2.6},
                 sigma=0.40, exception_multiplier=0.9,
-                cost_eur={"DE": 4.10, "AT": 6.90, "CH": 9.80},
+                cost_eur={"DE": 4.10, "AT": 4.30, "CH": 9.80},
             ),
             "Nordpost": CarrierCfg(
                 share={"DE": 0.35, "AT": 0.40, "CH": 0.45},
                 median_days={"default": 1.6, "DE-SH": 1.3, "DE-HH": 1.2, "AT": 2.3, "CH": 2.4},
                 sigma=0.50, exception_multiplier=1.1,
-                cost_eur={"DE": 3.80, "AT": 6.40, "CH": 9.20},
+                cost_eur={"DE": 3.80, "AT": 4.00, "CH": 9.20},
             ),
             "Swiftbox": CarrierCfg(
                 share={"DE": 0.20, "AT": 0.25, "CH": 0.25},
                 median_days={"default": 1.1, "DE-BY": 1.2, "AT": 1.8, "CH": 2.2},
                 sigma=0.35, exception_multiplier=1.0,
-                cost_eur={"DE": 4.40, "AT": 7.20, "CH": 10.40},
+                cost_eur={"DE": 4.40, "AT": 4.60, "CH": 10.40},
             ),
         }
     )
@@ -447,26 +450,29 @@ class MarketingCfg(_M):
 
     response_elasticity: float = 0.7  # new customers respond to spend flights with this elasticity
     # Paid media calibration. Design rule: the baseline business is healthy, so every paid channel pays
-    # back within 12 months at baseline (a customer's 12-month value above the channel's CAC);
-    # unprofitable patterns come only from planted scenarios recorded in truth (the influencer story is
-    # the influencer_cohort_churn code, not the channel). Measured contribution per web order is about
-    # EUR 13.0 / 10.0 / 9.3 for a customer's orders 1 / 2 / 3 (cumulative 13.0 / 23.1 / 32.3); 12-month
-    # value per customer about EUR 23.9 (search), 23.6 (social), 19.8 (influencer, after the first-order
-    # discount). Realised CAC runs about 2.5 % above cac_eur. Paid CAC lies above the first-order margin
-    # and pays back with order 2: search about EUR 22, social about EUR 20.5, influencer about EUR 16.4
-    # including the commission (cheapest CAC, lower value). Enforced by test_phase2_acceptance
+    # back within 12 months at baseline, in every country (a customer's 12-month value above the channel's
+    # CAC); unprofitable channels or countries come only from planted scenarios recorded in truth (the
+    # influencer story is the influencer_cohort_churn code, not the channel). Single flights may cost more
+    # per customer than their 12-month value (diminishing returns, response_elasticity); the rule is per
+    # channel. Measured contribution per web order of paid-channel customers is about EUR 12.9 / 9.7 / 9.0
+    # for orders 1 / 2 / 3 (cumulative 12.9 / 22.7 / 31.7); 12-month value per customer about EUR 24.5
+    # (search), 24.2 (social), 21.8 (influencer, after the first-order discount). Realised CAC over the same
+    # acquisition period (January to October, no fourth quarter) about EUR 20.5 / 21.6 / 17.3 (influencer
+    # including the commission), over the whole run about 19.1 / 20.7 / 15.7. Payback: search order 2,
+    # social order 2, influencer order 2; every paid channel's 12-month value above CAC (by 12 to 26 %),
+    # and by at least 9 % in every country. Enforced by test_phase2_acceptance
     # (test_paid_channels_pay_back_within_12_months). CPM and CTR are set so that the clicks implied by
     # spend match the configured session conversion rates (sessions = clicks x 0.80-0.92 + 15 % organic).
     paid: dict[str, PaidChannelCfg] = Field(
         default_factory=lambda: {
             "paid_search": PaidChannelCfg(
-                cac_eur=22.0, always_on_share=0.8, flights_per_quarter=1.0, cpm_eur=16.0, ctr=0.035
+                cac_eur=19.0, always_on_share=0.8, flights_per_quarter=1.0, cpm_eur=13.8, ctr=0.035
             ),
             "social": PaidChannelCfg(
                 cac_eur=20.0, always_on_share=0.4, flights_per_quarter=2.0, cpm_eur=4.2, ctr=0.015
             ),
             "influencer": PaidChannelCfg(
-                cac_eur=14.0, always_on_share=0.5, flights_per_quarter=1.5, cpm_eur=4.9, ctr=0.015
+                cac_eur=13.0, always_on_share=0.5, flights_per_quarter=1.5, cpm_eur=4.6, ctr=0.015
             ),
         }
     )

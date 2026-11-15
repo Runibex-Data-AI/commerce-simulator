@@ -64,7 +64,7 @@ _CACHE_LIMIT = 6000
 # orders a day and this constant to 0.895 = 0.94 x 300 / 315: retail sizing
 # (proportional to base_orders_per_day x this constant) keeps the absolute size
 # it had at 300 orders a day (to 0.03 %), so the 5 % more web volume shows up as
-# web share (expected about 9.9 %).
+# web share (9.94 % measured in the acceptance run).
 WEB_VALUE_REALISATION = 0.895
 _DC_WEIGHT_SPREAD = 0.5  # DC weights are 0.75 + 0.5 * u before normalising
 

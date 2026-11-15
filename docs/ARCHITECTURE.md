@@ -454,26 +454,49 @@ intercept never takes it. The commission
 that discount, and is part of the influencer campaigns' `spend_eur`.
 
 Design rule: the baseline business is healthy. Every paid channel pays back
-within 12 months at baseline (a customer's 12-month contribution above the
-channel's realised CAC), and unprofitable patterns come only from planted
-scenarios recorded in truth (`promo_margin_trap`, `influencer_cohort_churn`).
-Influencer as a channel stays profitable; the influencer story is the
-`influencer_cohort_churn` code's window cohort, not the channel.
-`test_paid_channels_pay_back_within_12_months` (phase-2 acceptance run,
-`phase2_checks.paid_channel_payback`) enforces it, leaving out the customers a
-scenario acquired.
+within 12 months at baseline, in every country (a customer's 12-month
+contribution above the channel's realised CAC), and unprofitable channels or
+countries come only from planted scenarios recorded in truth
+(`promo_margin_trap`, `influencer_cohort_churn`). Influencer as a channel stays
+profitable; the influencer story is the `influencer_cohort_churn` code's window
+cohort, not the channel. `test_paid_channels_pay_back_within_12_months`
+(phase-2 acceptance run, `phase2_checks.payback_checks`) enforces it per paid
+channel and per paid channel and customer country. Both sides cover one
+acquisition period (run start to one year before its end): spend and
+last-click attributed new customers by date, and the customers whose first
+order falls in it. Planted scenarios are left out on both sides: the days of a
+scenario window for the channels it moves (`influencer_cohort_churn` moves
+influencer only; `promo_margin_trap`'s extra web demand lowers every paid
+channel's CAC while it runs) and the customers a scenario acquired. The rule
+holds per channel and country, not per campaign: within a channel a flight
+buys customers at a higher CAC than always-on spend (`response_elasticity`
+0.7, diminishing returns), so single social flights (the 2025 winter and
+spring flights: CAC about EUR 28 to 29 against a 12-month value of about
+EUR 22 to 26) cost more than their customers return in 12 months while the
+always-on retargeting carries the channel. That
+follows from the configured spend response, not from a planted story, and
+truth does not record it.
 
 Paid media defaults (`marketing.paid`) are calibrated against the measured
-contribution per web order, about EUR 13.0 / 10.0 / 9.3 for a customer's orders
-1 / 2 / 3 (cumulative 13.0 / 23.1 / 32.3), and the 12-month value per customer
-(about EUR 23.9 paid search, 23.6 social, 19.8 influencer after the first-order
-discount). Realised CAC runs about 2.5 % above `cac_eur`: paid search CAC EUR 22,
-social EUR 20 (about EUR 20.5 realised), influencer EUR 14 (about EUR 16.4 with
-the commission: the cheapest CAC, but a lower value); each pays back with the
-customer's second order. CPM and CTR (search 16.0 / 3.5 %, social 4.2 / 1.5 %,
-influencer 4.9 / 1.5 %) are set so that the clicks implied by spend match the
-configured session conversion rates (`conversion_rates`, social 2.0 %): paid
-sessions = clicks x U(0.80, 0.92) + 15 % of the expected sessions as organic.
+contribution per web order of paid-channel customers, about EUR 12.9 / 9.7 /
+9.0 for a customer's orders 1 / 2 / 3 (cumulative 12.9 / 22.7 / 31.7), and
+the 12-month value per customer over the acquisition period (about EUR 24.5
+paid search, 24.2 social, 21.8 influencer after the first-order discount,
+planted cohort left out). Paid search CAC EUR 19, social EUR 20, influencer
+EUR 13 (plus the commission, about 14 % of influencer spend). Realised CAC
+over the acquisition period is about EUR 20.5 / 21.6 / 17.3, some 8 % above
+`cac_eur` for search and social because that period (January to October)
+lacks the cheap customers of the fourth quarter; over the whole run it is
+about EUR 19.1 / 20.7 / 15.7. Each channel pays back with the customer's
+second order, by 12 to 26 %, and by at least 9 % in every country
+(Austria 12 to 19 %).
+Austrian parcels cost about EUR 0.20 more than German ones
+(`carriers.parcel.*.cost_eur`); the shop charges the same EUR fee and
+free-shipping threshold in both, so Austrian orders earn close to German
+ones. CPM and CTR (search 13.8 / 3.5 %, social 4.2 / 1.5 %, influencer
+4.6 / 1.5 %) are set so that the clicks implied by spend match the configured
+session conversion rates (`conversion_rates`, social 2.0 %): paid sessions =
+clicks x U(0.80, 0.92) + 15 % of the expected sessions as organic.
 
 ### `truth`
 
