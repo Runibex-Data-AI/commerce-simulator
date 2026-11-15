@@ -140,8 +140,8 @@ def test_phase2_config_sections():
 def test_paid_media_calibration_and_influencer_discount_config():
     m = Config().marketing
     got = {k: (p.cac_eur, p.cpm_eur, p.ctr) for k, p in m.paid.items()}
-    assert got == {"paid_search": (22.0, 16.0, 0.035), "social": (29.0, 4.5, 0.013), "influencer": (14.0, 4.9, 0.015)}
-    assert m.conversion_rates["social"] == 0.018 and m.conversion_rates["paid_search"] == 0.031
+    assert got == {"paid_search": (19.0, 13.8, 0.035), "social": (20.0, 4.2, 0.015), "influencer": (13.0, 4.6, 0.015)}
+    assert m.conversion_rates["social"] == 0.020 and m.conversion_rates["paid_search"] == 0.031
     assert m.influencer_first_order_discount_pct == 15.0 and m.influencer_commission_pct == 12.0
     for ok in (0, 0.0, 0.01, 15, 100):
         cfg = Config.model_validate({"marketing": {"influencer_first_order_discount_pct": ok}})
@@ -152,6 +152,26 @@ def test_paid_media_calibration_and_influencer_discount_config():
     for tiny in (0.004, 0.0099):  # would round to a 0 % shop promotion that no order can redeem
         with pytest.raises(ValidationError, match=r"must be 0 \(off\) or at least 0.01"):
             Config.model_validate({"marketing": {"influencer_first_order_discount_pct": tiny}})
+
+
+def test_shipping_terms_by_country_are_validated(tmp_path):
+    w = Config().channels.web
+    assert w.shipping_fee_by_country == {"AT": 6.95} and w.free_shipping_by_country == {"AT": 49.0}
+    for bad, match in (({"at": 5.0}, "'at' is not a customer country"), ({"FR": 3.0}, "'FR' is not a customer"),
+                       ({"AT": -1.0}, r"must be >= 0")):
+        for name in ("shipping_fee_by_country", "free_shipping_by_country"):
+            with pytest.raises(ValidationError, match=match):
+                Config.model_validate({"channels": {"web": {name: bad}}})
+    ok = Config.model_validate({"channels": {"web": {"shipping_fee_by_country": {"AT": 0.0, "CH": 9.9}}}})
+    assert ok.channels.web.shipping_fee("AT") == 0.0 and ok.channels.web.shipping_fee("CH") == 9.9
+    # overlays deep-merge: an empty mapping keeps the AT default; setting AT to the EUR terms restores them
+    ov = tmp_path / "ov.yaml"
+    ov.write_text("channels:\n  web:\n    shipping_fee_by_country: {}\n")
+    assert load_config(overlay=ov).channels.web.shipping_fee("AT") == 6.95
+    ov.write_text("channels:\n  web:\n    shipping_fee_by_country: {AT: 4.95}\n"
+                  "    free_shipping_by_country: {AT: 29.0}\n")
+    w = load_config(overlay=ov).channels.web
+    assert (w.shipping_fee("AT"), w.free_shipping_threshold("AT")) == (w.shipping_fee_eur, w.free_shipping_eur)
 
 
 def test_chaos_config_is_typed_and_validated():

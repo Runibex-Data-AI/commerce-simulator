@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from cpgsim.config import load_config
+from cpgsim.config import Config, load_config
 from cpgsim.domain import billing as real_billing
 from cpgsim.domain import customers, subscriptions, web
 from cpgsim.domain.events import (
@@ -115,7 +115,7 @@ class Stubs:
         return [w for w in self.windows if d0 <= w.first <= d1]
 
     # promotions
-    def web_promo_for_basket(self, world, t, sku_ids, rng):
+    def web_promo_for_basket(self, world, t, sku_ids, rng, country=None):
         return self.promo_fn(world, t, sku_ids, rng)
 
     def active_web_promos(self, world, t):
@@ -503,6 +503,25 @@ def test_happy_path_order_lifecycle_and_cleanup(monkeypatch):
     assert h.world.store.count("billing") == 0
 
 
+def test_shipping_fee_and_threshold_per_country(monkeypatch):
+    """Austria pays its own fee and threshold (EUR); Germany and Switzerland their currency's."""
+    h = Harness(monkeypatch, **_happy_cfg())
+    w = h.cfg.channels.web
+    assert (w.shipping_fee("DE"), w.free_shipping_threshold("DE")) == (w.shipping_fee_eur, w.free_shipping_eur)
+    assert (w.shipping_fee("CH"), w.free_shipping_threshold("CH")) == (w.shipping_fee_chf, w.free_shipping_chf)
+    assert (w.shipping_fee("AT"), w.free_shipping_threshold("AT")) == (
+        w.shipping_fee_by_country["AT"], w.free_shipping_by_country["AT"])
+    assert w.shipping_fee("AT") > w.shipping_fee_eur and w.free_shipping_threshold("AT") > w.free_shipping_eur
+    # a basket between the German and the Austrian threshold ships free to Germany, not to Austria
+    lines, _ = _basket_between(h, w.free_shipping_eur, w.free_shipping_threshold("AT"), "EUR")
+    de = web.place_order(h.world, h.customer(country="DE", acquisition="direct"), lines, source="direct")
+    at = web.place_order(h.world, h.customer(country="AT", acquisition="direct"), lines, source="direct")
+    assert de.shipping_fee == 0.0 and at.currency == "EUR" and at.shipping_fee == w.shipping_fee("AT")
+    lines, _ = _basket_between(h, w.free_shipping_threshold("AT"), 1000.0, "EUR")
+    at = web.place_order(h.world, h.customer(country="AT", acquisition="direct"), lines, source="direct")
+    assert at.shipping_fee == 0.0
+
+
 def test_small_basket_pays_shipping_and_chf(monkeypatch):
     h = Harness(monkeypatch, **_happy_cfg())
     c = h.customer(country="CH")
@@ -750,6 +769,36 @@ def test_scenario_promo_recorded_and_free_shipping(monkeypatch):
     assert conds[1].rate == 0.25 and o.lines[0].discount_pct == 0.25
 
 
+def test_austrian_shipping_fee_in_erp_and_waived_fee_in_truth(monkeypatch):
+    """Austria's own fee (EUR 6.95 gross, 20 % VAT) on the ERP freight item, and as the waived amount in truth."""
+    h = Harness(monkeypatch, **_happy_cfg())
+    w = h.cfg.channels.web
+    fee = w.shipping_fee("AT")
+    net, tax = split_gross(fee, w.vat["AT"])
+    assert fee == 6.95 and (net, tax) == (5.79, 1.16)
+    sku = _sku(h, "mass", max_price=8.0)
+    o = web.place_order(h.world, h.customer(country="AT"), [(sku.sku_id, 1)], source="direct")
+    assert o.currency == "EUR" and o.shipping_fee == fee
+    h.run_until(START + timedelta(days=1))
+    fr = h.of(SalesDocCreated)[0].doc.items[-1]
+    assert fr.item_type == "freight" and (fr.net_value, fr.tax) == (net, tax)
+    assert [(c.ctype, c.amount) for c in fr.conditions] == [("shipping", net), ("tax", tax)]
+    # a free-shipping promotion waives the Austrian fee; truth records it gross and net
+    velmora = h.world.ref.catalogue.brand_of_role("mass")
+    promo = Promotion(
+        promo_id=900002, channel="web", name="Velmora 25", kind="automatic", code=None, discount_pct=0.25,
+        free_shipping=True, sku_ids=[], brand=velmora, start=START, end=START + timedelta(days=10),
+        announced_at=START, scenario_id="promo_margin_trap",
+    )
+    h.s.promo_fn = lambda world, t, sku_ids, rng: promo
+    o = web.place_order(h.world, h.customer(country="AT"), [(sku.sku_id, 1)], source="direct")
+    assert o.promo_id == promo.promo_id and o.shipping_fee == 0.0
+    det = h.s.effects[-1][6]
+    assert det["free_shipping_waived"] == fee and det["shipping_waived_eur"] == net
+    assert det["freight_eur"] == round(web.expected_freight_eur(h.world, "AT"), 2)
+    assert det["freight_eur"] > web.expected_freight_eur(h.world, "DE") + 1.5
+
+
 def test_promo_not_applied_without_eligible_line(monkeypatch):
     h = Harness(monkeypatch, **_happy_cfg())
     promo = Promotion(
@@ -866,7 +915,8 @@ def test_influencer_discount_never_costs_the_free_shipping(monkeypatch):
 
     h = Harness(monkeypatch, **_happy_cfg())
     w = h.cfg.channels.web
-    for country, threshold in (("DE", w.free_shipping_eur), ("CH", w.free_shipping_chf)):
+    for country in ("DE", "AT", "CH"):
+        threshold = w.free_shipping_threshold(country)
         currency = web.currency_of(country)
         lines, listed = _basket_between(h, threshold, round(threshold / 0.85, 2) - 0.01, currency)
         c = h.customer(country=country, acquisition="influencer")
@@ -1125,7 +1175,9 @@ def test_deterministic_replay(monkeypatch):
 def test_steady_state_volume(monkeypatch):
     base = 60.0
     days = 240
-    h = _run_small_business(monkeypatch, days, base, int(9000 * base / 300))
+    web_default = Config().channels.web  # warm start at the default ratio (30 x base_orders_per_day)
+    initial = int(web_default.initial_customers * base / web_default.base_orders_per_day)
+    h = _run_small_business(monkeypatch, days, base, initial)
     per_day = Counter()
     kinds = Counter()
     for e in h.of(WebOrderPlaced):

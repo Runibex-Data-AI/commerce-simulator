@@ -26,10 +26,11 @@ docker compose logs -f generator
 ```
 
 On first start the generator creates the schemas and backfills 24 months of history. With the
-default volume this takes about 15 minutes with the stack limited to 2 vCPU and 2 GB RAM (phase 1
-measured 13 minutes there; phase 2 takes 1.1 to 1.15 times as long on the same machine); slower
-disks take longer. It then keeps running live, with the simulation clock equal to wall time. Only
-Postgres is published (port 5432, SSL required for remote connections).
+default volume this takes about 18 minutes with the stack limited to 2 vCPU and 2 GB RAM (an
+estimate: phase 1 measured 13 minutes there, and the phase-2 backfill takes about 1.4 times as
+long on the same development machine, 13.4 against 9.5 minutes); slower disks take longer. It
+then keeps running live, with the simulation clock equal to wall time. Only Postgres is published
+(port 5432, SSL required for remote connections).
 
 Connect your BI tool as `bi_reader` (password `CPGSIM_READER_PASSWORD`) to database `cpgsim`.
 That role can read the business schemas and nothing else.
@@ -55,9 +56,9 @@ per country. Retailers and the marketplace report their own article numbers, map
 recovered from the order history; feeds and deduction claim items carry the article only. Joining
 the systems is part of what a platform is tested on.
 
-At the default 300 web orders a day, a 24-month backfill writes about 10.4 million rows (3.3 GB
-including indexes, plus up to 2 GB of Postgres WAL). Live mode adds about 13,000 to 14,600 rows
-a day, about 1.6 GB a year.
+At the default 315 web orders a day, a 24-month backfill writes about 10.9 million rows (3.6 GB
+including indexes, plus up to 2 GB of Postgres WAL). Live mode adds about 13,800 to 15,300 rows a
+day, about 1.6 GB a year.
 
 ## Loading it into a BI tool
 

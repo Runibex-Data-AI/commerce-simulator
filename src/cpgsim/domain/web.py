@@ -219,12 +219,13 @@ def free_shipping_promo_covers(world, sku_ids) -> bool:
     return any(promotions.is_eligible(p, s) for p in promos for s in skus)
 
 
-def _topup(world, rng: Rng, d: date, currency: str, lines: list[list[int]], sku_ids: list[int]) -> None:
+def _topup(world, rng: Rng, d: date, country: str, lines: list[list[int]], sku_ids: list[int]) -> None:
     w = world.cfg.channels.web
     cat = world.ref.catalogue
     if free_shipping_promo_covers(world, [s for s, _ in lines]):
         return
-    threshold = w.free_shipping_chf if currency == "CHF" else w.free_shipping_eur
+    currency = currency_of(country)
+    threshold = w.free_shipping_threshold(country)
     gross = round(sum(unit_price(cat.get(s), currency) * q for s, q in lines), 2)
     in_basket = {s for s, _ in lines}
     pool = [c for c in _cheap_candidates(world, d, currency, sku_ids) if c[0] not in in_basket]
@@ -291,7 +292,7 @@ def draw_lines(world, rng: Rng, d: date, country: str = "DE", topup: bool = Fals
     )
     lines = [[s, q] for s, q in drawn]
     if topup and lines:
-        _topup(world, rng, d, currency_of(country), lines, sku_ids)
+        _topup(world, rng, d, country, lines, sku_ids)
     return lines
 
 
@@ -339,7 +340,7 @@ def repeat_basket(world, rng: Rng, country: str, intent_lines: list[list[int]]) 
                 seen.add(s)
                 lines.append([s, q])
     if lines:
-        _topup(world, rng, d, currency_of(country), lines, sku_ids)
+        _topup(world, rng, d, country, lines, sku_ids)
     return lines
 
 
@@ -376,11 +377,15 @@ def _scenario_window_id(world, promo) -> str | None:
     return wid
 
 
-def _price_lines(world, merged: dict[int, int], currency: str, vat: float, promo, threshold_on_list: bool = False):
+def _price_lines(
+    world, merged: dict[int, int], country: str, currency: str, vat: float, promo, threshold_on_list: bool = False
+):
     """Order lines, goods total, shipping charged and waived, and the promotion that took effect (or None).
 
     ``promo`` discounts its eligible lines and may waive the shipping fee; it
-    takes effect when it discounts a line or waives a fee. The free-shipping
+    takes effect when it discounts a line or waives a fee. Fee and
+    free-shipping threshold are the customer country's
+    (``WebCfg.shipping_fee`` / ``free_shipping_threshold``). The free-shipping
     threshold applies to the goods after discount, or before it with
     ``threshold_on_list`` (the influencer first-order code: 15 % off the goods
     must never add a shipping fee to a basket that ships free at list prices).
@@ -400,8 +405,8 @@ def _price_lines(world, merged: dict[int, int], currency: str, vat: float, promo
             OrderLine(line_no=i, sku_id=s, qty=q, unit_price=price, discount=disc, tax_rate=vat, discount_pct=pct)
         )
     goods = round(sum(ln.gross for ln in olines), 2)
-    threshold = w.free_shipping_chf if currency == "CHF" else w.free_shipping_eur
-    fee = w.shipping_fee_chf if currency == "CHF" else w.shipping_fee_eur
+    threshold = w.free_shipping_threshold(country)
+    fee = w.shipping_fee(country)
     basis = round(sum(ln.unit_price * ln.qty for ln in olines), 2) if threshold_on_list else goods
     nominal_fee = round(fee, 2) if basis < threshold else 0.0
     shipping, waived = nominal_fee, 0.0
@@ -418,8 +423,8 @@ def place_order(
     """Price and place a web order for ``lines`` ``[(sku_id, qty), ...]``.
 
     Gross prices in the order currency (rrp_eur, rrp_chf for CH), best web
-    promotion for the basket, shipping fee below the free-shipping threshold
-    (waived by free-shipping promotions). Emits ``WebOrderPlaced`` and
+    promotion for the basket, the customer country's shipping fee below its
+    free-shipping threshold (waived by free-shipping promotions). Emits ``WebOrderPlaced`` and
     schedules the payment.
 
     One promotion per order: the first order of a customer acquired with an
@@ -447,14 +452,14 @@ def place_order(
         if q > 0:
             merged[s] = merged.get(s, 0) + q
     sku_ids = list(merged)
-    promo = promotions.web_promo_for_basket(world, now, sku_ids, rng) if sku_ids else None
-    olines, goods, shipping, waived, applied = _price_lines(world, merged, currency, vat, promo)
+    promo = promotions.web_promo_for_basket(world, now, sku_ids, rng, country) if sku_ids else None
+    olines, goods, shipping, waived, applied = _price_lines(world, merged, country, currency, vat, promo)
     if applied is None and c.orders == 0 and c.influencer_code:
         # One code per order: the influencer first-order discount only when no other promotion applies
         # (no rng draw, so every other stream and every planted scenario stays as it was).
         first = marketing.influencer_promotion(world, c.influencer_code)
         if first is not None:
-            priced = _price_lines(world, merged, currency, vat, first, threshold_on_list=True)
+            priced = _price_lines(world, merged, country, currency, vat, first, threshold_on_list=True)
             if priced[4] is not None:
                 olines, goods, shipping, waived, applied = priced
     discount_total = round(sum(ln.discount for ln in olines), 2)

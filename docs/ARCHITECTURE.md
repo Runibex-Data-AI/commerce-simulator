@@ -265,6 +265,18 @@ UTC, statuses as lower-case words (the neutral vocabulary), money as
   `returned` order to `return_rejected` (no refund). Refunds are `issued`, then
   `completed` (`RefundChanged`) when the payment provider has paid out, by
   payment method hours to a week later (`returns.REFUND_COMPLETION_DAYS`).
+* Shipping fee and free-shipping threshold are the customer country's
+  (`WebCfg.shipping_fee(country)` / `free_shipping_threshold(country)`): the
+  per-currency values (EUR 4.95 below EUR 29, CHF 7.90 below CHF 35) unless
+  `channels.web.shipping_fee_by_country` / `free_shipping_by_country` set the
+  country's own (Austria EUR 6.95 below EUR 49). The threshold top-up and
+  the free-shipping waiver use the same per-country terms, and so does the
+  waiver's value when promotions compete for EUR countries (Switzerland is
+  ranked at `shipping_fee_eur`, as before). Demand does not respond to the
+  terms (Austrian volume, conversion and repeat rates are the same whatever
+  the fee), and
+  Austrian baskets (about EUR 19 on average) rarely come within the top-up
+  band below EUR 49, so there is little bunching above that threshold.
 * Promotions: one per order (`orders.promotion_id`, `promo_code` for code
   promotions, one `promo_redemptions` row). The best calendar promotion for the
   basket wins (`promotions.web_promo_for_basket`). A customer acquired with an
@@ -453,15 +465,64 @@ intercept never takes it. The commission
 (`influencer_codes.commission_pct`) is paid on attributed net revenue, after
 that discount, and is part of the influencer campaigns' `spend_eur`.
 
+Design rule: the baseline business is healthy. Every paid channel pays back
+within 12 months at baseline, in every country (a customer's 12-month
+contribution above the channel's realised CAC), and unprofitable channels or
+countries come only from planted scenarios recorded in truth
+(`promo_margin_trap`, `influencer_cohort_churn`). Influencer as a channel stays
+profitable; the influencer story is the `influencer_cohort_churn` code's window
+cohort, not the channel. `test_paid_channels_pay_back_within_12_months`
+(phase-2 acceptance run, `phase2_checks.payback_checks`) enforces it per paid
+channel and per paid channel and customer country. Both sides cover one
+acquisition period (run start to one year before its end): spend and
+last-click attributed new customers by date, and the customers whose first
+order falls in it. Planted scenarios are left out on both sides: the days of a
+scenario window for the channels it moves (`influencer_cohort_churn` moves
+influencer only; `promo_margin_trap`'s extra web demand lowers every paid
+channel's CAC while it runs) and the customers a scenario acquired. The rule
+holds per channel and country, not per campaign: within a channel a flight
+buys customers at a higher CAC than always-on spend (`response_elasticity`
+0.7, diminishing returns), so single social flights (the 2025 winter and
+spring flights: CAC about EUR 28 to 29 against a 12-month value of about
+EUR 22 to 26) cost more than their customers return in 12 months while the
+always-on retargeting carries the channel. That
+follows from the configured spend response, not from a planted story, and
+truth does not record it.
+
 Paid media defaults (`marketing.paid`) are calibrated against the measured
-contribution per web order, about EUR 13.1 / 9.7 / 8.9 for a customer's orders
-1 / 2 / 3 (cumulative 13.1 / 22.8 / 31.7): paid search CAC EUR 22 (pays back
-with order 2), social EUR 29 (order 3), influencer EUR 14 (about EUR 16 with
-the commission: the cheapest CAC, but the worst lifetime value). CPM and CTR
-(search 16.0 / 3.5 %, social 4.5 / 1.3 %, influencer 4.9 / 1.5 %) are set so
-that the clicks implied by spend match the configured session conversion rates
-(`conversion_rates`, social 1.8 %): paid sessions = clicks x U(0.80, 0.92) +
-15 % of the expected sessions as organic.
+contribution per web order of paid-channel customers, about EUR 13.0 / 9.8 /
+8.9 for a customer's orders 1 / 2 / 3 (cumulative 13.0 / 22.9 / 31.8), and
+the 12-month value per customer over the acquisition period (about EUR 24.8
+paid search, 24.1 social, 22.7 influencer after the first-order discount,
+planted cohort left out). Paid search CAC EUR 19, social EUR 20, influencer
+EUR 13 (plus the commission, about 14 % of influencer spend). Realised CAC
+over the acquisition period is about EUR 20.4 / 21.8 / 17.4, some 8 % above
+`cac_eur` for search and social because that period (January to October)
+lacks the cheap customers of the fourth quarter; over the whole run it is
+about EUR 19.1 / 20.7 / 15.8. Each channel pays back with the customer's
+second order, by 11 to 30 %, and by at least 7 % in every country
+(Austria 13 to 28 %). These margins are the default seed's, which
+`test_phase2_acceptance` checks. The realised CAC over the acquisition period
+varies with the seed's flight draws (Poisson flights per quarter, diminishing
+returns) far more than the value does: social EUR 26.1 / 16.4 / 17.4 on
+seeds 1 / 2 / 3, so on seed 1 social falls below its 12-month value (ratio
+0.93; Germany 0.91, Austria 0.92, Switzerland 1.09), although its whole-run
+CAC there (EUR 21.6) is still below the value. Paid search (1.27 to 1.39) and
+influencer (1.18 to 1.47) pay back on all three seeds.
+Parcels from the German warehouse to Austria cost about EUR 1.90 more than
+domestic ones (`carriers.parcel.*.cost_eur`, carrier-share weighted EUR 5.98
+against 4.06), so the shop charges Austria its own shipping fee and
+free-shipping threshold (`channels.web.shipping_fee_by_country` /
+`free_shipping_by_country`: EUR 6.95 below EUR 49, against EUR 4.95 below
+EUR 29 in Germany), as German D2C shops commonly do. Over 90 % of Austrian
+orders pay the fee (Germany about 72 %), and Austrian customers pay back like
+German ones. The Austrian parcel rates are EUR 0.80 below the 6.90 / 6.40 /
+7.20 they had before (contract rates of a volume shipper): with those, even
+this fee and threshold left Austrian social customers at break-even. CPM and
+CTR (search 13.8 / 3.5 %, social 4.2 / 1.5 %, influencer 4.6 / 1.5 %) are set
+so that the clicks implied by spend match the configured session conversion
+rates (`conversion_rates`, social 2.0 %): paid sessions = clicks x
+U(0.80, 0.92) + 15 % of the expected sessions as organic.
 
 ### `truth`
 

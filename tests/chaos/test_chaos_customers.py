@@ -232,7 +232,7 @@ def test_duplicate_account_of_an_influencer_customer_gets_no_first_order_discoun
     _register_dup(h, c)
     buyer = chaos.repeat_customer(h.world, h.store.get("customer", c.customer_id))
     assert (buyer.acquisition, buyer.influencer_code) == ("influencer", code)
-    monkeypatch.setattr(promotions, "web_promo_for_basket", lambda world, t, sku_ids, rng: None)
+    monkeypatch.setattr(promotions, "web_promo_for_basket", lambda world, t, sku_ids, rng, country=None: None)
     monkeypatch.setattr(chaos, "on_order_placed", lambda w, o: None)
     sku = h.world.ref.catalogue.skus[0].sku_id
     first = web.place_order(h.world, buyer, [(sku, 2)], source="direct")

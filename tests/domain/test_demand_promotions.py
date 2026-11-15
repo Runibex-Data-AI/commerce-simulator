@@ -381,6 +381,21 @@ def test_web_promo_for_basket_prefers_larger_value(monkeypatch):
     assert promotions.web_promo_for_basket(w, small.start, [s.sku_id], Rng(1)) is fs
 
 
+def test_web_promo_for_basket_values_free_shipping_at_the_country_fee(monkeypatch):
+    w, _ = make_world()
+    web = w.cfg.channels.web
+    s = next(x for x in w.ref.catalogue.active(date(2025, 6, 1)) if x.rrp_eur >= 10.0)
+    fs = _promo(promo_id=4, discount_pct=0.10, sku_ids=[s.sku_id], free_shipping=True)
+    # worth more than 10 % plus the German fee, less than 10 % plus the Austrian fee
+    between = (web.shipping_fee_eur + web.shipping_fee("AT")) / 2
+    mid = _promo(promo_id=5, discount_pct=0.10 + between / s.rrp_eur, sku_ids=[s.sku_id])
+    monkeypatch.setattr(promotions, "active_web_promos", lambda world, t: [fs, mid])
+    assert promotions.web_promo_for_basket(w, fs.start, [s.sku_id], Rng(1), "DE") is mid
+    assert promotions.web_promo_for_basket(w, fs.start, [s.sku_id], Rng(1), "AT") is fs
+    assert promotions.web_promo_for_basket(w, fs.start, [s.sku_id], Rng(1), "CH") is mid  # EUR fee, as before
+    assert promotions.web_promo_for_basket(w, fs.start, [s.sku_id], Rng(1)) is mid
+
+
 # ---------------------------------------------------------------------------
 # Announcement
 # ---------------------------------------------------------------------------
@@ -607,7 +622,7 @@ def test_basket_stats():
     assert 3.0 < b["unit_net_eur"] < 15.0
     assert b["basket_net_eur"] == pytest.approx(b["lines"] * b["qty"] * b["unit_net_eur"])
     assert b["e_basket_net_eur"] == b["basket_net_eur"]
-    assert b["annual_web_net_eur"] == pytest.approx(300 * 365 * b["basket_net_eur"])
+    assert b["annual_web_net_eur"] == pytest.approx(w.cfg.channels.web.base_orders_per_day * 365 * b["basket_net_eur"])
 
 
 def test_retail_weekly_demand_sizing_and_dc_split():
