@@ -607,7 +607,7 @@ def test_basket_stats():
     assert 3.0 < b["unit_net_eur"] < 15.0
     assert b["basket_net_eur"] == pytest.approx(b["lines"] * b["qty"] * b["unit_net_eur"])
     assert b["e_basket_net_eur"] == b["basket_net_eur"]
-    assert b["annual_web_net_eur"] == pytest.approx(300 * 365 * b["basket_net_eur"])
+    assert b["annual_web_net_eur"] == pytest.approx(w.cfg.channels.web.base_orders_per_day * 365 * b["basket_net_eur"])
 
 
 def test_retail_weekly_demand_sizing_and_dc_split():

@@ -140,8 +140,8 @@ def test_phase2_config_sections():
 def test_paid_media_calibration_and_influencer_discount_config():
     m = Config().marketing
     got = {k: (p.cac_eur, p.cpm_eur, p.ctr) for k, p in m.paid.items()}
-    assert got == {"paid_search": (22.0, 16.0, 0.035), "social": (29.0, 4.5, 0.013), "influencer": (14.0, 4.9, 0.015)}
-    assert m.conversion_rates["social"] == 0.018 and m.conversion_rates["paid_search"] == 0.031
+    assert got == {"paid_search": (22.0, 16.0, 0.035), "social": (20.0, 4.2, 0.015), "influencer": (14.0, 4.9, 0.015)}
+    assert m.conversion_rates["social"] == 0.020 and m.conversion_rates["paid_search"] == 0.031
     assert m.influencer_first_order_discount_pct == 15.0 and m.influencer_commission_pct == 12.0
     for ok in (0, 0.0, 0.01, 15, 100):
         cfg = Config.model_validate({"marketing": {"influencer_first_order_discount_pct": ok}})

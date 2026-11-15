@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from cpgsim.config import load_config
+from cpgsim.config import Config, load_config
 from cpgsim.domain import billing as real_billing
 from cpgsim.domain import customers, subscriptions, web
 from cpgsim.domain.events import (
@@ -1125,7 +1125,9 @@ def test_deterministic_replay(monkeypatch):
 def test_steady_state_volume(monkeypatch):
     base = 60.0
     days = 240
-    h = _run_small_business(monkeypatch, days, base, int(9000 * base / 300))
+    web_default = Config().channels.web  # warm start at the default ratio (30 x base_orders_per_day)
+    initial = int(web_default.initial_customers * base / web_default.base_orders_per_day)
+    h = _run_small_business(monkeypatch, days, base, initial)
     per_day = Counter()
     kinds = Counter()
     for e in h.of(WebOrderPlaced):

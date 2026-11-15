@@ -44,7 +44,7 @@ company:
 channels:
   web:                    # own web shop, DE / AT / CH
     share: 0.10
-    base_orders_per_day: 300
+    base_orders_per_day: 315
     new_customer_share: 0.42
     country_mix: { DE: 0.78, AT: 0.14, CH: 0.08 }
     free_shipping_eur: 29.0

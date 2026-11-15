@@ -453,15 +453,27 @@ intercept never takes it. The commission
 (`influencer_codes.commission_pct`) is paid on attributed net revenue, after
 that discount, and is part of the influencer campaigns' `spend_eur`.
 
+Design rule: the baseline business is healthy. Every paid channel pays back
+within 12 months at baseline (a customer's 12-month contribution above the
+channel's realised CAC), and unprofitable patterns come only from planted
+scenarios recorded in truth (`promo_margin_trap`, `influencer_cohort_churn`).
+Influencer as a channel stays profitable; the influencer story is the
+`influencer_cohort_churn` code's window cohort, not the channel.
+`test_paid_channels_pay_back_within_12_months` (phase-2 acceptance run,
+`phase2_checks.paid_channel_payback`) enforces it, leaving out the customers a
+scenario acquired.
+
 Paid media defaults (`marketing.paid`) are calibrated against the measured
-contribution per web order, about EUR 13.1 / 9.7 / 8.9 for a customer's orders
-1 / 2 / 3 (cumulative 13.1 / 22.8 / 31.7): paid search CAC EUR 22 (pays back
-with order 2), social EUR 29 (order 3), influencer EUR 14 (about EUR 16 with
-the commission: the cheapest CAC, but the worst lifetime value). CPM and CTR
-(search 16.0 / 3.5 %, social 4.5 / 1.3 %, influencer 4.9 / 1.5 %) are set so
-that the clicks implied by spend match the configured session conversion rates
-(`conversion_rates`, social 1.8 %): paid sessions = clicks x U(0.80, 0.92) +
-15 % of the expected sessions as organic.
+contribution per web order, about EUR 13.0 / 10.0 / 9.3 for a customer's orders
+1 / 2 / 3 (cumulative 13.0 / 23.1 / 32.3), and the 12-month value per customer
+(about EUR 23.9 paid search, 23.6 social, 19.8 influencer after the first-order
+discount). Realised CAC runs about 2.5 % above `cac_eur`: paid search CAC EUR 22,
+social EUR 20 (about EUR 20.5 realised), influencer EUR 14 (about EUR 16.4 with
+the commission: the cheapest CAC, but a lower value); each pays back with the
+customer's second order. CPM and CTR (search 16.0 / 3.5 %, social 4.2 / 1.5 %,
+influencer 4.9 / 1.5 %) are set so that the clicks implied by spend match the
+configured session conversion rates (`conversion_rates`, social 2.0 %): paid
+sessions = clicks x U(0.80, 0.92) + 15 % of the expected sessions as organic.
 
 ### `truth`
 

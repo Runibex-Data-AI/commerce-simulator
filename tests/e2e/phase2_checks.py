@@ -568,6 +568,161 @@ def influencer_checks(conn, horizon_days: int = 180, max_ratio: float = 0.5,
     return out
 
 
+# ---------------------------------------------------------------------------
+# Paid channel payback (design rule: the baseline business is healthy)
+# ---------------------------------------------------------------------------
+
+PAID_CHANNELS = ("paid_search", "social", "influencer")
+
+
+def outbound_freight_eur(cfg) -> dict[str, float]:
+    """Expected parcel cost of a web order per country: carrier shares x ``cost_eur`` (config)."""
+    parcel = cfg.carriers.parcel
+    out = {}
+    for country in cfg.channels.web.country_mix:
+        weights = {name: float(c.share.get(country, 0.0)) for name, c in parcel.items()}
+        total = sum(weights.values())
+        if total > 0:
+            out[country] = sum(w * float(parcel[n].cost_eur.get(country, 0.0)) for n, w in weights.items()) / total
+    return out
+
+
+#: Per paid channel: realised CAC (whole-run spend / last-click attributed new customers) and the mean
+#: contribution within the horizon of the customers acquired through it (``signup_source``), registered on
+#: or after the run start with a first order at least one horizon before its end. Customers a planted
+#: scenario acquired are left out: every customer a non-chaos scenario recorded in truth (the
+#: influencer_cohort_churn window cohort); promo_margin_trap's deal-site customers are no paid channel.
+#: Contribution per order (payment_failed and cancelled orders left out): net revenue ex VAT including the
+#: shipping fee (CHF at the mean erp.tcurr rate), minus the standard cost of the quantity not cancelled
+#: (erp.mbew via mara.ean11), minus the expected outbound parcel cost per country (config), minus
+#: completed refunds ex VAT, plus the standard cost of returned units.
+PAYBACK_SQL = """
+WITH ch AS (SELECT unnest(%(channels)s::text[]) AS channel),
+spend AS (
+    SELECT c.channel, sum(d.spend_eur) AS spend
+    FROM mkt.campaign_spend_daily d JOIN mkt.campaigns c USING (campaign_id)
+    WHERE NOT d.is_deleted AND c.channel IN (SELECT channel FROM ch)
+    GROUP BY 1),
+acq AS (
+    SELECT channel, count(*) AS new_customers FROM mkt.attributions
+    WHERE NOT is_deleted AND is_new_customer AND model = 'last_click' AND channel IN (SELECT channel FROM ch)
+    GROUP BY 1),
+fx AS (SELECT coalesce(avg(ukurs), 1) AS r FROM erp.tcurr WHERE fcurr = 'CHF' AND tcurr = 'EUR'),
+freight AS (SELECT * FROM unnest(%(countries)s::text[], %(freight)s::float8[]) AS f(country, eur)),
+cost AS (
+    SELECT m.ean11 AS ean, avg(b.stprs / nullif(b.peinh, 0)) AS unit_cost
+    FROM erp.mara m JOIN erp.mbew b USING (matnr) GROUP BY 1),
+planted AS (
+    SELECT DISTINCT (e.system_refs->>'shop_customer_id')::uuid AS id
+    FROM truth.planted_effects e JOIN truth.scenario_windows w USING (window_id)
+    WHERE e.entity_type = 'customer' AND w.source <> 'chaos' AND e.system_refs->>'shop_customer_id' IS NOT NULL),
+signed AS (
+    SELECT cu.id, cu.signup_source AS channel, EXISTS (SELECT 1 FROM planted p WHERE p.id = cu.id) AS planted
+    FROM shop.customers cu
+    WHERE cu.signup_source IN (SELECT channel FROM ch) AND cu.registered_at >= %(start)s),
+cohort AS (SELECT id, channel FROM signed WHERE NOT planted),
+ord AS (
+    SELECT o.id, o.customer_id, c.channel, o.placed_at, o.country, o.total_amount, o.tax_total,
+           CASE WHEN o.currency = 'CHF' THEN (SELECT r FROM fx) ELSE 1 END AS f
+    FROM shop.orders o JOIN cohort c ON c.id = o.customer_id
+    WHERE o.status NOT IN ('payment_failed', 'cancelled')),
+lines AS (
+    SELECT l.order_id,
+           sum((l.quantity - l.qty_cancelled) * coalesce(k.unit_cost, 0)) AS cogs,
+           sum(l.qty_returned * coalesce(k.unit_cost, 0)) AS restock
+    FROM shop.order_lines l JOIN ord o ON o.id = l.order_id LEFT JOIN cost k ON k.ean = l.ean
+    GROUP BY 1),
+refunds AS (
+    SELECT r.order_id, sum(r.amount) AS refunded
+    FROM shop.refunds r JOIN ord o ON o.id = r.order_id WHERE r.status = 'completed'
+    GROUP BY 1),
+contrib AS (
+    SELECT o.customer_id, o.channel, o.placed_at,
+           min(o.placed_at) OVER (PARTITION BY o.customer_id) AS first_at,
+           (o.total_amount - o.tax_total) * o.f
+           - coalesce(li.cogs, 0)
+           - coalesce(fr.eur, 0)
+           - CASE WHEN o.total_amount > 0
+                  THEN coalesce(rf.refunded, 0) * (o.total_amount - o.tax_total) / o.total_amount * o.f
+                  ELSE 0 END
+           + coalesce(li.restock, 0) AS contrib
+    FROM ord o LEFT JOIN lines li ON li.order_id = o.id LEFT JOIN refunds rf ON rf.order_id = o.id
+    LEFT JOIN freight fr ON fr.country = o.country),
+per_customer AS (
+    SELECT customer_id, channel, min(first_at) AS first_at,
+           sum(contrib) FILTER (WHERE placed_at < first_at + %(horizon)s * interval '1 day') AS value
+    FROM contrib GROUP BY 1, 2),
+val AS (
+    SELECT channel, count(*) AS customers, avg(value) AS value
+    FROM per_customer WHERE first_at < %(cutoff)s GROUP BY 1),
+excl AS (SELECT channel, count(*) FILTER (WHERE planted) AS excluded FROM signed GROUP BY 1)
+SELECT ch.channel, coalesce(s.spend, 0), coalesce(a.new_customers, 0), coalesce(v.customers, 0), v.value,
+       coalesce(x.excluded, 0)
+FROM ch LEFT JOIN spend s USING (channel) LEFT JOIN acq a USING (channel) LEFT JOIN val v USING (channel)
+LEFT JOIN excl x USING (channel)
+ORDER BY 1"""
+
+
+@dataclass(frozen=True)
+class Payback:
+    """One paid channel's realised CAC against the value of the customers it acquired."""
+
+    channel: str
+    spend_eur: float
+    new_customers: int  # last-click attributed new customers, whole run
+    cohort: int  # customers in the value cohort (scenario-acquired customers left out)
+    value_eur: float | None  # mean contribution per cohort customer within the horizon
+    excluded: int  # customers of the channel left out because a planted scenario acquired them
+
+    @property
+    def cac_eur(self) -> float | None:
+        return self.spend_eur / self.new_customers if self.new_customers else None
+
+    @property
+    def ratio(self) -> float | None:
+        cac = self.cac_eur
+        return self.value_eur / cac if cac and self.value_eur is not None else None
+
+
+def paid_channel_payback(conn, cfg, start: date, until: date, horizon_days: int = 365,
+                         channels: tuple[str, ...] = PAID_CHANNELS) -> dict[str, Payback]:
+    """Realised CAC and ``horizon_days`` customer value per paid channel (see ``PAYBACK_SQL``).
+
+    The value cohort registered on or after ``start`` (local) and placed its first order at least
+    ``horizon_days`` before ``until`` (local), so every customer has a full horizon of data.
+    """
+    freight = outbound_freight_eur(cfg)
+    params = {
+        "channels": list(channels),
+        "countries": list(freight),
+        "freight": [freight[k] for k in freight],
+        "start": datetime.combine(start, datetime.min.time(), BERLIN),
+        "cutoff": datetime.combine(until - timedelta(days=horizon_days), datetime.min.time(), BERLIN),
+        "horizon": horizon_days,
+    }
+    out = {}
+    for ch, spend, newc, n, value, excluded in conn.execute(PAYBACK_SQL, params).fetchall():
+        out[ch] = Payback(ch, float(spend), int(newc), int(n), None if value is None else float(value), int(excluded))
+    return out
+
+
+def payback_checks(conn, cfg, start: date, until: date, horizon_days: int = 365) -> list[Check]:
+    """One check per paid channel: the cohort's ``horizon_days`` value exceeds the realised CAC."""
+    out = []
+    for ch, p in paid_channel_payback(conn, cfg, start, until, horizon_days).items():
+        cac = p.cac_eur
+        value = (f"CAC {cac:.2f} EUR (spend {p.spend_eur:.0f} / {p.new_customers} new)" if cac is not None
+                 else f"no CAC (spend {p.spend_eur:.0f}, no attributed new customers)")
+        if p.ratio is not None:
+            value += (f", {horizon_days}-day value {p.value_eur:.2f} EUR (n={p.cohort}, {p.excluded}"
+                      f" scenario-acquired left out), value/CAC {p.ratio:.3f}")
+        else:
+            value += f", no value (n={p.cohort})"
+        out.append(Check(f"{ch}: {horizon_days}-day customer value above realised CAC", value,
+                         p.ratio is not None and p.ratio > 1.0, PAYBACK_SQL))
+    return out
+
+
 def margin_trap_checks(conn, contribution_sql: str) -> list[Check]:
     w = window(conn, "promo_margin_trap")
     if w is None:

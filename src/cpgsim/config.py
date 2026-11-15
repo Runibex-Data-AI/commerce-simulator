@@ -75,9 +75,10 @@ class CompanyCfg(_M):
 
 class WebCfg(_M):
     share: float = 0.10  # default sell-in value share (used to size retail channels)
-    base_orders_per_day: float = 300.0
+    base_orders_per_day: float = 315.0
     new_customer_share: float = 0.42  # share of base orders from first-time customers at steady state
-    initial_customers: int = 9000  # warm-start cohort with pending repurchase intents at history start
+    # Warm-start cohort with pending repurchase intents at history start: 30 x base_orders_per_day.
+    initial_customers: int = 9450
     country_mix: dict[str, float] = Field(default_factory=lambda: {"DE": 0.78, "AT": 0.14, "CH": 0.08})
     free_shipping_eur: float = 29.0
     free_shipping_chf: float = 35.0
@@ -445,19 +446,24 @@ class MarketingCfg(_M):
     """Marketing stack: campaign calendar, spend-driven acquisition, daily exports."""
 
     response_elasticity: float = 0.7  # new customers respond to spend flights with this elasticity
-    # Paid media calibration. Measured contribution per web order is about EUR 13.1 / 9.7 / 8.9 for a
-    # customer's orders 1 / 2 / 3 (cumulative 13.1 / 22.8 / 31.7). Paid CAC lies above the first-order
-    # margin and pays back within two to three orders (search about EUR 21: order 2; social about
-    # EUR 28: order 3). Influencer is the cheapest CAC (about EUR 16 including the commission) but
-    # buys the worst lifetime value. CPM and CTR are set so that the clicks implied by spend match the
-    # configured session conversion rates (sessions = clicks x 0.80-0.92 + 15 % organic).
+    # Paid media calibration. Design rule: the baseline business is healthy, so every paid channel pays
+    # back within 12 months at baseline (a customer's 12-month value above the channel's CAC);
+    # unprofitable patterns come only from planted scenarios recorded in truth (the influencer story is
+    # the influencer_cohort_churn code, not the channel). Measured contribution per web order is about
+    # EUR 13.0 / 10.0 / 9.3 for a customer's orders 1 / 2 / 3 (cumulative 13.0 / 23.1 / 32.3); 12-month
+    # value per customer about EUR 23.9 (search), 23.6 (social), 19.8 (influencer, after the first-order
+    # discount). Realised CAC runs about 2.5 % above cac_eur. Paid CAC lies above the first-order margin
+    # and pays back with order 2: search about EUR 22, social about EUR 20.5, influencer about EUR 16.4
+    # including the commission (cheapest CAC, lower value). Enforced by test_phase2_acceptance
+    # (test_paid_channels_pay_back_within_12_months). CPM and CTR are set so that the clicks implied by
+    # spend match the configured session conversion rates (sessions = clicks x 0.80-0.92 + 15 % organic).
     paid: dict[str, PaidChannelCfg] = Field(
         default_factory=lambda: {
             "paid_search": PaidChannelCfg(
                 cac_eur=22.0, always_on_share=0.8, flights_per_quarter=1.0, cpm_eur=16.0, ctr=0.035
             ),
             "social": PaidChannelCfg(
-                cac_eur=29.0, always_on_share=0.4, flights_per_quarter=2.0, cpm_eur=4.5, ctr=0.013
+                cac_eur=20.0, always_on_share=0.4, flights_per_quarter=2.0, cpm_eur=4.2, ctr=0.015
             ),
             "influencer": PaidChannelCfg(
                 cac_eur=14.0, always_on_share=0.5, flights_per_quarter=1.5, cpm_eur=4.9, ctr=0.015
@@ -466,7 +472,7 @@ class MarketingCfg(_M):
     )
     conversion_rates: dict[str, float] = Field(
         default_factory=lambda: {
-            "organic_search": 0.024, "paid_search": 0.031, "social": 0.018, "influencer": 0.020,
+            "organic_search": 0.024, "paid_search": 0.031, "social": 0.020, "influencer": 0.020,
             "marketplace_spillover": 0.018, "direct": 0.035, "email": 0.042, "app": 0.050, "deal_site": 0.060,
         }
     )  # orders per session, by traffic source

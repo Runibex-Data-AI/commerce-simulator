@@ -81,6 +81,19 @@ def test_influencer_cohort_churn_at_default_volume(run):
     assert not bad
 
 
+def test_paid_channels_pay_back_within_12_months(run):
+    # Design rule (SPEC, Planted scenarios): the baseline business is healthy. For every paid channel the
+    # 12-month contribution of the customers it acquired (cohort registered from START with a first order
+    # before UNTIL - 365 days, scenario-acquired customers left out) exceeds its realised CAC (whole-run
+    # spend / last-click attributed new customers). Losses come only from planted scenarios.
+    conn, _ = run
+    checks = p2.payback_checks(conn, load_config(), START, UNTIL, horizon_days=365)
+    print(*((c.name, c.value) for c in checks), sep="\n")  # shown with -s or -rP; margins are a few EUR
+    assert len(checks) == len(p2.PAID_CHANNELS)
+    bad = [(c.name, c.value) for c in checks if not c.ok]
+    assert not bad
+
+
 def test_promo_margin_trap_and_marketing_metrics(run):
     conn, _ = run
     checks = p2.margin_trap_checks(conn, CONTRIBUTION_SQL) + p2.mkt_metrics_checks(conn)

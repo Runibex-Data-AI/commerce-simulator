@@ -57,8 +57,15 @@ _CACHE_LIMIT = 6000
 # Phase 2 (five channels, marketing-driven acquisition): 0.94; 0.97 gave a web
 # goods share of 9.85 % in 2025 and 9.78 % in the last 12 months of the default
 # 24-month backfill, and 9.21 % in the acceptance run from 2025-01-06 (shorter
-# history, fewer repeat customers), against 10 %.
-WEB_VALUE_REALISATION = 0.94
+# history, fewer repeat customers), against 10 %. Marketing recalibration
+# (influencer first-order discount, paid media) brought the acceptance run's web
+# goods share down to 9.50 % at 0.94 and 300 orders a day, a realisation of about
+# 0.89 against that run's retail. The default web baseline then rose to 315
+# orders a day and this constant to 0.895 = 0.94 x 300 / 315: retail sizing
+# (proportional to base_orders_per_day x this constant) keeps the absolute size
+# it had at 300 orders a day (to 0.03 %), so the 5 % more web volume shows up as
+# web share (expected about 9.9 %).
+WEB_VALUE_REALISATION = 0.895
 _DC_WEIGHT_SPREAD = 0.5  # DC weights are 0.75 + 0.5 * u before normalising
 
 

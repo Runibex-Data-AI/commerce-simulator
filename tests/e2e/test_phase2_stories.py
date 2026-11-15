@@ -90,6 +90,26 @@ def test_marketing_metrics_are_consistent(run):
     assert not _bad(p2.duplicate_account_checks(conn))
 
 
+def test_paid_channel_payback_measures_every_paid_channel(run):
+    # Seven months hold no 12-month horizon: a 60-day horizon exercises the measurement (the 12-month
+    # rule itself is asserted at default volume in test_phase2_acceptance).
+    conn, cfg = run
+    freight = p2.outbound_freight_eur(cfg)
+    assert freight == pytest.approx({"DE": 4.055, "AT": 6.775, "CH": 9.68})
+    pb = p2.paid_channel_payback(conn, cfg, START, UNTIL, horizon_days=60)
+    assert set(pb) == set(p2.PAID_CHANNELS)
+    for p in pb.values():
+        assert p.spend_eur > 0 and p.new_customers > 0 and p.cohort > 0, p
+        assert p.cac_eur is not None and p.value_eur is not None and p.value_eur > 0, p
+    # the influencer_cohort_churn window cohort is left out of the influencer value cohort, and only there
+    planted = conn.execute(
+        "SELECT count(DISTINCT entity_id) FROM truth.planted_effects"
+        " WHERE scenario_id = 'influencer_cohort_churn' AND entity_type = 'customer'").fetchone()[0]
+    assert planted > 0 and pb["influencer"].excluded == planted
+    assert pb["paid_search"].excluded == pb["social"].excluded == 0
+    print(*(c.value for c in p2.payback_checks(conn, cfg, START, UNTIL, horizon_days=60)), sep="\n")
+
+
 def test_carrier_decay_is_visible(run):
     conn, _ = run
     assert not _bad(p2.carrier_decay_checks(conn))

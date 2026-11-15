@@ -55,7 +55,8 @@ per country. Retailers and the marketplace report their own article numbers, map
 recovered from the order history; feeds and deduction claim items carry the article only. Joining
 the systems is part of what a platform is tested on.
 
-At the default 300 web orders a day, a 24-month backfill writes about 10.4 million rows (3.3 GB
+<!-- TODO-SIZE: rows, GB and live-mode figures below were measured at 300 web orders a day; re-measure at 315 and replace them, then delete this marker. -->
+At the default 315 web orders a day, a 24-month backfill writes about 10.4 million rows (3.3 GB
 including indexes, plus up to 2 GB of Postgres WAL). Live mode adds about 13,000 to 14,600 rows
 a day, about 1.6 GB a year.
 

@@ -148,7 +148,7 @@ Corrections are part of the lifecycle too. A status set in error is overwritten 
 
 Demand is generated bottom-up, from consumers and retailers behaving plausibly, not by drawing daily totals. All parameters below are config defaults chosen to look credible. They are not market data and should be presented as synthetic.
 
-**Arrivals.** New web orders follow a non-homogeneous Poisson process. Its rate multiplies a base rate (default 300 orders a day) by an hour-of-day curve (evening peak around 20:00, trough at 04:00), a day-of-week factor (Sunday and Monday highest), annual seasonality per category, event multipliers and active scenario modifiers.
+**Arrivals.** New web orders follow a non-homogeneous Poisson process. Its rate multiplies a base rate (default 315 orders a day) by an hour-of-day curve (evening peak around 20:00, trough at 04:00), a day-of-week factor (Sunday and Monday highest), annual seasonality per category, event multipliers and active scenario modifiers.
 
 **Seasonality and events.** Sun care peaks May to August. Lip care and rich creams peak November to February. Gift sets sell almost only in November and December. Black Friday week lifts web demand about 2.5 times, the run-up to Christmas about 1.6 times, and a marketplace sale event in July about 3 times on the marketplace only. Mother's Day lifts Cutara.
 
@@ -171,6 +171,8 @@ Demand is generated bottom-up, from consumers and retailers behaving plausibly, 
 ## Planted scenarios and ground truth
 
 Scenarios are time-bounded modifiers on model parameters, switched on in config or live from the CLI. Each one plants a business story that a platform should be able to surface by joining sources, and each records exactly what it did in the `truth` schema so findings can be checked afterwards.
+
+**Design rule: the baseline business is healthy.** Without scenarios the business makes money: every paid acquisition channel (paid search, social, influencer) pays back within 12 months, meaning a customer's 12-month contribution exceeds the channel's customer acquisition cost. Unprofitable patterns come only from planted scenarios recorded in `truth`, so every loss a platform finds can be checked against ground truth. Influencer marketing as a channel stays profitable; the influencer story is one code's campaign window (`influencer_cohort_churn`), not the channel. The phase-2 acceptance run checks the rule per paid channel, leaving out customers a scenario acquired.
 
 | Scenario id | The story | Mechanism | Where it shows | Sources to join |
 | --- | --- | --- | --- | --- |
@@ -236,7 +238,7 @@ company:
   brands: [Velmora, Cutara, Sorell]
   catalogue_size: 180
 channels:
-  web:            { base_orders_per_day: 300, free_shipping_eur: 29 }
+  web:            { base_orders_per_day: 315, free_shipping_eur: 29 }
   drogerie_kranz: { share: 0.35, order_cycle_days: 7, dcs: 3 }
   mylo:           { share: 0.25, order_cycle_days: 7, dcs: 2 }
   shopnova:       { share: 0.20, model: 1p }
@@ -305,7 +307,7 @@ cpg-commerce-simulator/
 
 **Running it.** `docker compose up` starts Postgres and the generator. On first start the generator runs `init` and `backfill`, then `run`. The generator reaches Postgres over the Compose network, and only port 5432 is published. A small VM with 2 vCPU, 2 GB RAM and a 50 GB disk is enough for the default volume.
 
-**Sizing.** Measured at the default 300 web orders a day with all five channels (phase 2). The 24-month backfill writes about 10.4 million business rows (erp 5.1 million, wms 3.2 million, shop 1.5 million, feeds 0.3 million, mkt 0.3 million), and the database comes to 3.3 GB including indexes (business schemas 3.0 GB, simulator state 0.25 GB, truth 0.03 GB). Postgres also keeps up to 2 GB of WAL (`max_wal_size`), so the data directory is about 5.5 GB. With the Compose stack limited to 2 vCPU and 2 GB RAM without swap (Postgres 1.2 CPU and 1280 MB, generator 0.8 CPU and 768 MB), the phase-1 backfill took 13 minutes on a laptop, with peak memory of 380 MB for the generator and 460 MB for Postgres (page cache not counted) and no OOM kill. The phase-2 backfill takes 1.1 to 1.15 times as long as phase 1 on the same development machine (10.3 and 10.9 minutes in two runs against 9.5) with a generator peak of 430 to 440 MB, so about 15 minutes are expected on that stack; a VM with slower disks takes longer. Live mode then adds about 13,000 rows a day in an ordinary month and 14,600 a day averaged over a year with its seasonal peaks, about 1.6 GB a year. A 50 GB disk therefore leaves room for many years of live running, Postgres overhead and Docker images.
+**Sizing.** <!-- TODO-SIZE: every phase-2 number in this paragraph was measured at 300 web orders a day; re-measure at the default 315 and replace them, then delete this marker. --> Measured at the default 315 web orders a day with all five channels (phase 2). The 24-month backfill writes about 10.4 million business rows (erp 5.1 million, wms 3.2 million, shop 1.5 million, feeds 0.3 million, mkt 0.3 million), and the database comes to 3.3 GB including indexes (business schemas 3.0 GB, simulator state 0.25 GB, truth 0.03 GB). Postgres also keeps up to 2 GB of WAL (`max_wal_size`), so the data directory is about 5.5 GB. With the Compose stack limited to 2 vCPU and 2 GB RAM without swap (Postgres 1.2 CPU and 1280 MB, generator 0.8 CPU and 768 MB), the phase-1 backfill took 13 minutes on a laptop, with peak memory of 380 MB for the generator and 460 MB for Postgres (page cache not counted) and no OOM kill. The phase-2 backfill takes 1.1 to 1.15 times as long as phase 1 on the same development machine (10.3 and 10.9 minutes in two runs against 9.5) with a generator peak of 430 to 440 MB, so about 15 minutes are expected on that stack; a VM with slower disks takes longer. Live mode then adds about 13,000 rows a day in an ordinary month and 14,600 a day averaged over a year with its seasonal peaks, about 1.6 GB a year. A 50 GB disk therefore leaves room for many years of live running, Postgres overhead and Docker images.
 
 **Public-repository rules.**
 
@@ -333,7 +335,7 @@ Tests cover the determinism guarantee, the loading contract (every table has the
 
 | Decision | Choice |
 | --- | --- |
-| Default web volume | 300 orders a day, configurable |
+| Default web volume | 315 orders a day, configurable |
 | ERP naming | SAP-style from phase 1; readable English profile in phase 3 |
 | Licence | Apache-2.0 |
 | Incremental strategy | Query-based on `updated_at`; log-based CDC out of scope |
