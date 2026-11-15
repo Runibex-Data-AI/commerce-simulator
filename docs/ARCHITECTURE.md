@@ -509,7 +509,7 @@ instance.
 | unmapped_article | `master` | a retailer article without `erp.knmt` row (about 95 % coverage); EDI order lines (`vbap.kdmat` + `matnr`) and `zkona_item` keep the pair, so the mapping is recoverable from history; `zdeduct_item.matnr` is NULL |
 | sellout_restatement | `domain/feeds.py` | a load under-reports one region; the next delivery restates the period as a new load |
 | free_text_return_reason | `logistics` | `wms.returns.reason_text` (German phrases, 10 % contradict the code) |
-| gdpr_erasure | `shop` | `shop.customers.status = 'anonymised'` and anonymised addresses; `wms` keeps the consignee name (deliberate cross-system disagreement) |
+| gdpr_erasure | `shop` | `shop.customers.status = 'anonymised'`, anonymised addresses and `influencer_code` cleared (`signup_source` and `mkt.attributions.influencer_code` keep the acquisition); `wms` keeps the consignee name (deliberate cross-system disagreement) |
 
 Exact-reconciliation e2e tests run with chaos off (`CHAOS_OFF`); determinism
 tests run with chaos on.

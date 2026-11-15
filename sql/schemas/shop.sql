@@ -33,7 +33,7 @@ CREATE INDEX IF NOT EXISTS customers_email_idx ON shop.customers (email);
 
 COMMENT ON TABLE shop.customers IS 'Registered web shop customers. A GDPR erasure anonymises personal data in place (status anonymised); the row and its orders are kept.';
 COMMENT ON COLUMN shop.customers.signup_source IS 'Acquisition channel at registration: organic_search, paid_search, social, influencer, marketplace_spillover, direct, or deal_site (deal-site shoppers during a promo_margin_trap promotion).';
-COMMENT ON COLUMN shop.customers.influencer_code IS 'Influencer code used at sign-up, if any (signup_source = influencer). The customer stays attributed to it for good: derive influencer customers from this column (or mkt.attributions.influencer_code), not from shop.orders.promo_code, which is NULL or another promotion''s code when another promotion took the first order.';
+COMMENT ON COLUMN shop.customers.influencer_code IS 'Influencer code used at sign-up, if any (signup_source = influencer). The customer stays attributed to it: derive influencer customers from signup_source = influencer and this column (or mkt.attributions.influencer_code), not from shop.orders.promo_code, which is NULL or another promotion''s code when another promotion took the first order. Cleared (NULL) when the customer is anonymised (GDPR erasure); signup_source and mkt.attributions.influencer_code keep it.';
 COMMENT ON COLUMN shop.customers.status IS 'active or anonymised (personal data erased on request).';
 COMMENT ON COLUMN shop.customers.anonymised_at IS 'When personal data was erased; NULL for active customers.';
 
