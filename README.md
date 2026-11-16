@@ -1,10 +1,13 @@
 # cpg-commerce-simulator
 
 Realistic, continuously changing commerce data for a fictional consumer goods brand, spread
-across several source systems in plain Postgres. Connect an analytics, BI or AI platform to it
-and evaluate it against data that behaves like a real business: sell-in and sell-out, imperfect
-keys between systems, documents that change state, seasonality, promotions and planted
-business stories with ground truth.
+across several source systems in plain Postgres.
+
+Use it to test and evaluate analytics, BI and AI platforms against data that behaves like a
+real business: sell-in and sell-out, imperfect keys between systems, documents that change
+state, seasonality, promotions and planted business stories with ground truth.
+
+Improvements are welcome: open an issue or a pull request.
 
 The simulated company is **Northvale Consumer Care GmbH**, a German skincare manufacturer with
 three brands (Velmora, Cutara, Sorell) selling in Germany, Austria and Switzerland through its
@@ -171,4 +174,12 @@ Microsoft Fabric or Databricks. Platform-specific notes live under `examples/`: 
 
 ## Licence
 
-Apache-2.0. Published by Runibex Data & AI.
+Apache-2.0, see [LICENSE](LICENSE).
+
+## About
+
+Maintained by the Data & AI team at [Runibex](https://runibex.com). We have spent years
+building commerce platforms for large B2C, B2B and B2B2C businesses, and this simulator
+distils what that work taught us about how commerce data actually behaves across systems.
+We use it in our own work and share it in case it is useful in yours. If you would like to
+collaborate, get in touch.
