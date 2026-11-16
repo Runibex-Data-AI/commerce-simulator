@@ -783,7 +783,7 @@ def _add_globals(p: argparse.ArgumentParser, suppress: bool) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sim",
-        description="cpg-commerce-simulator: realistic, continuously changing commerce data in Postgres.",
+        description="commerce-simulator: realistic, continuously changing commerce data in Postgres.",
     )
     _add_globals(parser, suppress=False)
     common = argparse.ArgumentParser(add_help=False)
