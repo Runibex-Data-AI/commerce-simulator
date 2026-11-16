@@ -1,4 +1,4 @@
-# cpg-commerce-simulator
+# commerce-simulator
 
 Realistic, continuously changing commerce data for a fictional consumer goods brand, spread
 across several source systems in plain Postgres.
