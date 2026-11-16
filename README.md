@@ -28,8 +28,10 @@ docker compose logs -f generator
 On first start the generator creates the schemas and backfills 24 months of history. With the
 default volume this takes about 18 minutes with the stack limited to 2 vCPU and 2 GB RAM (an
 estimate: phase 1 measured 13 minutes there, and the phase-2 backfill takes about 1.4 times as
-long on the same development machine, 13.4 against 9.5 minutes); slower disks take longer. It
-then keeps running live, with the simulation clock equal to wall time. Only Postgres is published
+long on the same development machine, 13.4 against 9.5 minutes); slower disks take longer. On a
+2 vCPU / 2 GB cloud VM (AWS t4g.small, gp3 disk, 2 GB swap) the v0.2.0 backfill measured about
+46 minutes, with at least 635 MB of memory available throughout and no OOM kill. It then keeps
+running live, with the simulation clock equal to wall time. Only Postgres is published
 (port 5432, SSL required for remote connections).
 
 Connect your BI tool as `bi_reader` (password `CPGSIM_READER_PASSWORD`) to database `cpgsim`.
