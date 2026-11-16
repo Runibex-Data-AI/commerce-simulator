@@ -1,4 +1,4 @@
-# cpg-commerce-simulator generator image.
+# commerce-simulator generator image.
 #   docker compose up            (see docker-compose.yml)
 #   docker run --rm IMAGE --help
 FROM python:3.12-slim

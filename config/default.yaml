@@ -1,4 +1,4 @@
-# cpg-commerce-simulator: default business configuration.
+# commerce-simulator: default business configuration.
 #
 # Validated at start-up against cpgsim.config.Config. Anything left out here
 # takes the default defined there, so this file shows the main knobs only.

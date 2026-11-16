@@ -1,4 +1,4 @@
-# cpg-commerce-simulator: Specification
+# commerce-simulator: Specification
 
 Version 1, 14 November 2026. Maintained by Runibex Data & AI.
 
@@ -6,7 +6,7 @@ Version 1, 14 November 2026. Maintained by Runibex Data & AI.
 
 The simulator produces realistic, continuously changing commerce data for a fictional consumer goods brand, spread across several source systems in plain Postgres. It exists so that analytics, BI and AI platforms (Incorta, Microsoft Fabric, Databricks or anything that reads Postgres) can be evaluated against data that behaves like a real business rather than a static sample.
 
-It is published by Runibex Data & AI as a public repository under `Runibex-Data-AI/cpg-commerce-simulator`. The audience is data teams, partners and prospects who need a credible source to connect a platform to.
+It is published by Runibex Data & AI as a public repository under `Runibex-Data-AI/commerce-simulator`. The audience is data teams, partners and prospects who need a credible source to connect a platform to.
 
 Seven principles govern every design choice below:
 
@@ -278,7 +278,7 @@ The stack is Python 3.12 with numpy, Faker (German, Austrian and Swiss locales),
 The repository contains the generator and everything needed to run it on any machine with Docker, and nothing about any particular deployment.
 
 ```
-cpg-commerce-simulator/
+commerce-simulator/
   README.md
   LICENSE
   docker-compose.yml        # postgres + generator, restart: unless-stopped

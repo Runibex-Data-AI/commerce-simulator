@@ -1,4 +1,4 @@
-# cpg-commerce-simulator: Postgres + generator.
+# commerce-simulator: Postgres + generator.
 #
 #   cp .env.example .env     # fill in the three passwords (>= 16 chars, all different)
 #   docker compose up -d

@@ -1,4 +1,4 @@
--- Roles for cpg-commerce-simulator (manual setup without Docker).
+-- Roles for commerce-simulator (manual setup without Docker).
 --
 -- Run once as an admin (superuser or a role with CREATEROLE), connected to the
 -- simulator's database. Idempotent: safe to run again.
